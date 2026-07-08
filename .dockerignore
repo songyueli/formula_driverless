@@ -1,0 +1,18 @@
+# Exclude these from the Docker build context.
+# The build context is the set of files Docker reads when running `docker build`.
+# Keeping it small makes builds faster — none of these are needed inside the image.
+
+.git
+build/
+install/
+ml/venv/
+ml/.venv/
+ml/data/*
+ml/models/
+*.o
+*.a
+*.so
+*.pt
+*.onnx
+*.trt
+.gz/
