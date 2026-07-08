@@ -1,0 +1,14 @@
+# Core training framework
+torch
+torchvision
+
+# Ultralytics YOLO (training, export, validation)
+ultralytics
+
+# ONNX export
+onnx
+onnxruntime
+
+# Utilities
+numpy
+matplotlib

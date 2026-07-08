@@ -1,0 +1,37 @@
+# CMake build artifacts
+build/
+install/
+*.o
+*.a
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# ML artifacts — large files, track with Git LFS if needed
+ml/data/*
+!ml/data/.gitkeep
+ml/models/
+*.pt
+*.pth
+*.onnx
+*.trt
+*.engine
+
+# Gazebo logs and caches
+.gz/
+*.log
+
+# macOS
+.DS_Store

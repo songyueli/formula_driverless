@@ -1,0 +1,214 @@
+<?xml version="1.0" ?>
+<!--
+  FSD race car model.
+  Step 2: basic car with AckermannSteering (no sensors) — drive manually.
+  Step 3: add lidar and cameras (sensor blocks are stubbed below).
+
+  All TODO values must be filled in from real car measurements before this
+  model will behave correctly. See project brief section 5 & 6.
+-->
+<sdf version="1.10">
+  <model name="fsd_car">
+
+    <!-- ================================================================
+         CHASSIS
+         TODO: set mass, moments of inertia from real car specs
+         ================================================================ -->
+    <link name="chassis">
+      <inertial>
+        <mass>TODO</mass>           <!-- kg, total vehicle mass -->
+        <inertia>
+          <ixx>TODO</ixx>          <!-- kg·m², roll -->
+          <iyy>TODO</iyy>          <!-- kg·m², pitch -->
+          <izz>TODO</izz>          <!-- kg·m², yaw -->
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <visual name="chassis_visual">
+        <!-- TODO: replace box with a proper mesh once CAD is available -->
+        <geometry>
+          <box><size>TODO TODO TODO</size></box>  <!-- length width height, meters -->
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.1 0.1 0.1 1</diffuse>
+        </material>
+      </visual>
+      <collision name="chassis_collision">
+        <geometry>
+          <box><size>TODO TODO TODO</size></box>
+        </geometry>
+      </collision>
+
+      <!-- ================================================================
+           LIDAR — Ouster OS1-128
+           Fully parameterized from the brief (section 6).
+           TODO: set <pose> to the actual mounting position on the chassis.
+           ================================================================ -->
+      <sensor name="os1_128" type="gpu_lidar">
+        <pose>TODO TODO TODO 0 0 0</pose>  <!-- x y z roll pitch yaw, meters/rad -->
+        <update_rate>10</update_rate>
+        <lidar>
+          <scan>
+            <horizontal>
+              <samples>1024</samples>
+              <min_angle>-3.14159</min_angle>
+              <max_angle>3.14159</max_angle>
+            </horizontal>
+            <vertical>
+              <samples>128</samples>
+              <min_angle>-0.3927</min_angle>  <!-- -22.5 deg -->
+              <max_angle>0.3927</max_angle>   <!--  22.5 deg -->
+            </vertical>
+          </scan>
+          <range>
+            <min>0.3</min>
+            <max>120.0</max>
+          </range>
+          <noise>
+            <type>gaussian</type>
+            <stddev>0.008</stddev>
+          </noise>
+        </lidar>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <topic>/lidar/points</topic>
+      </sensor>
+
+      <!-- ================================================================
+           CAMERA — Blackfly S GigE 1.6MP (front)
+           TODO: set horizontal_fov from chosen lens spec
+           TODO: set pose from mounting position
+           ================================================================ -->
+      <sensor name="camera_front" type="camera">
+        <pose>TODO TODO TODO 0 0 0</pose>
+        <update_rate>30</update_rate>
+        <camera>
+          <image>
+            <width>1440</width>
+            <height>1080</height>
+          </image>
+          <horizontal_fov>TODO</horizontal_fov>
+        </camera>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <topic>/camera/front/image</topic>
+      </sensor>
+
+      <!-- CAMERA — Blackfly S GigE 1.6MP (left) -->
+      <sensor name="camera_left" type="camera">
+        <pose>TODO TODO TODO 0 0 TODO</pose>  <!-- rotate yaw for left-facing -->
+        <update_rate>30</update_rate>
+        <camera>
+          <image>
+            <width>1440</width>
+            <height>1080</height>
+          </image>
+          <horizontal_fov>TODO</horizontal_fov>
+        </camera>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <topic>/camera/left/image</topic>
+      </sensor>
+
+      <!-- CAMERA — Blackfly S GigE 1.6MP (right) -->
+      <sensor name="camera_right" type="camera">
+        <pose>TODO TODO TODO 0 0 TODO</pose>
+        <update_rate>30</update_rate>
+        <camera>
+          <image>
+            <width>1440</width>
+            <height>1080</height>
+          </image>
+          <horizontal_fov>TODO</horizontal_fov>
+        </camera>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <topic>/camera/right/image</topic>
+      </sensor>
+
+    </link> <!-- chassis -->
+
+
+    <!-- ================================================================
+         WHEELS — 4x (AWD, Ackermann front steering)
+         TODO: fill in mass, radius, width, friction coefficients
+         ================================================================ -->
+
+    <!-- Front-left wheel steering pivot -->
+    <joint name="front_left_wheel_steering_joint" type="revolute">
+      <parent>chassis</parent>
+      <child>front_left_wheel</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <limit>
+          <lower>TODO</lower>   <!-- negative of steering_limit, radians -->
+          <upper>TODO</upper>   <!-- steering_limit, radians -->
+        </limit>
+      </axis>
+      <pose>TODO TODO TODO 0 0 0</pose>
+    </joint>
+
+    <link name="front_left_wheel">
+      <inertial>
+        <mass>TODO</mass>
+        <inertia><ixx>TODO</ixx><iyy>TODO</iyy><izz>TODO</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
+      </inertial>
+      <visual name="visual"><geometry><cylinder><radius>TODO</radius><length>TODO</length></cylinder></geometry></visual>
+      <collision name="collision">
+        <geometry><cylinder><radius>TODO</radius><length>TODO</length></cylinder></geometry>
+        <surface><friction><ode>
+          <mu>TODO</mu>    <!-- longitudinal grip -->
+          <mu2>TODO</mu2>  <!-- lateral grip -->
+        </ode></friction></surface>
+      </collision>
+    </link>
+    <joint name="front_left_wheel_joint" type="revolute">
+      <parent>front_left_wheel</parent>
+      <child>front_left_wheel</child>
+      <axis><xyz>0 1 0</xyz></axis>
+    </joint>
+
+    <!-- TODO: repeat the same block for front_right_wheel, rear_left_wheel, rear_right_wheel -->
+
+
+    <!-- ================================================================
+         ACKERMANN STEERING SYSTEM PLUGIN
+         See project brief section 5 for parameter descriptions.
+         TODO: fill in all numeric values from real car specs.
+         ================================================================ -->
+    <plugin filename="gz-sim-ackermann-steering-system"
+            name="gz::sim::systems::AckermannSteering">
+      <!-- Driven wheels (AWD: both front and rear) -->
+      <left_joint>front_left_wheel_joint</left_joint>
+      <left_joint>rear_left_wheel_joint</left_joint>
+      <right_joint>front_right_wheel_joint</right_joint>
+      <right_joint>rear_right_wheel_joint</right_joint>
+
+      <!-- Steering joints (front axle only) -->
+      <left_steering_joint>front_left_wheel_steering_joint</left_steering_joint>
+      <right_steering_joint>front_right_wheel_steering_joint</right_steering_joint>
+
+      <kingpin_width>TODO</kingpin_width>       <!-- meters -->
+      <wheel_base>TODO</wheel_base>             <!-- meters, front-to-rear axle distance -->
+      <wheel_separation>TODO</wheel_separation> <!-- meters, track width -->
+      <wheel_radius>TODO</wheel_radius>         <!-- meters -->
+      <steering_limit>TODO</steering_limit>     <!-- radians; asin(wheel_base / min_turning_radius) -->
+
+      <min_velocity>TODO</min_velocity>         <!-- m/s, typically negative for reverse -->
+      <max_velocity>TODO</max_velocity>         <!-- m/s -->
+      <min_acceleration>TODO</min_acceleration> <!-- m/s² -->
+      <max_acceleration>TODO</max_acceleration> <!-- m/s² -->
+
+      <!-- gz-transport topic the control process publishes commands to -->
+      <topic>/cmd_ackermann</topic>
+    </plugin>
+
+    <!-- Required: broadcasts joint states so the steering works in simulation -->
+    <plugin filename="gz-sim-joint-state-publisher-system"
+            name="gz::sim::systems::JointStatePublisher"/>
+
+  </model>
+</sdf>
