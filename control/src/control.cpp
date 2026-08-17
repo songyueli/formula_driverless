@@ -1,6 +1,6 @@
 #include <gz/transport/Node.hh>
 #include <gz/msgs/pose.pb.h>
-#include <gz/msgs/ackermann_steering.pb.h>
+#include <gz/msgs/twist.pb.h>
 
 #include <common/types.hpp>
 

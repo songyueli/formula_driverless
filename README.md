@@ -55,8 +55,8 @@ Connect Foxglove to `ws://localhost:8765`.
 
 ## Build roadmap
 
-- [ ] Step 1 — Empty Gazebo world (ground plane) — confirm it runs
-- [ ] Step 2 — Add car model with AckermannSteering plugin, drive manually
+- [x] Step 1 — Empty Gazebo world (ground plane) — confirm it runs
+- [x] Step 2 — Add car model with AckermannSteering plugin, drive manually
 - [ ] Step 3 — Add lidar and 3 cameras to the car
 - [ ] Step 4 — Build cone track (blue/yellow/orange cones)
 - [ ] Step 5 — First gz-transport C++ program: subscribe to a sensor topic

@@ -59,5 +59,11 @@
       </link>
     </model>
 
+    <!-- FSD car — requires GZ_SIM_RESOURCE_PATH to include simulation/models -->
+    <include>
+      <uri>model://fsd_car</uri>
+      <pose>0 0 0.1 0 0 0</pose>
+    </include>
+
   </world>
 </sdf>
