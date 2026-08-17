@@ -9,6 +9,7 @@ ml/venv/
 ml/.venv/
 ml/data/*
 ml/models/
+ml/runs/
 *.o
 *.a
 *.so

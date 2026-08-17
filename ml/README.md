@@ -30,8 +30,14 @@ pip install -r requirements.txt
 
 ## Cone classes
 
-| Class   | Color  | Track position |
-|---------|--------|----------------|
-| 0       | Blue   | Left boundary  |
-| 1       | Yellow | Right boundary |
-| 2       | Orange | Entry / exit   |
+| Class | Color        | Track position   |
+|-------|--------------|-------------------|
+| 0     | Blue         | Left boundary     |
+| 1     | Yellow       | Right boundary    |
+| 2     | Orange       | Entry / exit      |
+| 3     | Large orange | Start/finish zone |
+
+Sourced from the [FSOCO dataset](https://fsoco.github.io/fsoco-dataset/), which
+labels 5 classes (`blue_cone`, `yellow_cone`, `orange_cone`, `large_orange_cone`,
+`unknown_cone`); `unknown_cone` (FSOCO's non-rules-compliant catch-all) is dropped
+during conversion.

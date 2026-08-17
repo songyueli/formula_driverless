@@ -1,6 +1,8 @@
 # Core training framework
-torch
+# torch pinned to 2.2.2: the last PyPI release with Intel macOS (x86_64) wheels
+torch==2.2.2
 torchvision
+opencv-python==4.9.0.80
 
 # Ultralytics YOLO (training, export, validation)
 ultralytics
@@ -10,5 +12,10 @@ onnx
 onnxruntime
 
 # Utilities
-numpy
+# numpy<2: torch 2.2.2 predates the NumPy 2.0 ABI and breaks tensor<->ndarray conversion above it
+numpy<2
 matplotlib
+
+# Streams a sample of the FSOCO dataset from the remote zip via HTTP range
+# requests, instead of downloading the full 24GB archive
+remotezip

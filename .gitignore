@@ -28,6 +28,20 @@ ml/models/
 *.onnx
 *.trt
 *.engine
+.ipynb_checkpoints/
+
+# Training run outputs (metrics, plots, logs) are ignored, except the
+# checkpoint below, which is tracked via Git LFS (see .gitattributes).
+# Git won't apply a negation to a file inside an ignored directory, so each
+# level has to be carved out individually rather than just ignoring ml/runs/.
+ml/runs/*
+!ml/runs/detect/
+ml/runs/detect/*
+!ml/runs/detect/train/
+ml/runs/detect/train/*
+!ml/runs/detect/train/weights/
+ml/runs/detect/train/weights/*
+!ml/runs/detect/train/weights/best.pt
 
 # Gazebo logs and caches
 .gz/
