@@ -1,0 +1,285 @@
+<?xml version="1.0" ?>
+<!--
+  Step 4 of the build roadmap: fsd_car + a small closed-loop cone track.
+  Stadium shape — two 15m straights joined by two 5m-radius semicircle
+  turns, 3m track width. Blue cones mark the left boundary (direction of
+  travel), yellow the right, with an orange gate at start/finish.
+  All dimensions are placeholders (no real track spec) chosen to be a
+  small, easy-to-eyeball first test track.
+
+  Run with (GZ_SIM_RESOURCE_PATH must include simulation/models):
+    export GZ_SIM_RESOURCE_PATH=/workspace/simulation/models
+    gz sim -s -r simulation/worlds/track.sdf
+-->
+<sdf version="1.11">
+  <world name="track">
+
+    <!-- Physics: DART engine, 1 ms step. Good default for vehicle dynamics. -->
+    <physics name="default" type="dart">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <!-- Required Gazebo system plugins -->
+    <plugin filename="gz-sim-physics-system"
+            name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+            name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-user-commands-system"
+            name="gz::sim::systems::UserCommands"/>
+    <!-- Required for camera/lidar sensors to actually initialize and publish
+         data — without this, sensor elements in a model are inert. -->
+    <plugin filename="gz-sim-sensors-system"
+            name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <!-- Lighting -->
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- Ground plane -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>200 200</size>
+            </plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>200 200</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.3 0.3 0.3 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- FSD car, spawned at the start/finish gate -->
+    <include>
+      <uri>model://fsd_car</uri>
+      <pose>-7.5 5.0 0.1 0 0 0</pose>
+    </include>
+
+    <!-- ==================== ORANGE — start/finish gate ==================== -->
+    <include>
+      <uri>model://cone_orange</uri>
+      <name>cone_orange_00</name>
+      <pose>-7.500 6.500 0.2525 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_orange</uri>
+      <name>cone_orange_01</name>
+      <pose>-7.500 3.500 0.2525 0 0 0</pose>
+    </include>
+
+    <!-- ==================== BLUE — left boundary ==================== -->
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_01</name>
+      <pose>-4.429 6.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_02</name>
+      <pose>-1.358 6.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_03</name>
+      <pose>1.712 6.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_04</name>
+      <pose>4.783 6.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_05</name>
+      <pose>7.960 6.484 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_06</name>
+      <pose>11.612 5.034 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_07</name>
+      <pose>13.762 1.744 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_08</name>
+      <pose>13.623 -2.183 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_09</name>
+      <pose>11.246 -5.312 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_10</name>
+      <pose>7.500 -6.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_11</name>
+      <pose>4.429 -6.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_12</name>
+      <pose>1.358 -6.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_13</name>
+      <pose>-1.712 -6.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_14</name>
+      <pose>-4.783 -6.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_15</name>
+      <pose>-7.960 -6.484 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_16</name>
+      <pose>-11.612 -5.034 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_17</name>
+      <pose>-13.762 -1.744 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_18</name>
+      <pose>-13.623 2.183 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_blue</uri>
+      <name>cone_blue_19</name>
+      <pose>-11.246 5.312 0.1625 0 0 0</pose>
+    </include>
+
+    <!-- ==================== YELLOW — right boundary ==================== -->
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_01</name>
+      <pose>-4.429 3.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_02</name>
+      <pose>-1.358 3.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_03</name>
+      <pose>1.712 3.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_04</name>
+      <pose>4.783 3.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_05</name>
+      <pose>7.748 3.491 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_06</name>
+      <pose>9.714 2.711 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_07</name>
+      <pose>10.872 0.939 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_08</name>
+      <pose>10.797 -1.175 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_09</name>
+      <pose>9.517 -2.860 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_10</name>
+      <pose>7.500 -3.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_11</name>
+      <pose>4.429 -3.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_12</name>
+      <pose>1.358 -3.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_13</name>
+      <pose>-1.712 -3.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_14</name>
+      <pose>-4.783 -3.500 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_15</name>
+      <pose>-7.748 -3.491 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_16</name>
+      <pose>-9.714 -2.711 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_17</name>
+      <pose>-10.872 -0.939 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_18</name>
+      <pose>-10.797 1.175 0.1625 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://cone_yellow</uri>
+      <name>cone_yellow_19</name>
+      <pose>-9.517 2.860 0.1625 0 0 0</pose>
+    </include>
+  </world>
+</sdf>

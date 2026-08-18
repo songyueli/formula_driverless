@@ -1,0 +1,27 @@
+<?xml version="1.0" ?>
+<!--
+  Blue boundary cone. FS-standard small cone dimensions (placeholder —
+  no real cone specs yet): 0.115m base radius, 0.325m tall.
+  <cone> geometry requires SDF 1.11+.
+-->
+<sdf version="1.11">
+  <model name="cone_blue">
+    <static>true</static>
+    <link name="link">
+      <visual name="visual">
+        <geometry>
+          <cone><radius>0.115</radius><length>0.325</length></cone>
+        </geometry>
+        <material>
+          <ambient>0 0 0.8 1</ambient>
+          <diffuse>0 0 0.8 1</diffuse>
+        </material>
+      </visual>
+      <collision name="collision">
+        <geometry>
+          <cone><radius>0.115</radius><length>0.325</length></cone>
+        </geometry>
+      </collision>
+    </link>
+  </model>
+</sdf>

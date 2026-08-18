@@ -43,19 +43,15 @@
       </collision>
 
       <!-- ================================================================
-           SENSORS (lidar + 3 cameras) — deferred to Step 3, disabled below.
-           SDF fails to parse the *entire* file if any single element has an
-           invalid value, even one nothing currently depends on — so these
-           can't be left in as live elements with TODO pose/FOV values.
-           Re-enable (uncomment) and fill in real values in Step 3:
-             LIDAR        — Ouster OS1-128, fully parameterized already,
-                             just needs <pose> set to the mounting position.
-             camera_front — needs <pose> and <horizontal_fov> from lens spec.
-             camera_left  — needs <pose> (yaw rotated to face left) and FOV.
-             camera_right — needs <pose> (yaw rotated to face right) and FOV.
+           SENSORS — lidar + 3 cameras.
+           Mounting positions and FOV are placeholders (no real car specs
+           yet): lidar centered above the chassis, cameras at the nose
+           with left/right yawed ~34° outward from front for peripheral
+           coverage. horizontal_fov is 45° (0.7854 rad) on all 3 cameras.
+           ================================================================ -->
 
       <sensor name="os1_128" type="gpu_lidar">
-        <pose>TODO TODO TODO 0 0 0</pose>
+        <pose>0.3 0 0.35 0 0 0</pose>
         <update_rate>10</update_rate>
         <lidar>
           <scan>
@@ -65,7 +61,10 @@
               <max_angle>3.14159</max_angle>
             </horizontal>
             <vertical>
-              <samples>128</samples>
+              <samples>32</samples>  <!-- reduced from 128 (real OS1-128 channel
+                                          count) for dev-time render cost on
+                                          software rendering; bump back up once
+                                          perception actually consumes this -->
               <min_angle>-0.3927</min_angle>
               <max_angle>0.3927</max_angle>
             </vertical>
@@ -85,14 +84,14 @@
       </sensor>
 
       <sensor name="camera_front" type="camera">
-        <pose>TODO TODO TODO 0 0 0</pose>
+        <pose>0.9 0 1.0 0 0.3 0</pose>  <!-- 1m up, pitched down ~17 deg -->
         <update_rate>30</update_rate>
         <camera>
           <image>
             <width>1440</width>
             <height>1080</height>
           </image>
-          <horizontal_fov>TODO</horizontal_fov>
+          <horizontal_fov>0.7854</horizontal_fov>  <!-- 45 deg -->
         </camera>
         <always_on>true</always_on>
         <visualize>false</visualize>
@@ -100,14 +99,14 @@
       </sensor>
 
       <sensor name="camera_left" type="camera">
-        <pose>TODO TODO TODO 0 0 TODO</pose>
+        <pose>0.9 0 1.0 0 0.3 0.6</pose>  <!-- 1m up, pitched down ~17 deg, yawed ~34 deg left -->
         <update_rate>30</update_rate>
         <camera>
           <image>
             <width>1440</width>
             <height>1080</height>
           </image>
-          <horizontal_fov>TODO</horizontal_fov>
+          <horizontal_fov>0.7854</horizontal_fov>  <!-- 45 deg -->
         </camera>
         <always_on>true</always_on>
         <visualize>false</visualize>
@@ -115,20 +114,19 @@
       </sensor>
 
       <sensor name="camera_right" type="camera">
-        <pose>TODO TODO TODO 0 0 TODO</pose>
+        <pose>0.9 0 1.0 0 0.3 -0.6</pose>  <!-- 1m up, pitched down ~17 deg, yawed ~34 deg right -->
         <update_rate>30</update_rate>
         <camera>
           <image>
             <width>1440</width>
             <height>1080</height>
           </image>
-          <horizontal_fov>TODO</horizontal_fov>
+          <horizontal_fov>0.7854</horizontal_fov>  <!-- 45 deg -->
         </camera>
         <always_on>true</always_on>
         <visualize>false</visualize>
         <topic>/camera/right/image</topic>
       </sensor>
-      -->
 
     </link> <!-- chassis -->
 

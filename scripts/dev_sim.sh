@@ -12,7 +12,7 @@ set -e
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export GZ_SIM_RESOURCE_PATH="${REPO_ROOT}/simulation/models"
 
-WORLD="${REPO_ROOT}/simulation/worlds/empty.sdf"
+WORLD="${REPO_ROOT}/simulation/worlds/track.sdf"
 BRIDGE="${REPO_ROOT}/build/foxglove_bridge"
 
 if [ ! -x "$BRIDGE" ]; then
@@ -42,7 +42,7 @@ SIM_PID=$!
 echo "Waiting for gz sim to come up..."
 UP=""
 for i in $(seq 1 30); do
-  if gz topic -l 2>/dev/null | grep -q "/world/empty/pose/info"; then
+  if gz topic -l 2>/dev/null | grep -q "/world/track/pose/info"; then
     UP=1
     break
   fi

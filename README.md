@@ -57,10 +57,10 @@ Connect Foxglove to `ws://localhost:8765`.
 
 - [x] Step 1 — Empty Gazebo world (ground plane) — confirm it runs
 - [x] Step 2 — Add car model with AckermannSteering plugin, drive manually
-- [ ] Step 3 — Add lidar and 3 cameras to the car
-- [ ] Step 4 — Build cone track (blue/yellow/orange cones)
-- [ ] Step 5 — First gz-transport C++ program: subscribe to a sensor topic
-- [ ] Step 6 — Foxglove bridge: live sensor visualization
+- [x] Step 3 — Add lidar and 3 cameras to the car
+- [x] Step 4 — Build cone track (blue/yellow/orange cones)
+- [x] Step 5 — First gz-transport C++ program: subscribe to a sensor topic
+- [x] Step 6 — Foxglove bridge: live sensor visualization
 - [ ] Step 7 — Perception: cone detection and color classification
 - [ ] Step 8 — Localization: vehicle pose from sensor fusion
 - [ ] Step 9 — Planning + Control: close the autonomy loop
