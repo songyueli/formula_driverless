@@ -21,12 +21,21 @@
 // Subscribes to gz-transport topics and republishes them through a
 // foxglove::WebSocketServer so the Foxglove desktop app can visualize them.
 //
+// Usage:
+//   foxglove_bridge <world_name>
+// <world_name> must match the <world name="..."> in whichever .sdf is
+// currently running (e.g. "track", "trackdrive") -- gz-transport namespaces
+// every world topic under /world/<world_name>/..., so this is the one place
+// that has to agree with the launcher script and the .sdf file. Passed as a
+// runtime argument rather than hardcoded, so changing which world is running
+// doesn't require touching this file or rebuilding.
+//
 // Connect Foxglove to:  ws://<docker-host>:8765
 //
 // Transform tree (/tf, Foxglove FrameTransforms):
 //   world -> fsd_car                         (dynamic, from Pose_V every tick)
 //   fsd_car -> {camera_front, camera_left, camera_right, os1_128}
-//     (static, fetched once at startup via the /world/track/scene/info
+//     (static, fetched once at startup via the /world/<world_name>/scene/info
 //      *service* -- not the topic of the same name, which is a one-shot
 //      broadcast a bridge started even slightly late would simply miss.
 //      Each sensor's pose-relative-to-model is composed from its parent
@@ -36,7 +45,7 @@
 // with no baked-in world pose; Foxglove resolves placement by walking /tf.
 //
 // Currently forwards:
-//   /world/track/pose/info (gz.msgs.Pose_V), driving:
+//   /world/<world_name>/pose/info (gz.msgs.Pose_V), driving:
 //     -> /vehicle_pose (Foxglove PoseInFrame)   — the "fsd_car" entry
 //     -> /scene        (Foxglove SceneUpdate)   — car chassis as a cube,
 //                       every cone_{blue,yellow,orange}_* entry as a cone
@@ -56,8 +65,6 @@
 
 namespace
 {
-constexpr const char *kPoseTopic = "/world/track/pose/info";
-constexpr const char *kSceneService = "/world/track/scene/info";
 constexpr const char *kCarModelName = "fsd_car";
 constexpr const char *kFrameId = "world";
 
@@ -191,16 +198,16 @@ bool ConeSpecForName(const std::string &_name, ConeSpec *_spec)
 // resolved model description (link.pose() composed with sensor.pose()),
 // rather than duplicating the SDF's numbers by hand a second time here.
 std::unordered_map<std::string, foxglove::messages::Pose> FetchStaticSensorPoses(
-    gz::transport::Node &_node)
+    gz::transport::Node &_node, const std::string &_sceneService)
 {
     std::unordered_map<std::string, foxglove::messages::Pose> poses;
 
     gz::msgs::Scene sceneMsg;
     bool result = false;
-    const bool ok = _node.Request(kSceneService, 5000u, sceneMsg, result);
+    const bool ok = _node.Request(_sceneService, 5000u, sceneMsg, result);
     if (!ok || !result)
     {
-        std::cerr << "Warning: failed to fetch " << kSceneService
+        std::cerr << "Warning: failed to fetch " << _sceneService
                   << " -- sensor frames will be missing from /tf\n";
         return poses;
     }
@@ -224,8 +231,19 @@ std::unordered_map<std::string, foxglove::messages::Pose> FetchStaticSensorPoses
 }
 }  // namespace
 
-int main()
+int main(int argc, char **argv)
 {
+    if (argc != 2)
+    {
+        std::cerr << "Usage: " << argv[0] << " <world_name>\n"
+                   << "  <world_name> must match the <world name=\"...\"> of the\n"
+                   << "  currently running .sdf, e.g.: " << argv[0] << " trackdrive\n";
+        return 1;
+    }
+    const std::string worldName = argv[1];
+    const std::string poseTopic = "/world/" + worldName + "/pose/info";
+    const std::string sceneService = "/world/" + worldName + "/scene/info";
+
     foxglove::WebSocketServerOptions ws_options;
     ws_options.host = "0.0.0.0";  // 127.0.0.1 wouldn't be reachable through -p 8765:8765
     ws_options.port = 8765;
@@ -259,9 +277,9 @@ int main()
 
     gz::transport::Node node;
 
-    const auto sensorStaticPoses = FetchStaticSensorPoses(node);
+    const auto sensorStaticPoses = FetchStaticSensorPoses(node, sceneService);
     std::cout << "Fetched " << sensorStaticPoses.size()
-              << " static sensor transform(s) from " << kSceneService << '\n';
+              << " static sensor transform(s) from " << sceneService << '\n';
 
     auto camFrontChannel = foxglove::messages::RawImageChannel::create("/camera/front").value();
     auto camLeftChannel  = foxglove::messages::RawImageChannel::create("/camera/left").value();
@@ -464,14 +482,14 @@ int main()
         scene_channel.log(update);
     };
 
-    if (!node.Subscribe(kPoseTopic, onPoseV))
+    if (!node.Subscribe(poseTopic, onPoseV))
     {
-        std::cerr << "Failed to subscribe to " << kPoseTopic << '\n';
+        std::cerr << "Failed to subscribe to " << poseTopic << '\n';
         return 1;
     }
 
     std::cout << "Foxglove bridge listening on ws://0.0.0.0:8765 -- forwarding "
-              << kPoseTopic << " -> /vehicle_pose, /scene, /tf; "
+              << poseTopic << " -> /vehicle_pose, /scene, /tf; "
               << "3 cameras -> /camera/{front,left,right}, /lidar/points/points -> /lidar\n";
 
     gz::transport::waitForShutdown();
