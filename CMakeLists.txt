@@ -14,14 +14,25 @@ find_package(gz-transport REQUIRED)
 find_package(gz-msgs      REQUIRED)
 
 # ---------------------------------------------------------------------------
-# Foxglove C++ SDK — prebuilt release binary (matches the container's
-# x86_64-unknown-linux-gnu target, so nothing needs to be compiled from source)
+# Foxglove C++ SDK — prebuilt release binary, picked by host architecture
+# (amd64 dev machines vs. arm64 boards like Jetson) so nothing needs to be
+# compiled from source on either. A hardcoded x86_64-only URL here silently
+# produces an unlinkable arm64 build ("Relocations in generic ELF (EM: 62)")
+# rather than a clear error, so this has to be architecture-aware.
 # ---------------------------------------------------------------------------
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  set(FOXGLOVE_SDK_TARGET "aarch64-unknown-linux-gnu")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+  set(FOXGLOVE_SDK_TARGET "x86_64-unknown-linux-gnu")
+else()
+  message(FATAL_ERROR "No prebuilt Foxglove SDK release known for CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
 include(FetchContent)
 FetchContent_Declare(
   foxglove_sdk
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-  URL https://github.com/foxglove/foxglove-sdk/releases/download/sdk%2Fv0.24.0/foxglove-v0.24.0-cpp-x86_64-unknown-linux-gnu.zip
+  URL https://github.com/foxglove/foxglove-sdk/releases/download/sdk%2Fv0.24.0/foxglove-v0.24.0-cpp-${FOXGLOVE_SDK_TARGET}.zip
 )
 FetchContent_MakeAvailable(foxglove_sdk)
 find_package(foxglove-sdk CONFIG REQUIRED HINTS "${foxglove_sdk_SOURCE_DIR}")
