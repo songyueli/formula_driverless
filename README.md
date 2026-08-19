@@ -35,8 +35,7 @@ ml/             Python environment for YOLO training (not part of the C++ build)
 ## Build
 
 ```bash
-cmake -B build
-cmake --build build
+./scripts/build.sh
 ```
 
 ## Run the simulation

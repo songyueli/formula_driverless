@@ -56,6 +56,9 @@
 //   /camera/{front,left,right}/image (gz.msgs.Image)
 //     -> /camera/{front,left,right} (Foxglove RawImage), frame_id matching
 //        the sensor's own name (camera_front/camera_left/camera_right)
+//   /camera/stitched/image (gz.msgs.Image, published by perception --
+//     the 3 raw cameras merged into one cylindrical panorama)
+//     -> /camera/stitched (Foxglove RawImage), frame_id "camera_front"
 //   /lidar/points/points (gz.msgs.PointCloudPacked -- gpu_lidar's derived
 //   point-cloud topic; /lidar/points itself is a raw LaserScan, not this)
 //     -> /lidar (Foxglove PointCloud), frame_id "os1_128"
@@ -281,10 +284,11 @@ int main(int argc, char **argv)
     std::cout << "Fetched " << sensorStaticPoses.size()
               << " static sensor transform(s) from " << sceneService << '\n';
 
-    auto camFrontChannel = foxglove::messages::RawImageChannel::create("/camera/front").value();
-    auto camLeftChannel  = foxglove::messages::RawImageChannel::create("/camera/left").value();
-    auto camRightChannel = foxglove::messages::RawImageChannel::create("/camera/right").value();
-    auto lidarChannel    = foxglove::messages::PointCloudChannel::create("/lidar").value();
+    auto camFrontChannel    = foxglove::messages::RawImageChannel::create("/camera/front").value();
+    auto camLeftChannel     = foxglove::messages::RawImageChannel::create("/camera/left").value();
+    auto camRightChannel    = foxglove::messages::RawImageChannel::create("/camera/right").value();
+    auto camStitchedChannel = foxglove::messages::RawImageChannel::create("/camera/stitched").value();
+    auto lidarChannel       = foxglove::messages::PointCloudChannel::create("/lidar").value();
 
     auto makeImageSubscriber = [](foxglove::messages::RawImageChannel &_channel,
                                    std::string _frameId)
@@ -313,9 +317,14 @@ int main(int argc, char **argv)
             });
     };
 
-    auto onCamFront = makeImageSubscriber(camFrontChannel, "camera_front");
-    auto onCamLeft  = makeImageSubscriber(camLeftChannel, "camera_left");
-    auto onCamRight = makeImageSubscriber(camRightChannel, "camera_right");
+    auto onCamFront    = makeImageSubscriber(camFrontChannel, "camera_front");
+    auto onCamLeft     = makeImageSubscriber(camLeftChannel, "camera_left");
+    auto onCamRight    = makeImageSubscriber(camRightChannel, "camera_right");
+    // frame_id "camera_front" is deliberate, not a copy-paste slip: the
+    // stitched panorama is built in the front camera's frame (see
+    // camera_stitcher.cpp), so that's the /tf entry Foxglove should place it
+    // relative to.
+    auto onCamStitched = makeImageSubscriber(camStitchedChannel, "camera_front");
 
     if (!node.Subscribe("/camera/front/image", onCamFront))
     {
@@ -330,6 +339,11 @@ int main(int argc, char **argv)
     if (!node.Subscribe("/camera/right/image", onCamRight))
     {
         std::cerr << "Failed to subscribe to /camera/right/image\n";
+        return 1;
+    }
+    if (!node.Subscribe("/camera/stitched/image", onCamStitched))
+    {
+        std::cerr << "Failed to subscribe to /camera/stitched/image\n";
         return 1;
     }
 

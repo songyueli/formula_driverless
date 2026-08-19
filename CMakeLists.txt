@@ -14,6 +14,16 @@ find_package(gz-transport REQUIRED)
 find_package(gz-msgs      REQUIRED)
 
 # ---------------------------------------------------------------------------
+# OpenCV -- used by perception for camera-frame stitching (see
+# perception/include/camera_stitcher.hpp). apt's libopencv-dev is CPU-only,
+# so Stitch() runs on the CPU everywhere for now. GPU acceleration
+# (cv::cuda::remap) needs OpenCV built from source with CUDA enabled -- not
+# done here; the cv::cuda API surface doesn't even exist in the headers of a
+# CPU-only build, so this isn't a runtime toggle, it's a separate rebuild.
+# ---------------------------------------------------------------------------
+find_package(OpenCV REQUIRED)
+
+# ---------------------------------------------------------------------------
 # Foxglove C++ SDK — prebuilt release binary, picked by host architecture
 # (amd64 dev machines vs. arm64 boards like Jetson) so nothing needs to be
 # compiled from source on either. A hardcoded x86_64-only URL here silently
@@ -39,6 +49,39 @@ find_package(foxglove-sdk CONFIG REQUIRED HINTS "${foxglove_sdk_SOURCE_DIR}")
 foxglove_sdk_add_cpp_library(foxglove_cpp TYPE STATIC)
 
 # ---------------------------------------------------------------------------
+# ONNX Runtime -- prebuilt release binary, picked by host architecture, same
+# pattern as the Foxglove SDK above (and same reason: a hardcoded x86_64
+# URL would silently produce an unlinkable arm64 build). CPU-only build on
+# both architectures -- Microsoft ships a separate prebuilt CUDA build for
+# x64 (onnxruntime-linux-x64-gpu_cuda12-*), but NOT for aarch64/Jetson
+# (checked the actual release assets, not assumed); real GPU inference on
+# the Jetson needs a from-source build, tracked as separate future work.
+#
+# This release doesn't ship a working CMake config package (its
+# onnxruntimeConfig.cmake references files the release tarball doesn't
+# actually include -- confirmed by trying find_package() against it, not
+# assumed), so its include dir and .so are wired up manually below instead
+# of via find_package like the Foxglove SDK. BUILD_RPATH points `perception`
+# at the extracted .so location so it's found at runtime without needing
+# LD_LIBRARY_PATH set by hand.
+# ---------------------------------------------------------------------------
+set(ONNXRUNTIME_VERSION "1.29.0")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  set(ONNXRUNTIME_TARGET "linux-aarch64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+  set(ONNXRUNTIME_TARGET "linux-x64")
+else()
+  message(FATAL_ERROR "No prebuilt ONNX Runtime release known for CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
+FetchContent_Declare(
+  onnxruntime
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  URL https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-${ONNXRUNTIME_TARGET}-${ONNXRUNTIME_VERSION}.tgz
+)
+FetchContent_MakeAvailable(onnxruntime)
+
+# ---------------------------------------------------------------------------
 # Shared type definitions (header-only, no compiled library needed)
 # ---------------------------------------------------------------------------
 include_directories(common/include)
@@ -47,10 +90,21 @@ include_directories(common/include)
 # Autonomy pipeline executables — one per process
 # ---------------------------------------------------------------------------
 
-add_executable(perception    perception/src/perception.cpp)
+add_executable(perception
+    perception/src/perception.cpp
+    perception/src/camera_stitcher.cpp
+    perception/src/cone_detector.cpp)
+target_include_directories(perception PRIVATE
+    perception/include
+    ${OpenCV_INCLUDE_DIRS}
+    ${onnxruntime_SOURCE_DIR}/include)
 target_link_libraries(perception
     gz-transport::gz-transport
-    gz-msgs::gz-msgs)
+    gz-msgs::gz-msgs
+    ${OpenCV_LIBS}
+    ${onnxruntime_SOURCE_DIR}/lib/libonnxruntime.so)
+set_target_properties(perception PROPERTIES
+    BUILD_RPATH "${onnxruntime_SOURCE_DIR}/lib")
 
 add_executable(localization  localization/src/localization.cpp)
 target_link_libraries(localization
