@@ -55,6 +55,26 @@
             name="gz::sim::systems::Sensors">
       <render_engine>ogre2</render_engine>
     </plugin>
+    <!-- Same requirement as Sensors above, but for the non-rendering IMU
+         and NavSat (GNSS) sensors on fsd_car; without these, those
+         <sensor> elements are inert too. -->
+    <plugin filename="gz-sim-imu-system"
+            name="gz::sim::systems::Imu"/>
+    <plugin filename="gz-sim-navsat-system"
+            name="gz::sim::systems::NavSat"/>
+
+    <!-- Arbitrary real-world georeference point (San Diego area) so the
+         navsat sensors have a lat/lon origin to compute from; not tied
+         to any specific real venue, this world's own local coordinates are
+         what actually matter for the track layout. -->
+    <spherical_coordinates>
+      <surface_model>EARTH_WGS84</surface_model>
+      <world_frame_orientation>ENU</world_frame_orientation>
+      <latitude_deg>32.9</latitude_deg>
+      <longitude_deg>-117.1</longitude_deg>
+      <elevation>100</elevation>
+      <heading_deg>0</heading_deg>
+    </spherical_coordinates>
 
     <!-- Lighting -->
     <light name="sun" type="directional">

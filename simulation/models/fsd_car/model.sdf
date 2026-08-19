@@ -133,6 +133,92 @@
         <topic>/camera/right/image</topic>
       </sensor>
 
+      <!-- ================================================================
+           INS/GNSS: emulates a VectorNav VN-300 (dual-antenna GNSS/INS).
+           A real VN-300 outputs an already internally-fused position/
+           velocity/attitude solution, but this exposes the RAW component
+           sensors (2x GNSS antenna, 1x IMU) that unit contains rather than
+           a magic pre-fused output, since the whole point of this project
+           is to fuse them ourselves in localization/. Mount positions are
+           placeholders (roof/hoop-height antennas, IMU near CG) pending
+           real measurements, same caveat as everything else in this file.
+
+           GNSS noise assumes RTK-corrected fixes: VN-300's own datasheet
+           only publishes standalone/SBAS accuracy (1.0m/1.5m horizontal/
+           vertical); RTK Fixed accuracy isn't vendor-specific (it's set by
+           carrier-phase differential GPS itself), so this uses the
+           standard RTK Fixed figures (~1cm horizontal, ~2cm vertical).
+           Velocity accuracy (<0.05 m/s) and the 1m antenna baseline (which
+           the VN-300 heading-accuracy spec of 0.15-0.3 deg is quoted at)
+           are both straight from the VN-300 datasheet:
+           https://www.vectornav.com/products/detail/vn-300
+           IMU noise is also straight from that datasheet: gyro 0.0035
+           deg/s/sqrt(Hz) noise density, <5 deg/hr typical in-run bias;
+           accel <0.14 mg/sqrt(Hz) noise density, <0.04 mg in-run bias.
+           Converted to stddev at this sensor's 400 Hz update rate (density
+           * sqrt(rate)); bias figures are modeled as a single per-run
+           constant draw (bias_stddev), not a full random-walk process;
+           noise.sdf supports that too (dynamic_bias_stddev/
+           dynamic_bias_correlation_time) but wasn't worth the extra
+           complexity here.
+           ================================================================ -->
+
+      <sensor name="gnss_front" type="navsat">
+        <pose>0.5 0 0.5 0 0 0</pose>  <!-- front antenna, 1m baseline from gnss_rear -->
+        <update_rate>400</update_rate>
+        <navsat>
+          <position_sensing>
+            <horizontal><noise type="gaussian"><stddev>0.01</stddev></noise></horizontal>
+            <vertical><noise type="gaussian"><stddev>0.02</stddev></noise></vertical>
+          </position_sensing>
+          <velocity_sensing>
+            <horizontal><noise type="gaussian"><stddev>0.05</stddev></noise></horizontal>
+            <vertical><noise type="gaussian"><stddev>0.05</stddev></noise></vertical>
+          </velocity_sensing>
+        </navsat>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <topic>/gnss/front</topic>
+      </sensor>
+
+      <sensor name="gnss_rear" type="navsat">
+        <pose>-0.5 0 0.5 0 0 0</pose>  <!-- rear antenna, 1m baseline from gnss_front -->
+        <update_rate>400</update_rate>
+        <navsat>
+          <position_sensing>
+            <horizontal><noise type="gaussian"><stddev>0.01</stddev></noise></horizontal>
+            <vertical><noise type="gaussian"><stddev>0.02</stddev></noise></vertical>
+          </position_sensing>
+          <velocity_sensing>
+            <horizontal><noise type="gaussian"><stddev>0.05</stddev></noise></horizontal>
+            <vertical><noise type="gaussian"><stddev>0.05</stddev></noise></vertical>
+          </velocity_sensing>
+        </navsat>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <topic>/gnss/rear</topic>
+      </sensor>
+
+      <sensor name="imu" type="imu">
+        <pose>0 0 0.05 0 0 0</pose>  <!-- near CG -->
+        <update_rate>400</update_rate>
+        <imu>
+          <angular_velocity>
+            <x><noise type="gaussian"><stddev>0.0012</stddev><bias_stddev>0.000024</bias_stddev></noise></x>
+            <y><noise type="gaussian"><stddev>0.0012</stddev><bias_stddev>0.000024</bias_stddev></noise></y>
+            <z><noise type="gaussian"><stddev>0.0012</stddev><bias_stddev>0.000024</bias_stddev></noise></z>
+          </angular_velocity>
+          <linear_acceleration>
+            <x><noise type="gaussian"><stddev>0.0275</stddev><bias_stddev>0.00039</bias_stddev></noise></x>
+            <y><noise type="gaussian"><stddev>0.0275</stddev><bias_stddev>0.00039</bias_stddev></noise></y>
+            <z><noise type="gaussian"><stddev>0.0275</stddev><bias_stddev>0.00039</bias_stddev></noise></z>
+          </linear_acceleration>
+        </imu>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <topic>/imu</topic>
+      </sensor>
+
     </link> <!-- chassis -->
 
 
@@ -360,6 +446,32 @@
     <!-- Required: broadcasts joint states so the steering works in simulation -->
     <plugin filename="gz-sim-joint-state-publisher-system"
             name="gz::sim::systems::JointStatePublisher"/>
+
+    <!-- ================================================================
+         GROUND SPEED SENSOR: emulates a Sensoric OMS Race, a non-contact
+         optical sensor that measures true ground velocity (longitudinal +
+         lateral only, no vertical, since it's a biaxial sensor) directly
+         off the road surface, independent of wheel slip. gz-sim has no
+         dedicated "ground speed sensor" type, so this uses the generic
+         OdometryPublisher system plugin instead, which reads the model's
+         actual physics-engine velocity (as opposed to AckermannSteering's
+         own /model/fsd_car/odometry above, which is wheel-kinematic
+         ESTIMATED velocity, not measured), mechanically the closest
+         match to what a non-contact optical sensor is approximating.
+         Specs from https://www.sensoric-solutions.com/ : 1kHz update
+         rate, 0.1% speed accuracy (converted to an absolute stddev
+         assuming a representative ~20 m/s FSAE dynamic-event speed, since
+         gz's noise model needs an absolute value, not a percentage).
+         ================================================================ -->
+    <plugin filename="gz-sim-odometry-publisher-system"
+            name="gz::sim::systems::OdometryPublisher">
+      <dimensions>2</dimensions>
+      <odom_frame>fsd_car/ground_speed_odom</odom_frame>
+      <robot_base_frame>fsd_car/chassis</robot_base_frame>
+      <odom_publish_frequency>1000</odom_publish_frequency>
+      <odom_topic>/ground_speed</odom_topic>
+      <gaussian_noise>0.02</gaussian_noise>
+    </plugin>
 
   </model>
 </sdf>
