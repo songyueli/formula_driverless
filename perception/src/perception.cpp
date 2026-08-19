@@ -4,6 +4,7 @@
 #include <gz/msgs/pose_v.pb.h>
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <common/types.hpp>
 #include "camera_stitcher.hpp"
@@ -12,6 +13,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -150,6 +152,19 @@ constexpr float kConfThreshold = 0.25f;
 // that's the order the model was trained to output class indices in.
 constexpr const char *kClassNames[] = {"blue", "yellow", "orange", "large_orange"};
 
+// RGB order (not BGR) -- matches this whole pipeline's own image
+// convention (RGB_INT8 throughout, see FromImageMsg's comment), NOT
+// OpenCV's usual BGR default. Same order/indexing as kClassNames.
+const cv::Scalar kClassColorsRgb[] = {
+    cv::Scalar(60, 60, 255),   // blue   (brightened -- pure (0,0,255) reads
+                               // near-black against a dark cone in a small
+                               // preview; same reasoning for the others)
+    cv::Scalar(255, 220, 40),  // yellow
+    cv::Scalar(255, 140, 30),  // orange
+    cv::Scalar(255, 90, 0),    // large_orange (darker orange, distinguishable
+                               // from orange at a glance)
+};
+
 gz::msgs::Image ToImageMsg(const cv::Mat &_img)
 {
     gz::msgs::Image msg;
@@ -240,6 +255,20 @@ int main()
     auto stitchedPub = node.Advertise<gz::msgs::Image>("/camera/stitched/image");
     auto detectionsPub = node.Advertise<gz::msgs::Pose_V>("/cone_detections");
 
+    // Visualization only -- lets a human directly compare YOLO's raw boxes
+    // against the panorama in Foxglove. Deliberately NOT a new gz-transport
+    // message type (e.g. packing bbox+class+confidence into some Float_V
+    // and having foxglove_bridge.cpp convert it to Foxglove's native
+    // ImageAnnotations overlay, which would be the more "proper" way to do
+    // this): reusing the exact same gz::msgs::Image + ToImageMsg() path
+    // already proven for /camera/stitched/image is much lower-risk when it
+    // can't be tested live before being needed (no annotation-schema or
+    // additional-message-type details to get right sight-unseen). Also
+    // draws EVERY detection, including ones with no lidar match -- shows
+    // YOLO's actual accuracy independent of lidar fusion, unlike
+    // /cone_detections (TODO 4), which only carries localized ones.
+    auto detectionsImgPub = node.Advertise<gz::msgs::Image>("/camera/detections/image");
+
     std::mutex mtx;
     cv::Mat latestFront, latestLeft, latestRight;
     StampKey stampFront{}, stampLeft{}, stampRight{};
@@ -290,12 +319,14 @@ int main()
         // detection has no (x,y) to give downstream consumers.
         const std::vector<ConeDetector::Detection> detections = detector->Detect(stitched);
         gz::msgs::Pose_V coneMsg;
+        cv::Mat annotated = stitched.clone();
         for (const auto &d : detections)
         {
-            const char *className = (d.classId >= 0 && static_cast<size_t>(d.classId) <
-                                      sizeof(kClassNames) / sizeof(kClassNames[0]))
-                                          ? kClassNames[d.classId]
-                                          : "unknown";
+            const bool knownClass = d.classId >= 0 && static_cast<size_t>(d.classId) <
+                                                            sizeof(kClassNames) / sizeof(kClassNames[0]);
+            const char *className = knownClass ? kClassNames[d.classId] : "unknown";
+            const cv::Scalar color = knownClass ? kClassColorsRgb[d.classId] : cv::Scalar(255, 255, 255);
+
             std::cout << "  cone: " << className << " conf=" << d.confidence << " bbox=["
                        << d.x1 << "," << d.y1 << "," << d.x2 << "," << d.y2 << "]";
 
@@ -316,8 +347,16 @@ int main()
                 std::cout << " pos=none";
             }
             std::cout << '\n';
+
+            cv::rectangle(annotated, cv::Point(static_cast<int>(d.x1), static_cast<int>(d.y1)),
+                          cv::Point(static_cast<int>(d.x2), static_cast<int>(d.y2)), color, 2);
+            char label[64];
+            std::snprintf(label, sizeof(label), "%s %.2f", className, d.confidence);
+            cv::putText(annotated, label, cv::Point(static_cast<int>(d.x1), static_cast<int>(d.y1) - 4),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
         }
         detectionsPub.Publish(coneMsg);
+        detectionsImgPub.Publish(ToImageMsg(annotated));
     };
 
     std::function<void(const gz::msgs::Image &)> onCameraFront =

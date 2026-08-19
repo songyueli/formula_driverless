@@ -59,6 +59,12 @@
 //   /camera/stitched/image (gz.msgs.Image, published by perception --
 //     the 3 raw cameras merged into one cylindrical panorama)
 //     -> /camera/stitched (Foxglove RawImage), frame_id "camera_front"
+//   /camera/detections/image (gz.msgs.Image, published by perception --
+//     the same panorama with every YOLO detection's bbox + class + confidence
+//     drawn directly into the pixels, for visually comparing detection
+//     accuracy in Foxglove; includes detections with no lidar match too,
+//     unlike /cone_detections, which only carries localized ones)
+//     -> /camera/detections (Foxglove RawImage), frame_id "camera_front"
 //   /lidar/points/points (gz.msgs.PointCloudPacked -- gpu_lidar's derived
 //   point-cloud topic; /lidar/points itself is a raw LaserScan, not this)
 //     -> /lidar (Foxglove PointCloud), frame_id "os1_128"
@@ -284,11 +290,12 @@ int main(int argc, char **argv)
     std::cout << "Fetched " << sensorStaticPoses.size()
               << " static sensor transform(s) from " << sceneService << '\n';
 
-    auto camFrontChannel    = foxglove::messages::RawImageChannel::create("/camera/front").value();
-    auto camLeftChannel     = foxglove::messages::RawImageChannel::create("/camera/left").value();
-    auto camRightChannel    = foxglove::messages::RawImageChannel::create("/camera/right").value();
-    auto camStitchedChannel = foxglove::messages::RawImageChannel::create("/camera/stitched").value();
-    auto lidarChannel       = foxglove::messages::PointCloudChannel::create("/lidar").value();
+    auto camFrontChannel      = foxglove::messages::RawImageChannel::create("/camera/front").value();
+    auto camLeftChannel       = foxglove::messages::RawImageChannel::create("/camera/left").value();
+    auto camRightChannel      = foxglove::messages::RawImageChannel::create("/camera/right").value();
+    auto camStitchedChannel   = foxglove::messages::RawImageChannel::create("/camera/stitched").value();
+    auto camDetectionsChannel = foxglove::messages::RawImageChannel::create("/camera/detections").value();
+    auto lidarChannel         = foxglove::messages::PointCloudChannel::create("/lidar").value();
 
     auto makeImageSubscriber = [](foxglove::messages::RawImageChannel &_channel,
                                    std::string _frameId)
@@ -317,14 +324,15 @@ int main(int argc, char **argv)
             });
     };
 
-    auto onCamFront    = makeImageSubscriber(camFrontChannel, "camera_front");
-    auto onCamLeft     = makeImageSubscriber(camLeftChannel, "camera_left");
-    auto onCamRight    = makeImageSubscriber(camRightChannel, "camera_right");
-    // frame_id "camera_front" is deliberate, not a copy-paste slip: the
-    // stitched panorama is built in the front camera's frame (see
-    // camera_stitcher.cpp), so that's the /tf entry Foxglove should place it
-    // relative to.
-    auto onCamStitched = makeImageSubscriber(camStitchedChannel, "camera_front");
+    auto onCamFront      = makeImageSubscriber(camFrontChannel, "camera_front");
+    auto onCamLeft       = makeImageSubscriber(camLeftChannel, "camera_left");
+    auto onCamRight      = makeImageSubscriber(camRightChannel, "camera_right");
+    // frame_id "camera_front" is deliberate, not a copy-paste slip: both the
+    // stitched panorama and the annotated-detections image are built in the
+    // front camera's frame (see camera_stitcher.cpp), so that's the /tf
+    // entry Foxglove should place them relative to.
+    auto onCamStitched   = makeImageSubscriber(camStitchedChannel, "camera_front");
+    auto onCamDetections = makeImageSubscriber(camDetectionsChannel, "camera_front");
 
     if (!node.Subscribe("/camera/front/image", onCamFront))
     {
@@ -344,6 +352,11 @@ int main(int argc, char **argv)
     if (!node.Subscribe("/camera/stitched/image", onCamStitched))
     {
         std::cerr << "Failed to subscribe to /camera/stitched/image\n";
+        return 1;
+    }
+    if (!node.Subscribe("/camera/detections/image", onCamDetections))
+    {
+        std::cerr << "Failed to subscribe to /camera/detections/image\n";
         return 1;
     }
 
