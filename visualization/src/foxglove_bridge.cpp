@@ -107,8 +107,13 @@
 //        shape as /vehicle (BuildVehicleEntity(), shared with it) but
 //        translucent green so it reads as a ghost overlay for comparing
 //        against /vehicle (ground truth) rather than obscuring it.
-//
-// TODO: add /planned_path once planning is publishing real data.
+//   /planned_path (gz.msgs.Pose_V, published by planning -- ordered
+//     centerline waypoints, body frame, nearest-ahead first)
+//     -> /planned_path (Foxglove SceneUpdate), a single LINE_STRIP through
+//        the waypoints, frame_id "fsd_car" (same reasoning as
+//        /cone_detections: it's already body-frame, so /tf places it with
+//        no transform math here either). Replaced wholesale every publish,
+//        same as /cone_detections, so it never shows a stale path.
 
 namespace
 {
@@ -603,6 +608,52 @@ int main(int argc, char **argv)
     if (!node.Subscribe("/cone_detections", onConeDetections))
     {
         std::cerr << "Failed to subscribe to /cone_detections\n";
+        return 1;
+    }
+
+    auto planned_path_channel_result = foxglove::messages::SceneUpdateChannel::create("/planned_path");
+    if (!planned_path_channel_result.has_value())
+    {
+        std::cerr << "Failed to create /planned_path channel: "
+                  << foxglove::strerror(planned_path_channel_result.error()) << '\n';
+        return 1;
+    }
+    auto planned_path_channel = std::move(planned_path_channel_result.value());
+
+    std::function<void(const gz::msgs::Pose_V &)> onPlannedPath =
+        [&planned_path_channel](const gz::msgs::Pose_V &_msg)
+    {
+        foxglove::messages::SceneEntity entity;
+        entity.timestamp = Now();
+        entity.frame_id = kCarModelName;
+        entity.id = "planned_path";
+
+        foxglove::messages::LinePrimitive line;
+        line.type = foxglove::messages::LinePrimitive::LineType::LINE_STRIP;
+        line.thickness = 0.05;
+        line.scale_invariant = false;
+        line.color = foxglove::messages::Color{0.1, 0.9, 0.9, 1};  // cyan
+        for (const auto &pose : _msg.pose())
+        {
+            line.points.push_back(foxglove::messages::Point3{
+                pose.position().x(), pose.position().y(), pose.position().z()});
+        }
+        // Only attach the line if it has at least 2 points -- Foxglove
+        // would just ignore a 1-point or empty LINE_STRIP anyway, but this
+        // makes the "no path this cycle" case explicit rather than
+        // incidental.
+        if (line.points.size() >= 2)
+        {
+            entity.lines.push_back(line);
+        }
+
+        foxglove::messages::SceneUpdate update;
+        update.entities.push_back(std::move(entity));
+        planned_path_channel.log(update);
+    };
+    if (!node.Subscribe("/planned_path", onPlannedPath))
+    {
+        std::cerr << "Failed to subscribe to /planned_path\n";
         return 1;
     }
 

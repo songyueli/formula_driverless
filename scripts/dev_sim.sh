@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Launches gz sim (headless), the foxglove bridge, perception, and
-# localization together, and cleans up all four on exit.
+# Launches gz sim (headless), the foxglove bridge, perception,
+# localization, planning, and control together, and cleans up all six on
+# exit. Once running, the car drives itself autonomously (planning/control
+# form a closed loop off perception's cone detections, no manual
+# /cmd_ackermann commands needed).
 #
 # Run from inside the fsd_dev container, from the repo root:
 #   ./scripts/dev_sim.sh [world_name]
@@ -11,15 +14,13 @@
 # rather than being duplicated (and silently drifting out of sync, as
 # happened before this was consolidated).
 #
-# perception and foxglove_bridge stay separate processes (not threads in one
-# binary) deliberately, matching every other pipeline stage -- planning and
-# control will follow the same pattern once they're implemented. This also
-# keeps perception free to eventually move to a different host/container
-# than the bridge (e.g. running natively on the Jetson for direct
+# Every pipeline stage stays a separate process (not threads in one binary)
+# deliberately -- keeps each one free to eventually move to a different
+# host/container (e.g. perception running natively on the Jetson for direct
 # TensorRT/CUDA access, while the bridge stays in Docker) without having to
 # be pulled apart out of a merged process later.
 #
-# Ctrl+C stops all three.
+# Ctrl+C stops all six.
 
 set -e
 
@@ -32,28 +33,35 @@ WORLD="${REPO_ROOT}/simulation/worlds/${WORLD_NAME}.sdf"
 BRIDGE="${REPO_ROOT}/build/foxglove_bridge"
 PERCEPTION="${REPO_ROOT}/build/perception"
 LOCALIZATION="${REPO_ROOT}/build/localization"
+PLANNING="${REPO_ROOT}/build/planning"
+CONTROL="${REPO_ROOT}/build/control"
 
 if [ ! -f "$WORLD" ]; then
   echo "error: $WORLD not found" >&2
   exit 1
 fi
 
-if [ ! -x "$BRIDGE" ] || [ ! -x "$PERCEPTION" ] || [ ! -x "$LOCALIZATION" ]; then
+if [ ! -x "$BRIDGE" ] || [ ! -x "$PERCEPTION" ] || [ ! -x "$LOCALIZATION" ] \
+   || [ ! -x "$PLANNING" ] || [ ! -x "$CONTROL" ]; then
   echo "error: build outputs not found — build first with: ./scripts/build.sh" >&2
   exit 1
 fi
 
 echo "World: ${WORLD_NAME} (${WORLD})"
 
-# Track child PIDs so all four get cleaned up together (Ctrl+C, error, normal exit).
+# Track child PIDs so all six get cleaned up together (Ctrl+C, error, normal exit).
 SIM_PID=""
 BRIDGE_PID=""
 PERCEPTION_PID=""
 LOCALIZATION_PID=""
+PLANNING_PID=""
+CONTROL_PID=""
 
 cleanup() {
   echo
   echo "Shutting down..."
+  [ -n "$CONTROL_PID" ] && kill "$CONTROL_PID" 2>/dev/null
+  [ -n "$PLANNING_PID" ] && kill "$PLANNING_PID" 2>/dev/null
   [ -n "$LOCALIZATION_PID" ] && kill "$LOCALIZATION_PID" 2>/dev/null
   [ -n "$PERCEPTION_PID" ] && kill "$PERCEPTION_PID" 2>/dev/null
   [ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null
@@ -95,4 +103,12 @@ echo "Starting localization..."
 "$LOCALIZATION" &
 LOCALIZATION_PID=$!
 
-wait "$SIM_PID" "$BRIDGE_PID" "$PERCEPTION_PID" "$LOCALIZATION_PID"
+echo "Starting planning..."
+"$PLANNING" &
+PLANNING_PID=$!
+
+echo "Starting control..."
+"$CONTROL" &
+CONTROL_PID=$!
+
+wait "$SIM_PID" "$BRIDGE_PID" "$PERCEPTION_PID" "$LOCALIZATION_PID" "$PLANNING_PID" "$CONTROL_PID"
