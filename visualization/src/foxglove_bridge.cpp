@@ -9,6 +9,7 @@
 #include <gz/transport/Node.hh>
 #include <gz/msgs/image.pb.h>
 #include <gz/msgs/pointcloud_packed.pb.h>
+#include <gz/msgs/pose.pb.h>
 #include <gz/msgs/pose_v.pb.h>
 #include <gz/msgs/scene.pb.h>
 
@@ -33,7 +34,13 @@
 // Connect Foxglove to:  ws://<docker-host>:8765
 //
 // Transform tree (/tf, Foxglove FrameTransforms):
-//   world -> fsd_car                         (dynamic, from Pose_V every tick)
+//   world -> fsd_car                         (dynamic, from Pose_V every tick
+//                                              -- GROUND TRUTH, straight from
+//                                              Gazebo's own physics state)
+//   world -> fsd_car_estimated               (dynamic, from localization's
+//                                              /estimated_pose -- the EKF's
+//                                              fused ESTIMATE, not truth;
+//                                              see /estimated_vehicle below)
 //   fsd_car -> {camera_front, camera_left, camera_right, os1_128}
 //     (static, fetched once at startup via the /world/<world_name>/scene/info
 //      *service* -- not the topic of the same name, which is a one-shot
@@ -89,6 +96,17 @@
 //        "cone_detections" is replaced wholesale every publish (including
 //        with zero cylinders when nothing is localized), so it always shows
 //        only the current frame's detections, not an accumulating trail.
+//   /estimated_pose (gz.msgs.Pose, published by localization -- the EKF's
+//     fused [x, y, yaw] estimate; see localization.cpp)
+//     -> /tf (world -> fsd_car_estimated)     -- z is fixed at the chassis's
+//        known ride height, NOT something the 2D-only EKF actually
+//        estimates; rendering at the filter's real z=0 would look like the
+//        car sank into the ground, an artifact of what's unmodeled, not of
+//        estimate quality.
+//     -> /estimated_vehicle (Foxglove SceneUpdate), same chassis+wheel
+//        shape as /vehicle (BuildVehicleEntity(), shared with it) but
+//        translucent green so it reads as a ghost overlay for comparing
+//        against /vehicle (ground truth) rather than obscuring it.
 //
 // TODO: add /planned_path once planning is publishing real data.
 
@@ -335,6 +353,43 @@ std::unordered_map<std::string, foxglove::messages::Pose> FetchStaticWheelPoses(
     }
     return poses;
 }
+
+// Shared between /vehicle (ground truth, called from onPoseV) and
+// /estimated_vehicle (the EKF's estimate, called from onEstimatedPose) --
+// same shape either way, just a different frame_id/id/colors so Foxglove
+// can place and distinguish the two independently.
+foxglove::messages::SceneEntity BuildVehicleEntity(
+    const std::string &_frameId, const std::string &_id,
+    const foxglove::messages::Color &_chassisColor,
+    const foxglove::messages::Color &_wheelColor,
+    const std::unordered_map<std::string, foxglove::messages::Pose> &_wheelStaticPoses)
+{
+    foxglove::messages::SceneEntity entity;
+    entity.timestamp = Now();
+    entity.frame_id = _frameId;
+    entity.id = _id;
+
+    foxglove::messages::CubePrimitive chassis;
+    chassis.pose = foxglove::messages::Pose{
+        foxglove::messages::Vector3{0, 0, 0},
+        foxglove::messages::Quaternion{0, 0, 0, 1}};
+    chassis.size = foxglove::messages::Vector3{1.8, 0.84, 0.3};  // matches model.sdf chassis box
+    chassis.color = _chassisColor;
+    entity.cubes.push_back(chassis);
+
+    for (const auto &entry : _wheelStaticPoses)
+    {
+        foxglove::messages::CylinderPrimitive wheel;
+        wheel.pose = foxglove::messages::Pose{entry.second.position, kWheelRollQuat};
+        wheel.size = foxglove::messages::Vector3{
+            kWheelRadius * 2, kWheelRadius * 2, kWheelLength};
+        wheel.bottom_scale = 1.0;  // full cylinder, not a cone
+        wheel.top_scale = 1.0;
+        wheel.color = _wheelColor;
+        entity.cylinders.push_back(wheel);
+    }
+    return entity;
+}
 }  // namespace
 
 int main(int argc, char **argv)
@@ -569,6 +624,60 @@ int main(int argc, char **argv)
     }
     auto vehicle_channel = std::move(vehicle_channel_result.value());
 
+    auto estimated_vehicle_channel_result =
+        foxglove::messages::SceneUpdateChannel::create("/estimated_vehicle");
+    if (!estimated_vehicle_channel_result.has_value())
+    {
+        std::cerr << "Failed to create /estimated_vehicle channel: "
+                  << foxglove::strerror(estimated_vehicle_channel_result.error()) << '\n';
+        return 1;
+    }
+    auto estimated_vehicle_channel = std::move(estimated_vehicle_channel_result.value());
+
+    // The EKF only estimates 2D (x, y, yaw) -- there's no z/roll/pitch in
+    // its state (see localization/include/ekf.hpp) -- so the ghost car's
+    // height here is a fixed stand-in for the chassis's known ride height,
+    // not something the filter itself produced. Must match model.sdf's
+    // trackdrive.sdf spawn z (0.31).
+    constexpr double kEstimatedRideHeightM = 0.31;
+    constexpr const char *kEstimatedFrameId = "fsd_car_estimated";
+
+    std::function<void(const gz::msgs::Pose &)> onEstimatedPose =
+        [&tf_channel, &estimated_vehicle_channel, &wheelStaticPoses](const gz::msgs::Pose &_msg)
+    {
+        foxglove::messages::FrameTransform worldToEstimated;
+        worldToEstimated.timestamp = Now();
+        worldToEstimated.parent_frame_id = kFrameId;
+        worldToEstimated.child_frame_id = kEstimatedFrameId;
+        worldToEstimated.translation = foxglove::messages::Vector3{
+            _msg.position().x(), _msg.position().y(), kEstimatedRideHeightM};
+        worldToEstimated.rotation = foxglove::messages::Quaternion{
+            _msg.orientation().x(), _msg.orientation().y(),
+            _msg.orientation().z(), _msg.orientation().w()};
+
+        foxglove::messages::FrameTransforms transforms;
+        transforms.transforms.push_back(worldToEstimated);
+        tf_channel.log(transforms);
+
+        // Translucent green so it reads as a ghost overlay against /vehicle
+        // (ground truth, opaque dark gray/near-black) rather than obscuring
+        // it when the two nearly coincide.
+        auto entity = BuildVehicleEntity(
+            kEstimatedFrameId, "fsd_car_estimated",
+            foxglove::messages::Color{0.1, 0.9, 0.3, 0.5},
+            foxglove::messages::Color{0.1, 0.6, 0.2, 0.5},
+            wheelStaticPoses);
+
+        foxglove::messages::SceneUpdate update;
+        update.entities.push_back(std::move(entity));
+        estimated_vehicle_channel.log(update);
+    };
+    if (!node.Subscribe("/estimated_pose", onEstimatedPose))
+    {
+        std::cerr << "Failed to subscribe to /estimated_pose\n";
+        return 1;
+    }
+
     // Cones are static — gz-transport may only include their pose in the
     // first Pose_V message rather than every tick, so cache what we've seen
     // instead of relying on it being present in the message currently in hand.
@@ -631,30 +740,11 @@ int main(int argc, char **argv)
             // Published in the fsd_car frame -- the world->fsd_car transform
             // logged just above places it, so no pose math is needed here at
             // all, unlike /scene's track cones (which are in the world frame).
-            foxglove::messages::SceneEntity vehicleEntity;
-            vehicleEntity.timestamp = Now();
-            vehicleEntity.frame_id = kCarModelName;
-            vehicleEntity.id = kCarModelName;
-
-            foxglove::messages::CubePrimitive chassis;
-            chassis.pose = foxglove::messages::Pose{
-                foxglove::messages::Vector3{0, 0, 0},
-                foxglove::messages::Quaternion{0, 0, 0, 1}};
-            chassis.size = foxglove::messages::Vector3{1.8, 0.84, 0.3};  // matches model.sdf chassis box
-            chassis.color = foxglove::messages::Color{0.1, 0.1, 0.1, 1};
-            vehicleEntity.cubes.push_back(chassis);
-
-            for (const auto &entry : wheelStaticPoses)
-            {
-                foxglove::messages::CylinderPrimitive wheel;
-                wheel.pose = foxglove::messages::Pose{entry.second.position, kWheelRollQuat};
-                wheel.size = foxglove::messages::Vector3{
-                    kWheelRadius * 2, kWheelRadius * 2, kWheelLength};
-                wheel.bottom_scale = 1.0;  // full cylinder, not a cone
-                wheel.top_scale = 1.0;
-                wheel.color = foxglove::messages::Color{0.05, 0.05, 0.05, 1};
-                vehicleEntity.cylinders.push_back(wheel);
-            }
+            auto vehicleEntity = BuildVehicleEntity(
+                kCarModelName, kCarModelName,
+                foxglove::messages::Color{0.1, 0.1, 0.1, 1},
+                foxglove::messages::Color{0.05, 0.05, 0.05, 1},
+                wheelStaticPoses);
 
             foxglove::messages::SceneUpdate vehicleUpdate;
             vehicleUpdate.entities.push_back(std::move(vehicleEntity));
@@ -699,6 +789,7 @@ int main(int argc, char **argv)
 
     std::cout << "Foxglove bridge listening on ws://0.0.0.0:8765 -- forwarding "
               << poseTopic << " -> /vehicle_pose, /scene, /vehicle, /tf; "
+              << "/estimated_pose -> /estimated_vehicle, /tf; "
               << "3 cameras -> /camera/{front,left,right}, /lidar/points/points -> /lidar\n";
 
     gz::transport::waitForShutdown();
