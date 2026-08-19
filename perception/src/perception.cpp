@@ -7,6 +7,7 @@
 #include <common/types.hpp>
 #include "camera_stitcher.hpp"
 #include "cone_detector.hpp"
+#include "lidar_projector.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -19,10 +20,17 @@
 // Perception process
 // ------------------
 // Inputs (subscribe):
-//   /camera/front/image   gz::msgs::Image
-//   /camera/left/image    gz::msgs::Image
-//   /camera/right/image   gz::msgs::Image
-//   /lidar/points         gz::msgs::PointCloudPacked
+//   /camera/front/image     gz::msgs::Image
+//   /camera/left/image      gz::msgs::Image
+//   /camera/right/image     gz::msgs::Image
+//   /lidar/points/points    gz::msgs::PointCloudPacked -- NOT /lidar/points,
+//                            which is gpu_lidar's raw LaserScan output;
+//                            /points is a second, auto-published topic with
+//                            the point cloud (matches foxglove_bridge.cpp's
+//                            own subscription; field layout -- x/y/z as
+//                            FLOAT32 at offsets 0/4/8, point_step=18 --
+//                            confirmed directly via `gz topic -e`, not
+//                            assumed, see lidar_projector.cpp)
 //
 // Output (publish):
 //   /camera/stitched/image  gz::msgs::Image  -- the 3 cameras merged into
@@ -60,11 +68,19 @@
 //            release (checked, see CMakeLists.txt), so real GPU inference
 //            there needs a from-source build, tracked as separate follow-up
 //            work, not blocking this step.
-//   TODO 3: Subscribe to /lidar/points and project each detected bounding
-//            box into the point cloud to get a 3-D cone position in the car
-//            frame -- using the cylindrical pixel -> ray formula (not a
-//            plain pinhole one), since detections come from the stitched
-//            frame now.
+//   TODO 3: Subscribe to /lidar/points/points and project each detected
+//            bounding box into the point cloud to get a 3-D cone position
+//            in the car frame. DONE (see lidar_projector.hpp) -- projects
+//            lidar points into the panorama's own cylindrical pixel space
+//            (not a plain pinhole projection, since detections come from
+//            the cylindrical panorama) using known, fixed lidar/camera
+//            extrinsics from model.sdf, then matches each detection
+//            bbox against the closest (by range) point that lands inside
+//            it. Lidar runs at 10 Hz vs the cameras' 30 Hz and isn't
+//            timestamp-synchronized against detections -- a detection can
+//            legitimately get no match, or match a point cloud up to
+//            ~1 lidar tick stale; acceptable for now, revisit if it causes
+//            real position error once the car is actually moving.
 //   TODO 4: Pack (x, y, color) for each detection and publish on /cone_detections.
 
 namespace
@@ -186,6 +202,13 @@ int main()
         {{0.0}, {kCamYawLeftRad}, {kCamYawRightRad}}, // front, left, right
         kPanoWidth, kPanoHeight, kPanoHFovRad);
 
+    // Must exactly match CameraStitcher's own internal focal length (its
+    // K.fx, computed from the same kCamWidth/kCamHFovRad) -- not exposed as
+    // a public accessor there, so recomputed here from the same two
+    // already-shared constants rather than an independent magic number.
+    const double fPano = (kCamWidth / 2.0) / std::tan(kCamHFovRad / 2.0);
+    LidarProjector lidarProjector(kPanoWidth, kPanoHeight, fPano);
+
     // kModelPath is git-ignored (see .gitignore) and only exists on a
     // machine that's actually run training -- fail with a clear, actionable
     // message rather than letting ONNX Runtime's own (much less obvious)
@@ -248,10 +271,11 @@ int main()
         const cv::Mat stitched = stitcher.Stitch({latestFront, latestLeft, latestRight});
         stitchedPub.Publish(ToImageMsg(stitched));
 
-        // TODO 2 confirmation step: print what's detected, matching the same
-        // "print to confirm it's actually working" pattern as TODO 1's
-        // camera-dimension print. TODO 3/4 (lidar projection + publishing
-        // to /cone_detections) replace this with real downstream use.
+        // TODO 2/3 confirmation step: print what's detected and, when a
+        // lidar match exists, its 3-D position -- matching the same "print
+        // to confirm it's actually working" pattern as TODO 1's camera-
+        // dimension print. TODO 4 (publishing to /cone_detections) replaces
+        // this with real downstream use.
         const std::vector<ConeDetector::Detection> detections = detector->Detect(stitched);
         for (const auto &d : detections)
         {
@@ -260,7 +284,19 @@ int main()
                                           ? kClassNames[d.classId]
                                           : "unknown";
             std::cout << "  cone: " << className << " conf=" << d.confidence << " bbox=["
-                       << d.x1 << "," << d.y1 << "," << d.x2 << "," << d.y2 << "]\n";
+                       << d.x1 << "," << d.y1 << "," << d.x2 << "," << d.y2 << "]";
+
+            const auto pos = lidarProjector.Localize(d.x1, d.y1, d.x2, d.y2);
+            if (pos)
+            {
+                std::cout << " pos=(" << pos->x << "," << pos->y << "," << pos->z
+                           << ") range=" << pos->range << "m";
+            }
+            else
+            {
+                std::cout << " pos=none";
+            }
+            std::cout << '\n';
         }
     };
 
@@ -300,6 +336,17 @@ int main()
         haveRight = true;
     };
 
+    // Locks the same mutex as the camera callbacks -- Localize() (called
+    // from tryStitchAndPublish, itself called under that lock) reads
+    // lidarProjector's cached points while this writes them; without
+    // sharing the lock the two could race on the same std::vector.
+    std::function<void(const gz::msgs::PointCloudPacked &)> onLidar =
+        [&](const gz::msgs::PointCloudPacked &_msg)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        lidarProjector.SetPointCloud(_msg);
+    };
+
     if (!node.Subscribe("/camera/front/image", onCameraFront))
     {
         std::cerr << "Failed to subscribe to /camera/front/image\n";
@@ -313,6 +360,11 @@ int main()
     if (!node.Subscribe("/camera/right/image", onCameraRight))
     {
         std::cerr << "Failed to subscribe to /camera/right/image\n";
+        return 1;
+    }
+    if (!node.Subscribe("/lidar/points/points", onLidar))
+    {
+        std::cerr << "Failed to subscribe to /lidar/points/points\n";
         return 1;
     }
 

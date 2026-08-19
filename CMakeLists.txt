@@ -93,7 +93,8 @@ include_directories(common/include)
 add_executable(perception
     perception/src/perception.cpp
     perception/src/camera_stitcher.cpp
-    perception/src/cone_detector.cpp)
+    perception/src/cone_detector.cpp
+    perception/src/lidar_projector.cpp)
 target_include_directories(perception PRIVATE
     perception/include
     ${OpenCV_INCLUDE_DIRS}
