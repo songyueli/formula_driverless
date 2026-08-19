@@ -1,6 +1,7 @@
 #include <gz/transport/Node.hh>
 #include <gz/msgs/image.pb.h>
 #include <gz/msgs/pointcloud_packed.pb.h>
+#include <gz/msgs/pose_v.pb.h>
 
 #include <opencv2/core.hpp>
 
@@ -46,7 +47,14 @@
 //                            panorama's own cones near the seams; cylindrical
 //                            doesn't have that problem, so the single-pass
 //                            (not per-camera) detection plan holds.
-//   /cone_detections      gz::msgs::Pose_V  (or a custom proto once protoc is added)
+//   /cone_detections        gz::msgs::Pose_V -- one Pose per LOCALIZED
+//                            detection (has a lidar match; see TODO 3),
+//                            name=class string ("blue"/"yellow"/"orange"/
+//                            "large_orange"), position=(x,y,z) in the car
+//                            (chassis) frame. No custom .proto: Pose_V
+//                            already carries everything needed (a name
+//                            string plus a position) without adding a
+//                            protoc build step for one message type.
 //
 // The camera geometry constants below (position being shared across all 3,
 // horizontal_fov, left/right yaw) mirror simulation/models/fsd_car/model.sdf
@@ -81,7 +89,10 @@
 //            legitimately get no match, or match a point cloud up to
 //            ~1 lidar tick stale; acceptable for now, revisit if it causes
 //            real position error once the car is actually moving.
-//   TODO 4: Pack (x, y, color) for each detection and publish on /cone_detections.
+//   TODO 4: Pack (x, y, color) for each detection and publish on
+//            /cone_detections. DONE -- only detections with a lidar match
+//            (TODO 3's pos != none) are published, since an unlocalized
+//            detection has no (x,y) to pack in the first place.
 
 namespace
 {
@@ -227,6 +238,7 @@ int main()
     }
 
     auto stitchedPub = node.Advertise<gz::msgs::Image>("/camera/stitched/image");
+    auto detectionsPub = node.Advertise<gz::msgs::Pose_V>("/cone_detections");
 
     std::mutex mtx;
     cv::Mat latestFront, latestLeft, latestRight;
@@ -271,12 +283,13 @@ int main()
         const cv::Mat stitched = stitcher.Stitch({latestFront, latestLeft, latestRight});
         stitchedPub.Publish(ToImageMsg(stitched));
 
-        // TODO 2/3 confirmation step: print what's detected and, when a
-        // lidar match exists, its 3-D position -- matching the same "print
-        // to confirm it's actually working" pattern as TODO 1's camera-
-        // dimension print. TODO 4 (publishing to /cone_detections) replaces
-        // this with real downstream use.
+        // Still prints every detection either way (matching the same
+        // "print to confirm it's actually working" pattern as TODO 1's
+        // camera-dimension print), but only LOCALIZED ones (a lidar match
+        // exists) get packed into coneMsg and published -- an unlocalized
+        // detection has no (x,y) to give downstream consumers.
         const std::vector<ConeDetector::Detection> detections = detector->Detect(stitched);
+        gz::msgs::Pose_V coneMsg;
         for (const auto &d : detections)
         {
             const char *className = (d.classId >= 0 && static_cast<size_t>(d.classId) <
@@ -291,6 +304,12 @@ int main()
             {
                 std::cout << " pos=(" << pos->x << "," << pos->y << "," << pos->z
                            << ") range=" << pos->range << "m";
+
+                gz::msgs::Pose *p = coneMsg.add_pose();
+                p->set_name(className);
+                p->mutable_position()->set_x(pos->x);
+                p->mutable_position()->set_y(pos->y);
+                p->mutable_position()->set_z(pos->z);
             }
             else
             {
@@ -298,6 +317,7 @@ int main()
             }
             std::cout << '\n';
         }
+        detectionsPub.Publish(coneMsg);
     };
 
     std::function<void(const gz::msgs::Image &)> onCameraFront =
