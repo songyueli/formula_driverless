@@ -47,12 +47,24 @@
 // Currently forwards:
 //   /world/<world_name>/pose/info (gz.msgs.Pose_V), driving:
 //     -> /vehicle_pose (Foxglove PoseInFrame)   — the "fsd_car" entry
-//     -> /scene        (Foxglove SceneUpdate)   — car chassis as a cube,
-//                       every cone_{blue,yellow,orange}_* entry as a cone
-//                       (a CylinderPrimitive with top_scale=0), so the whole
-//                       track is viewable in Foxglove's 3D panel without
-//                       needing Gazebo's own GUI.
+//     -> /scene        (Foxglove SceneUpdate)   — every cone_{blue,yellow,
+//                       orange}_* entry as a cone (a CylinderPrimitive with
+//                       top_scale=0), so the track is viewable in
+//                       Foxglove's 3D panel without needing Gazebo's own
+//                       GUI. Deliberately just the (static) track -- the
+//                       car has its own /vehicle topic below, so either can
+//                       be shown/hidden independently in Foxglove.
 //     -> /tf (Foxglove FrameTransforms)         — world->fsd_car
+//   fsd_car's wheel link poses (fetched once from the same scene service
+//   used for sensor frames below, not hand-duplicated from model.sdf)
+//     -> /vehicle (Foxglove SceneUpdate), frame_id "fsd_car" -- a chassis
+//        CubePrimitive plus 4 wheel CylinderPrimitives, republished every
+//        Pose_V tick alongside /scene/vehicle_pose. Placement in world
+//        space comes entirely from /tf's dynamic world->fsd_car transform,
+//        not from any pose math here. Wheels don't animate steering or
+//        spin: spin is invisible on a symmetric cylinder anyway, and
+//        steering would need parsing live joint_state, which nothing here
+//        needs yet.
 //   /camera/{front,left,right}/image (gz.msgs.Image)
 //     -> /camera/{front,left,right} (Foxglove RawImage), frame_id matching
 //        the sensor's own name (camera_front/camera_left/camera_right)
@@ -273,6 +285,56 @@ std::unordered_map<std::string, foxglove::messages::Pose> FetchStaticSensorPoses
     }
     return poses;
 }
+
+constexpr const char *kWheelLinkNames[] = {
+    "front_left_wheel", "front_right_wheel", "rear_left_wheel", "rear_right_wheel"};
+constexpr double kWheelRadius = 0.26;  // must match fsd_car/model.sdf
+constexpr double kWheelLength = 0.18;
+// A bare cylinder's symmetry axis defaults to Z (vertical); this is the
+// same 90deg-about-X roll applied to the wheel visual/collision geometry in
+// model.sdf, needed here too since the fetched link poses below are the
+// LINK frames (identity orientation, deliberately -- see model.sdf), not
+// the rotated geometry within them.
+const foxglove::messages::Quaternion kWheelRollQuat{0.70710678118654752, 0, 0, 0.70710678118654752};
+
+// Fetches each wheel link's pose relative to the model root, straight from
+// Gazebo's resolved model description (same service and pattern as
+// FetchStaticSensorPoses above), rather than duplicating model.sdf's wheel
+// offsets by hand a second time here.
+std::unordered_map<std::string, foxglove::messages::Pose> FetchStaticWheelPoses(
+    gz::transport::Node &_node, const std::string &_sceneService)
+{
+    std::unordered_map<std::string, foxglove::messages::Pose> poses;
+
+    gz::msgs::Scene sceneMsg;
+    bool result = false;
+    const bool ok = _node.Request(_sceneService, 5000u, sceneMsg, result);
+    if (!ok || !result)
+    {
+        std::cerr << "Warning: failed to fetch " << _sceneService
+                  << " -- /vehicle will be missing its wheels\n";
+        return poses;
+    }
+
+    for (const auto &model : sceneMsg.model())
+    {
+        if (model.name() != kCarModelName)
+        {
+            continue;
+        }
+        for (const auto &link : model.link())
+        {
+            for (const char *wheelName : kWheelLinkNames)
+            {
+                if (link.name() == wheelName)
+                {
+                    poses[link.name()] = ToFoxglovePose(link.pose());
+                }
+            }
+        }
+    }
+    return poses;
+}
 }  // namespace
 
 int main(int argc, char **argv)
@@ -324,6 +386,10 @@ int main(int argc, char **argv)
     const auto sensorStaticPoses = FetchStaticSensorPoses(node, sceneService);
     std::cout << "Fetched " << sensorStaticPoses.size()
               << " static sensor transform(s) from " << sceneService << '\n';
+
+    const auto wheelStaticPoses = FetchStaticWheelPoses(node, sceneService);
+    std::cout << "Fetched " << wheelStaticPoses.size()
+              << " static wheel pose(s) from " << sceneService << '\n';
 
     auto camFrontChannel      = foxglove::messages::RawImageChannel::create("/camera/front").value();
     auto camLeftChannel       = foxglove::messages::RawImageChannel::create("/camera/left").value();
@@ -494,14 +560,23 @@ int main(int argc, char **argv)
     }
     auto scene_channel = std::move(scene_channel_result.value());
 
+    auto vehicle_channel_result = foxglove::messages::SceneUpdateChannel::create("/vehicle");
+    if (!vehicle_channel_result.has_value())
+    {
+        std::cerr << "Failed to create /vehicle channel: "
+                  << foxglove::strerror(vehicle_channel_result.error()) << '\n';
+        return 1;
+    }
+    auto vehicle_channel = std::move(vehicle_channel_result.value());
+
     // Cones are static — gz-transport may only include their pose in the
     // first Pose_V message rather than every tick, so cache what we've seen
     // instead of relying on it being present in the message currently in hand.
     std::unordered_map<std::string, foxglove::messages::Pose> conePoseCache;
 
     std::function<void(const gz::msgs::Pose_V &)> onPoseV =
-        [&pose_channel, &scene_channel, &tf_channel, &conePoseCache, &sensorStaticPoses](
-            const gz::msgs::Pose_V &_msg)
+        [&pose_channel, &scene_channel, &vehicle_channel, &tf_channel, &conePoseCache,
+         &sensorStaticPoses, &wheelStaticPoses](const gz::msgs::Pose_V &_msg)
     {
         bool haveCarPose = false;
         foxglove::messages::Pose carPose;
@@ -552,6 +627,38 @@ int main(int argc, char **argv)
             }
 
             tf_channel.log(transforms);
+
+            // Published in the fsd_car frame -- the world->fsd_car transform
+            // logged just above places it, so no pose math is needed here at
+            // all, unlike /scene's track cones (which are in the world frame).
+            foxglove::messages::SceneEntity vehicleEntity;
+            vehicleEntity.timestamp = Now();
+            vehicleEntity.frame_id = kCarModelName;
+            vehicleEntity.id = kCarModelName;
+
+            foxglove::messages::CubePrimitive chassis;
+            chassis.pose = foxglove::messages::Pose{
+                foxglove::messages::Vector3{0, 0, 0},
+                foxglove::messages::Quaternion{0, 0, 0, 1}};
+            chassis.size = foxglove::messages::Vector3{1.8, 0.5, 0.3};  // matches model.sdf chassis box
+            chassis.color = foxglove::messages::Color{0.1, 0.1, 0.1, 1};
+            vehicleEntity.cubes.push_back(chassis);
+
+            for (const auto &entry : wheelStaticPoses)
+            {
+                foxglove::messages::CylinderPrimitive wheel;
+                wheel.pose = foxglove::messages::Pose{entry.second.position, kWheelRollQuat};
+                wheel.size = foxglove::messages::Vector3{
+                    kWheelRadius * 2, kWheelRadius * 2, kWheelLength};
+                wheel.bottom_scale = 1.0;  // full cylinder, not a cone
+                wheel.top_scale = 1.0;
+                wheel.color = foxglove::messages::Color{0.05, 0.05, 0.05, 1};
+                vehicleEntity.cylinders.push_back(wheel);
+            }
+
+            foxglove::messages::SceneUpdate vehicleUpdate;
+            vehicleUpdate.entities.push_back(std::move(vehicleEntity));
+            vehicle_channel.log(vehicleUpdate);
         }
 
         if (!haveCarPose && conePoseCache.empty())
@@ -581,22 +688,6 @@ int main(int argc, char **argv)
         }
         update.entities.push_back(std::move(trackEntity));
 
-        if (haveCarPose)
-        {
-            foxglove::messages::SceneEntity carEntity;
-            carEntity.timestamp = Now();
-            carEntity.frame_id = kFrameId;
-            carEntity.id = "fsd_car";
-
-            foxglove::messages::CubePrimitive chassis;
-            chassis.pose = carPose;
-            chassis.size = foxglove::messages::Vector3{1.8, 0.5, 0.3};  // matches model.sdf chassis box
-            chassis.color = foxglove::messages::Color{0.1, 0.1, 0.1, 1};
-            carEntity.cubes.push_back(chassis);
-
-            update.entities.push_back(std::move(carEntity));
-        }
-
         scene_channel.log(update);
     };
 
@@ -607,7 +698,7 @@ int main(int argc, char **argv)
     }
 
     std::cout << "Foxglove bridge listening on ws://0.0.0.0:8765 -- forwarding "
-              << poseTopic << " -> /vehicle_pose, /scene, /tf; "
+              << poseTopic << " -> /vehicle_pose, /scene, /vehicle, /tf; "
               << "3 cameras -> /camera/{front,left,right}, /lidar/points/points -> /lidar\n";
 
     gz::transport::waitForShutdown();
