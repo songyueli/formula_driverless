@@ -183,8 +183,15 @@
         <mass>5</mass>
         <inertia><ixx>0.098</ixx><iyy>0.169</iyy><izz>0.098</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
       </inertial>
-      <visual name="visual"><geometry><cylinder><radius>0.26</radius><length>0.18</length></cylinder></geometry></visual>
+      <!-- A bare cylinder's symmetry axis defaults to the link's local Z
+           (vertical), i.e. an upright can, not a wheel. Rolling 90deg here
+           (on the visual/collision only, NOT the link's own pose) lays it
+           on its side so the axis matches the wheel joint's Y spin axis,
+           without disturbing how that joint's axis gets interpreted
+           (which is relative to the link's own, unrotated, frame). -->
+      <visual name="visual"><pose>0 0 0 1.570796 0 0</pose><geometry><cylinder><radius>0.26</radius><length>0.18</length></cylinder></geometry></visual>
       <collision name="collision">
+        <pose>0 0 0 1.570796 0 0</pose>
         <geometry><cylinder><radius>0.26</radius><length>0.18</length></cylinder></geometry>
         <surface><friction><ode>
           <mu>1.5</mu>    <!-- longitudinal grip -->
@@ -227,8 +234,15 @@
         <mass>5</mass>
         <inertia><ixx>0.098</ixx><iyy>0.169</iyy><izz>0.098</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
       </inertial>
-      <visual name="visual"><geometry><cylinder><radius>0.26</radius><length>0.18</length></cylinder></geometry></visual>
+      <!-- A bare cylinder's symmetry axis defaults to the link's local Z
+           (vertical), i.e. an upright can, not a wheel. Rolling 90deg here
+           (on the visual/collision only, NOT the link's own pose) lays it
+           on its side so the axis matches the wheel joint's Y spin axis,
+           without disturbing how that joint's axis gets interpreted
+           (which is relative to the link's own, unrotated, frame). -->
+      <visual name="visual"><pose>0 0 0 1.570796 0 0</pose><geometry><cylinder><radius>0.26</radius><length>0.18</length></cylinder></geometry></visual>
       <collision name="collision">
+        <pose>0 0 0 1.570796 0 0</pose>
         <geometry><cylinder><radius>0.26</radius><length>0.18</length></cylinder></geometry>
         <surface><friction><ode>
           <mu>1.5</mu>
@@ -253,8 +267,15 @@
         <mass>5</mass>
         <inertia><ixx>0.098</ixx><iyy>0.169</iyy><izz>0.098</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
       </inertial>
-      <visual name="visual"><geometry><cylinder><radius>0.26</radius><length>0.18</length></cylinder></geometry></visual>
+      <!-- A bare cylinder's symmetry axis defaults to the link's local Z
+           (vertical), i.e. an upright can, not a wheel. Rolling 90deg here
+           (on the visual/collision only, NOT the link's own pose) lays it
+           on its side so the axis matches the wheel joint's Y spin axis,
+           without disturbing how that joint's axis gets interpreted
+           (which is relative to the link's own, unrotated, frame). -->
+      <visual name="visual"><pose>0 0 0 1.570796 0 0</pose><geometry><cylinder><radius>0.26</radius><length>0.18</length></cylinder></geometry></visual>
       <collision name="collision">
+        <pose>0 0 0 1.570796 0 0</pose>
         <geometry><cylinder><radius>0.26</radius><length>0.18</length></cylinder></geometry>
         <surface><friction><ode>
           <mu>1.5</mu>
@@ -275,8 +296,15 @@
         <mass>5</mass>
         <inertia><ixx>0.098</ixx><iyy>0.169</iyy><izz>0.098</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
       </inertial>
-      <visual name="visual"><geometry><cylinder><radius>0.26</radius><length>0.18</length></cylinder></geometry></visual>
+      <!-- A bare cylinder's symmetry axis defaults to the link's local Z
+           (vertical), i.e. an upright can, not a wheel. Rolling 90deg here
+           (on the visual/collision only, NOT the link's own pose) lays it
+           on its side so the axis matches the wheel joint's Y spin axis,
+           without disturbing how that joint's axis gets interpreted
+           (which is relative to the link's own, unrotated, frame). -->
+      <visual name="visual"><pose>0 0 0 1.570796 0 0</pose><geometry><cylinder><radius>0.26</radius><length>0.18</length></cylinder></geometry></visual>
       <collision name="collision">
+        <pose>0 0 0 1.570796 0 0</pose>
         <geometry><cylinder><radius>0.26</radius><length>0.18</length></cylinder></geometry>
         <surface><friction><ode>
           <mu>1.5</mu>
