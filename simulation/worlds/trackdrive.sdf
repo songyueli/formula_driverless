@@ -92,10 +92,14 @@
       </link>
     </model>
 
-    <!-- FSD car, staged 6m behind the start/finish line (D 8.3.2) -->
+    <!-- FSD car, staged 6m behind the start/finish line (D 8.3.2).
+         z=0.31 so the wheels (radius 0.26, mounted 0.05 below the chassis
+         origin, see fsd_car/model.sdf) rest on the ground instead of
+         sinking into it; the old z=0.1 predates fixing the wheel geometry
+         and left them ~0.2m interpenetrating the ground plane. -->
     <include>
       <uri>model://fsd_car</uri>
-      <pose>116.836 29.137 0.1 0 0 1.3748</pose>
+      <pose>116.836 29.137 0.31 0 0 1.3748</pose>
     </include>
 
     <!-- ==================== ORANGE — start/finish gate ==================== -->
