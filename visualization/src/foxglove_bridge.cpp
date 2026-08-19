@@ -640,7 +640,7 @@ int main(int argc, char **argv)
             chassis.pose = foxglove::messages::Pose{
                 foxglove::messages::Vector3{0, 0, 0},
                 foxglove::messages::Quaternion{0, 0, 0, 1}};
-            chassis.size = foxglove::messages::Vector3{1.8, 0.5, 0.3};  // matches model.sdf chassis box
+            chassis.size = foxglove::messages::Vector3{1.8, 0.84, 0.3};  // matches model.sdf chassis box
             chassis.color = foxglove::messages::Color{0.1, 0.1, 0.1, 1};
             vehicleEntity.cubes.push_back(chassis);
 
