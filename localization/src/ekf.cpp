@@ -157,4 +157,46 @@ void Ekf::CorrectHeading(double _measuredYaw, double _stddev)
     m_P = (StateCov::Identity() - K * H) * m_P;
 }
 
+void Ekf::CorrectLandmark(double _measuredBodyX, double _measuredBodyY,
+                           double _landmarkWorldX, double _landmarkWorldY,
+                           double _stddev)
+{
+    const double yaw = m_x(2);
+    const double cosYaw = std::cos(yaw);
+    const double sinYaw = std::sin(yaw);
+
+    // World-frame vector from the state's current position estimate to the
+    // known landmark.
+    const double wx = _landmarkWorldX - m_x(0);
+    const double wy = _landmarkWorldY - m_x(1);
+
+    // h(x): rotate that vector into the body frame by -yaw -- what a
+    // detection of this landmark SHOULD read given the current estimate.
+    const double bodyX = wx * cosYaw + wy * sinYaw;
+    const double bodyY = -wx * sinYaw + wy * cosYaw;
+
+    const Eigen::Vector2d z(_measuredBodyX, _measuredBodyY);
+    const Eigen::Vector2d h(bodyX, bodyY);
+    const Eigen::Vector2d y = z - h;
+
+    // d(bodyX)/dyaw = -wx*sin(yaw) + wy*cos(yaw) = bodyY (by inspection of
+    // h() above); d(bodyY)/dyaw = -wx*cos(yaw) - wy*sin(yaw) = -bodyX.
+    Eigen::Matrix<double, 2, kStateDim> H = Eigen::Matrix<double, 2, kStateDim>::Zero();
+    H(0, 0) = -cosYaw;
+    H(0, 1) = -sinYaw;
+    H(0, 2) = bodyY;
+    H(1, 0) = sinYaw;
+    H(1, 1) = -cosYaw;
+    H(1, 2) = -bodyX;
+
+    const Eigen::Matrix2d R = Eigen::Matrix2d::Identity() * (_stddev * _stddev);
+
+    const Eigen::Matrix2d S = H * m_P * H.transpose() + R;
+    const Eigen::Matrix<double, kStateDim, 2> K = m_P * H.transpose() * S.inverse();
+
+    m_x += K * y;
+    m_x(2) = NormalizeAngle(m_x(2));
+    m_P = (StateCov::Identity() - K * H) * m_P;
+}
+
 } // namespace fsd

@@ -59,6 +59,18 @@ public:
     // periodic.
     void CorrectHeading(double _measuredYaw, double _stddev);
 
+    // A cone landmark: _measuredBodyX/Y is where perception's
+    // /cone_detections says the cone is, in the vehicle's own body frame;
+    // _landmarkWorldX/Y is that same cone's KNOWN position from the track
+    // map (see cone_map.hpp). The measurement model predicts what a
+    // body-frame detection of a landmark at that known world position
+    // SHOULD look like given the current state estimate -- the mirror
+    // image of CorrectGnssPosition's h(x) (which goes body-offset ->
+    // world), so this one goes world-landmark -> body-frame prediction.
+    void CorrectLandmark(double _measuredBodyX, double _measuredBodyY,
+                          double _landmarkWorldX, double _landmarkWorldY,
+                          double _stddev);
+
     const StateVec &State() const { return m_x; }
     const StateCov &Covariance() const { return m_P; }
 

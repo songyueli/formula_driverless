@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Launches gz sim (headless), the foxglove bridge, and the perception
-# process together, and cleans up all three on exit.
+# Launches gz sim (headless), the foxglove bridge, perception, and
+# localization together, and cleans up all four on exit.
 #
 # Run from inside the fsd_dev container, from the repo root:
 #   ./scripts/dev_sim.sh [world_name]
@@ -31,27 +31,30 @@ export GZ_SIM_RESOURCE_PATH="${REPO_ROOT}/simulation/models"
 WORLD="${REPO_ROOT}/simulation/worlds/${WORLD_NAME}.sdf"
 BRIDGE="${REPO_ROOT}/build/foxglove_bridge"
 PERCEPTION="${REPO_ROOT}/build/perception"
+LOCALIZATION="${REPO_ROOT}/build/localization"
 
 if [ ! -f "$WORLD" ]; then
   echo "error: $WORLD not found" >&2
   exit 1
 fi
 
-if [ ! -x "$BRIDGE" ] || [ ! -x "$PERCEPTION" ]; then
+if [ ! -x "$BRIDGE" ] || [ ! -x "$PERCEPTION" ] || [ ! -x "$LOCALIZATION" ]; then
   echo "error: build outputs not found — build first with: ./scripts/build.sh" >&2
   exit 1
 fi
 
 echo "World: ${WORLD_NAME} (${WORLD})"
 
-# Track child PIDs so all three get cleaned up together (Ctrl+C, error, normal exit).
+# Track child PIDs so all four get cleaned up together (Ctrl+C, error, normal exit).
 SIM_PID=""
 BRIDGE_PID=""
 PERCEPTION_PID=""
+LOCALIZATION_PID=""
 
 cleanup() {
   echo
   echo "Shutting down..."
+  [ -n "$LOCALIZATION_PID" ] && kill "$LOCALIZATION_PID" 2>/dev/null
   [ -n "$PERCEPTION_PID" ] && kill "$PERCEPTION_PID" 2>/dev/null
   [ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null
   [ -n "$SIM_PID" ] && kill "$SIM_PID" 2>/dev/null
@@ -88,4 +91,8 @@ echo "Starting perception..."
 "$PERCEPTION" &
 PERCEPTION_PID=$!
 
-wait "$SIM_PID" "$BRIDGE_PID" "$PERCEPTION_PID"
+echo "Starting localization..."
+"$LOCALIZATION" &
+LOCALIZATION_PID=$!
+
+wait "$SIM_PID" "$BRIDGE_PID" "$PERCEPTION_PID" "$LOCALIZATION_PID"

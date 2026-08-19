@@ -128,7 +128,8 @@ set_target_properties(perception PROPERTIES
 add_executable(localization
     localization/src/localization.cpp
     localization/src/ekf.cpp
-    localization/src/geodetic.cpp)
+    localization/src/geodetic.cpp
+    localization/src/cone_map.cpp)
 target_include_directories(localization PRIVATE
     localization/include
     ${eigen_SOURCE_DIR})
