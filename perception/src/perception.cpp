@@ -212,16 +212,28 @@ int main()
 
     // Stitches only when all 3 buffered frames carry CLOSE-ENOUGH simulation
     // timestamps (see StampsClose/kStampToleranceSec) -- not just "whatever's
-    // latest", and not exact equality either. Triggering on "latest" sounds
-    // harmless (all 3 cameras publish at the same 30 Hz), but gz-transport
-    // doesn't guarantee their callbacks fire in lockstep, so "latest" can
-    // silently mean "this tick's front + last tick's left/right" -- verified
-    // empirically: camera_front's stamp runs a consistent ~1 tick ahead of
-    // camera_left/right's, every frame (a fixed pipeline skew, not jitter).
-    // Any such mismatch shows up as a faint double image at the blended
-    // seams -- worst on small/thin objects, since a sub-pixel shift is a
-    // large fraction of their size. Exact equality would reject every frame
-    // given that fixed skew, hence the tolerance instead.
+    // latest", and not exact equality either: measured empirically,
+    // camera_front's stamp runs a consistent ~1 tick (1/30 s) ahead of
+    // camera_left/right's, every frame (a fixed pipeline skew, not jitter),
+    // so exact equality would reject every frame given that fixed skew.
+    //
+    // Only called from onCameraFront below, not from all 3 camera
+    // callbacks -- calling it from all 3 was tried first and, on tracing
+    // through the actual arrival pattern, doesn't do what it sounds like it
+    // should: front arrives and checks against still-stale left/right,
+    // passes (triple 1); moments later left arrives and checks against
+    // fresh front + still-stale right, passes again (triple 2, genuinely
+    // different from triple 1 since left changed); then right arrives and
+    // passes a third time (triple 3, different again). All 3 are distinct
+    // triples, not repeats, so a "have I already processed this exact
+    // triple" dedup doesn't collapse any of them -- confirmed directly:
+    // distinct but near-identical detection results appeared 2-3x between
+    // console prints of a single new camera_front frame. Gating on front's
+    // callback alone -- the camera confirmed (not assumed) to always arrive
+    // first each cycle -- naturally rate-limits to once per cycle instead,
+    // using whatever's currently buffered for left/right (consistently
+    // ~1 tick "behind" per that same empirical data, comfortably inside
+    // the tolerance).
     auto tryStitchAndPublish = [&]()
     {
         if (!(haveFront && haveLeft && haveRight))
@@ -232,6 +244,7 @@ int main()
         {
             return;
         }
+
         const cv::Mat stitched = stitcher.Stitch({latestFront, latestLeft, latestRight});
         stitchedPub.Publish(ToImageMsg(stitched));
 
@@ -263,6 +276,12 @@ int main()
         tryStitchAndPublish();
     };
 
+    // Neither of these calls tryStitchAndPublish() -- see the comment on
+    // that lambda above for why only onCameraFront does. At startup, before
+    // left/right have ever received a frame, this just means the very
+    // first stitch waits for front's NEXT tick after both have arrived at
+    // least once (at most ~33 ms) rather than firing immediately -- not a
+    // correctness concern.
     std::function<void(const gz::msgs::Image &)> onCameraLeft =
         [&](const gz::msgs::Image &_msg)
     {
@@ -270,7 +289,6 @@ int main()
         latestLeft = FromImageMsg(_msg).clone();
         stampLeft = ToStampKey(_msg);
         haveLeft = true;
-        tryStitchAndPublish();
     };
 
     std::function<void(const gz::msgs::Image &)> onCameraRight =
@@ -280,7 +298,6 @@ int main()
         latestRight = FromImageMsg(_msg).clone();
         stampRight = ToStampKey(_msg);
         haveRight = true;
-        tryStitchAndPublish();
     };
 
     if (!node.Subscribe("/camera/front/image", onCameraFront))
