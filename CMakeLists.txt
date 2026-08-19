@@ -82,6 +82,24 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(onnxruntime)
 
 # ---------------------------------------------------------------------------
+# Eigen -- header-only, used by localization for the EKF's matrix math
+# (state covariance propagation, Kalman gain). Fetched via Populate (not
+# MakeAvailable) deliberately: Eigen's own CMakeLists.txt configures a full
+# build (tests, docs, optional BLAS/LAPACK detection) that we don't want or
+# need for a header-only dependency -- Populate just downloads/extracts the
+# source without ever running it.
+# ---------------------------------------------------------------------------
+FetchContent_Declare(
+  eigen
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  URL https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz
+)
+FetchContent_GetProperties(eigen)
+if(NOT eigen_POPULATED)
+  FetchContent_Populate(eigen)
+endif()
+
+# ---------------------------------------------------------------------------
 # Shared type definitions (header-only, no compiled library needed)
 # ---------------------------------------------------------------------------
 include_directories(common/include)
@@ -107,7 +125,13 @@ target_link_libraries(perception
 set_target_properties(perception PROPERTIES
     BUILD_RPATH "${onnxruntime_SOURCE_DIR}/lib")
 
-add_executable(localization  localization/src/localization.cpp)
+add_executable(localization
+    localization/src/localization.cpp
+    localization/src/ekf.cpp
+    localization/src/geodetic.cpp)
+target_include_directories(localization PRIVATE
+    localization/include
+    ${eigen_SOURCE_DIR})
 target_link_libraries(localization
     gz-transport::gz-transport
     gz-msgs::gz-msgs)

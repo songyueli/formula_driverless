@@ -148,6 +148,21 @@
            vertical); RTK Fixed accuracy isn't vendor-specific (it's set by
            carrier-phase differential GPS itself), so this uses the
            standard RTK Fixed figures (~1cm horizontal, ~2cm vertical).
+
+           position_sensing/horizontal's <stddev> is in DEGREES, not
+           meters, despite navsat.sdf's own schema doc saying "in units of
+           meters"; confirmed empirically (not guessed): with 0.01 there,
+           a stationary car's reported latitude jittered by up to 0.005deg
+           (~600m!) between samples, while altitude (position_sensing/
+           vertical, genuinely meters-native) stayed within ~1cm of
+           correct the whole time. The noise is evidently applied directly
+           to the output field (latitude_deg, a raw double), not converted
+           through the local-to-global meters-per-degree transform first.
+           So 1.07e-7 below is 0.01m converted to degrees by hand, using
+           ~93480 m/deg (longitude's tighter conversion at this latitude,
+           slightly conservative vs. latitude's ~111320 m/deg); there's
+           only one shared horizontal noise value for both lat and lon, so
+           this can't be tuned separately per axis anyway.
            Velocity accuracy (<0.05 m/s) and the 1m antenna baseline (which
            the VN-300 heading-accuracy spec of 0.15-0.3 deg is quoted at)
            are both straight from the VN-300 datasheet:
@@ -168,7 +183,7 @@
         <update_rate>400</update_rate>
         <navsat>
           <position_sensing>
-            <horizontal><noise type="gaussian"><stddev>0.01</stddev></noise></horizontal>
+            <horizontal><noise type="gaussian"><stddev>1.07e-7</stddev></noise></horizontal>
             <vertical><noise type="gaussian"><stddev>0.02</stddev></noise></vertical>
           </position_sensing>
           <velocity_sensing>
@@ -186,7 +201,7 @@
         <update_rate>400</update_rate>
         <navsat>
           <position_sensing>
-            <horizontal><noise type="gaussian"><stddev>0.01</stddev></noise></horizontal>
+            <horizontal><noise type="gaussian"><stddev>1.07e-7</stddev></noise></horizontal>
             <vertical><noise type="gaussian"><stddev>0.02</stddev></noise></vertical>
           </position_sensing>
           <velocity_sensing>
