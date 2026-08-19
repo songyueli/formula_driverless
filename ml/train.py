@@ -1,5 +1,7 @@
 """YOLO cone detection — training script."""
 
+from typing import Optional
+
 import torch
 from ultralytics import YOLO
 
@@ -15,8 +17,8 @@ PROFILES = {
 def train(
     data_yaml: str,
     model_variant: str = "yolo26n.pt",
-    epochs: int | None = None,
-    imgsz: int | None = None,
+    epochs: Optional[int] = None,
+    imgsz: Optional[int] = None,
     profile: str = "auto",
     project: str = "runs/detect",
     name: str = "train",
