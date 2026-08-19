@@ -68,9 +68,17 @@
 //   /lidar/points/points (gz.msgs.PointCloudPacked -- gpu_lidar's derived
 //   point-cloud topic; /lidar/points itself is a raw LaserScan, not this)
 //     -> /lidar (Foxglove PointCloud), frame_id "os1_128"
+//   /cone_detections (gz.msgs.Pose_V, published by perception -- one Pose
+//     per LOCALIZED detection this frame, position in the car/chassis
+//     frame, name() set to the class name)
+//     -> /cone_detections (Foxglove SceneUpdate), a CylinderPrimitive per
+//        cone colored/sized by class, frame_id "fsd_car" so Foxglove places
+//        them via /tf without any transform math here. Entity id
+//        "cone_detections" is replaced wholesale every publish (including
+//        with zero cylinders when nothing is localized), so it always shows
+//        only the current frame's detections, not an accumulating trail.
 //
-// TODO: add /planned_path, /cone_detections once planning/perception are
-// publishing real data.
+// TODO: add /planned_path once planning is publishing real data.
 
 namespace
 {
@@ -196,6 +204,33 @@ bool ConeSpecForName(const std::string &_name, ConeSpec *_spec)
         return true;
     }
     if (_name.rfind("cone_orange", 0) == 0)
+    {
+        *_spec = ConeSpec{0.1425, 0.505, foxglove::messages::Color{0.9, 0.35, 0, 1}};
+        return true;
+    }
+    return false;
+}
+
+// Same visual spec table as ConeSpecForName above, but keyed on perception's
+// raw YOLO class names ("blue"/"yellow"/"orange"/"large_orange") rather than
+// ground-truth model-instance names ("cone_blue_12") -- the two naming
+// schemes don't overlap, so this can't just reuse that lookup. The sim only
+// ships one orange cone model (already sized as the big 505mm cone), so
+// "orange" and "large_orange" both map to it; there's no ground-truth model
+// for a small orange cone to distinguish them against.
+bool DetectionConeSpec(const std::string &_className, ConeSpec *_spec)
+{
+    if (_className == "blue")
+    {
+        *_spec = ConeSpec{0.115, 0.325, foxglove::messages::Color{0, 0, 0.8, 1}};
+        return true;
+    }
+    if (_className == "yellow")
+    {
+        *_spec = ConeSpec{0.115, 0.325, foxglove::messages::Color{0.9, 0.9, 0, 1}};
+        return true;
+    }
+    if (_className == "orange" || _className == "large_orange")
     {
         *_spec = ConeSpec{0.1425, 0.505, foxglove::messages::Color{0.9, 0.35, 0, 1}};
         return true;
@@ -391,6 +426,62 @@ int main(int argc, char **argv)
     if (!node.Subscribe("/lidar/points/points", onLidar))
     {
         std::cerr << "Failed to subscribe to /lidar/points/points\n";
+        return 1;
+    }
+
+    auto detections_channel_result = foxglove::messages::SceneUpdateChannel::create("/cone_detections");
+    if (!detections_channel_result.has_value())
+    {
+        std::cerr << "Failed to create /cone_detections channel: "
+                  << foxglove::strerror(detections_channel_result.error()) << '\n';
+        return 1;
+    }
+    auto detections_channel = std::move(detections_channel_result.value());
+
+    std::function<void(const gz::msgs::Pose_V &)> onConeDetections =
+        [&detections_channel](const gz::msgs::Pose_V &_msg)
+    {
+        foxglove::messages::SceneEntity entity;
+        entity.timestamp = Now();
+        entity.frame_id = kCarModelName;
+        entity.id = "cone_detections";
+
+        for (const auto &pose : _msg.pose())
+        {
+            ConeSpec spec;
+            if (!DetectionConeSpec(pose.name(), &spec))
+            {
+                continue;
+            }
+
+            // Position-only from perception (see lidar_projector.cpp) --
+            // orientation is never set on these Pose messages, so an unset
+            // sub-message reads back as all-zero, which is a degenerate
+            // (zero-length) quaternion, not identity. Set identity
+            // explicitly rather than passing that through ToFoxglovePose().
+            foxglove::messages::Pose fgPose;
+            fgPose.position = foxglove::messages::Vector3{
+                pose.position().x(), pose.position().y(), pose.position().z()};
+            fgPose.orientation = foxglove::messages::Quaternion{0, 0, 0, 1};
+
+            foxglove::messages::CylinderPrimitive cone;
+            cone.pose = fgPose;
+            cone.size = foxglove::messages::Vector3{
+                spec.radius * 2, spec.radius * 2, spec.length};
+            cone.bottom_scale = 1.0;
+            cone.top_scale = 0.0;
+            cone.color = spec.color;
+            entity.cylinders.push_back(cone);
+        }
+
+        foxglove::messages::SceneUpdate update;
+        update.entities.push_back(std::move(entity));
+        detections_channel.log(update);
+    };
+
+    if (!node.Subscribe("/cone_detections", onConeDetections))
+    {
+        std::cerr << "Failed to subscribe to /cone_detections\n";
         return 1;
     }
 
