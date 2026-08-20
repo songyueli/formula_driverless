@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Configures (if needed) and builds the C++ workspace in one step.
 #
-# Run from inside the fsd_dev container, from the repo root:
+# Environment-agnostic -- just cmake, works the same whether run natively
+# (Jetson host or an x86 laptop, as long as Gazebo Jetty + OpenCV are
+# installed) or inside the Docker container. See dev_sim.sh for the same
+# note in more detail.
+#
+# Run from the repo root:
 #   ./scripts/build.sh
 #
 # `cmake -B build` is safe to call every time -- it only reconfigures when

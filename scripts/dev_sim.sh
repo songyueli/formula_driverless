@@ -5,7 +5,18 @@
 # form a closed loop off perception's cone detections, no manual
 # /cmd_ackermann commands needed).
 #
-# Run from inside the fsd_dev container, from the repo root:
+# Environment-agnostic on purpose -- no docker exec, no container-only
+# paths, nothing here cares whether it's running natively (Jetson host or
+# an x86 laptop) or inside the Docker container. It only needs whatever
+# environment it's invoked in to already have Gazebo Jetty + the built
+# binaries in ./build (see build.sh, same story there). The Jetson runs
+# this natively now (its host OS caught up to Ubuntu 24.04, which is what
+# Gazebo Jetty needs -- Docker was only ever a workaround for the old
+# Ubuntu 20.04 host, see Dockerfile); a laptop without a matching native
+# Gazebo Jetty install can still use the Docker container, same script
+# either way.
+#
+# Run from the repo root:
 #   ./scripts/dev_sim.sh [world_name]
 # world_name defaults to "trackdrive" and must match both the filename
 # (simulation/worlds/<world_name>.sdf) and its internal <world name="...">.
@@ -16,9 +27,8 @@
 #
 # Every pipeline stage stays a separate process (not threads in one binary)
 # deliberately -- keeps each one free to eventually move to a different
-# host/container (e.g. perception running natively on the Jetson for direct
-# TensorRT/CUDA access, while the bridge stays in Docker) without having to
-# be pulled apart out of a merged process later.
+# host/container from the others later without having to be pulled apart
+# out of a merged process first.
 #
 # Ctrl+C stops all six.
 
