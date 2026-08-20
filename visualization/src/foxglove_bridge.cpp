@@ -6,15 +6,20 @@
 #include <unordered_map>
 #include <utility>
 
+#include <cstdio>
+
 #include <gz/transport/Node.hh>
 #include <gz/msgs/image.pb.h>
 #include <gz/msgs/pointcloud_packed.pb.h>
 #include <gz/msgs/pose.pb.h>
 #include <gz/msgs/pose_v.pb.h>
 #include <gz/msgs/scene.pb.h>
+#include <gz/msgs/uint64.pb.h>
 
+#include <foxglove/channel.hpp>
 #include <foxglove/error.hpp>
 #include <foxglove/messages.hpp>
+#include <foxglove/schema.hpp>
 #include <foxglove/websocket.hpp>
 
 // Foxglove bridge process
@@ -121,6 +126,19 @@
 //        /cone_detections: it's already body-frame, so /tf places it with
 //        no transform math here either). Replaced wholesale every publish,
 //        same as /cone_detections, so it never shows a stale path.
+//   /timing/{perception,localization,planning,control} (gz.msgs.UInt64,
+//     published by each of those 4 processes -- see common/scoped_timer.hpp
+//     -- microseconds spent on that process's own last unit of real work)
+//     -> /timing (Foxglove RawChannel, "json" encoding + a small jsonschema
+//        describing the 4 fields) -- none of the SDK's built-in typed
+//        channels used elsewhere in this file (PoseInFrame, SceneUpdate,
+//        etc.) fit 4 independent named scalars, so this uses RawChannel
+//        directly instead, the SDK's supported escape hatch for a custom
+//        data shape. Combined into ONE topic rather than 4 separate ones:
+//        the 4 stages update at different, unrelated rates, so this
+//        latest-value-per-field cache is republished in full every time ANY
+//        one of the 4 ticks (same pattern as /tf above, which similarly
+//        merges multiple independently-arriving sources into one output).
 
 namespace
 {
@@ -790,6 +808,104 @@ int main(int argc, char **argv)
     if (!node.Subscribe("/estimated_landmarks", onEstimatedLandmarks))
     {
         std::cerr << "Failed to subscribe to /estimated_landmarks\n";
+        return 1;
+    }
+
+    // Per-stage compute-time aggregation -- see the /timing doc comment at
+    // the top of this file for the full rationale.
+    constexpr const char *kTimingSchemaJson =
+        R"({"type":"object","properties":{)"
+        R"("perception_us":{"type":"integer"},)"
+        R"("localization_us":{"type":"integer"},)"
+        R"("planning_us":{"type":"integer"},)"
+        R"("control_us":{"type":"integer"}}})";
+
+    foxglove::Schema timingSchema;
+    timingSchema.name = "StageTimingUs";
+    timingSchema.encoding = "jsonschema";
+    timingSchema.data = reinterpret_cast<const std::byte *>(kTimingSchemaJson);
+    timingSchema.data_len = std::char_traits<char>::length(kTimingSchemaJson);
+
+    auto timing_channel_result = foxglove::RawChannel::create("/timing", "json", timingSchema);
+    if (!timing_channel_result.has_value())
+    {
+        std::cerr << "Failed to create /timing channel: "
+                  << foxglove::strerror(timing_channel_result.error()) << '\n';
+        return 1;
+    }
+    auto timing_channel = std::move(timing_channel_result.value());
+
+    // Latest known value per stage -- each field updates independently as
+    // its own /timing/<stage> topic ticks (different stages, different
+    // rates), and the full struct is republished together every time ANY
+    // one field updates, so /timing always reflects the most recent known
+    // duration for all 4 stages at once.
+    struct StageTimingUs
+    {
+        uint64_t perception = 0;
+        uint64_t localization = 0;
+        uint64_t planning = 0;
+        uint64_t control = 0;
+    };
+    StageTimingUs stageTiming;
+
+    auto publishTiming = [&timing_channel, &stageTiming]()
+    {
+        char buf[160];
+        const int len = std::snprintf(buf, sizeof(buf),
+            R"({"perception_us":%llu,"localization_us":%llu,"planning_us":%llu,"control_us":%llu})",
+            static_cast<unsigned long long>(stageTiming.perception),
+            static_cast<unsigned long long>(stageTiming.localization),
+            static_cast<unsigned long long>(stageTiming.planning),
+            static_cast<unsigned long long>(stageTiming.control));
+        timing_channel.log(reinterpret_cast<const std::byte *>(buf), static_cast<size_t>(len));
+    };
+
+    std::function<void(const gz::msgs::UInt64 &)> onPerceptionTiming =
+        [&stageTiming, &publishTiming](const gz::msgs::UInt64 &_msg)
+    {
+        stageTiming.perception = _msg.data();
+        publishTiming();
+    };
+    if (!node.Subscribe("/timing/perception", onPerceptionTiming))
+    {
+        std::cerr << "Failed to subscribe to /timing/perception\n";
+        return 1;
+    }
+
+    std::function<void(const gz::msgs::UInt64 &)> onLocalizationTiming =
+        [&stageTiming, &publishTiming](const gz::msgs::UInt64 &_msg)
+    {
+        stageTiming.localization = _msg.data();
+        publishTiming();
+    };
+    if (!node.Subscribe("/timing/localization", onLocalizationTiming))
+    {
+        std::cerr << "Failed to subscribe to /timing/localization\n";
+        return 1;
+    }
+
+    std::function<void(const gz::msgs::UInt64 &)> onPlanningTiming =
+        [&stageTiming, &publishTiming](const gz::msgs::UInt64 &_msg)
+    {
+        stageTiming.planning = _msg.data();
+        publishTiming();
+    };
+    if (!node.Subscribe("/timing/planning", onPlanningTiming))
+    {
+        std::cerr << "Failed to subscribe to /timing/planning\n";
+        return 1;
+    }
+
+    std::function<void(const gz::msgs::UInt64 &)> onControlTiming =
+        [&stageTiming, &publishTiming](const gz::msgs::UInt64 &_msg)
+    {
+        stageTiming.control = _msg.data();
+        publishTiming();
+    };
+    if (!node.Subscribe("/timing/control", onControlTiming))
+    {
+        std::cerr << "Failed to subscribe to /timing/control\n";
         return 1;
     }
 

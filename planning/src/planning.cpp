@@ -7,7 +7,9 @@
 #include <gz/transport/Node.hh>
 #include <gz/msgs/pose.pb.h>
 #include <gz/msgs/pose_v.pb.h>
+#include <gz/msgs/uint64.pb.h>
 
+#include <common/scoped_timer.hpp>
 #include <common/types.hpp>
 
 // Path planning process
@@ -67,9 +69,22 @@ int main()
 
     auto pathPub = node.Advertise<gz::msgs::Pose_V>("/planned_path");
 
+    // Per-cycle compute time (microseconds) -- currently trivial nearest-
+    // neighbor pairing, but wrapping the whole callback body (rather than
+    // hand-picking which lines to time) means this keeps working unchanged
+    // if this algorithm later grows into something heavier.
+    auto timingPub = node.Advertise<gz::msgs::UInt64>("/timing/planning");
+
     std::function<void(const gz::msgs::Pose_V &)> onConeDetections =
-        [&pathPub](const gz::msgs::Pose_V &_msg)
+        [&pathPub, &timingPub](const gz::msgs::Pose_V &_msg)
     {
+        fsd::ScopedTimer timer([&timingPub](int64_t _us)
+        {
+            gz::msgs::UInt64 msg;
+            msg.set_data(static_cast<uint64_t>(_us));
+            timingPub.Publish(msg);
+        });
+
         std::vector<Cone> blue, yellow;
         for (const auto &pose : _msg.pose())
         {

@@ -11,7 +11,9 @@
 #include <gz/msgs/pose.pb.h>
 #include <gz/msgs/pose_v.pb.h>
 #include <gz/msgs/time.pb.h>
+#include <gz/msgs/uint64.pb.h>
 
+#include <common/scoped_timer.hpp>
 #include "cone_color.hpp"
 #include "ekf.hpp"
 #include "geodetic.hpp"
@@ -115,6 +117,22 @@ int main()
     auto posePub = node.Advertise<gz::msgs::Pose>("/estimated_pose");
     auto landmarksPub = node.Advertise<gz::msgs::Pose_V>("/estimated_landmarks");
 
+    // Per-cycle compute time (microseconds). Unlike the other 3 processes,
+    // localization has 5 distinct callbacks (one per sensor stream) rather
+    // than one -- each is its own "cycle", at its own rate and cost (the
+    // cone-detection callback does real EKF landmark matching; the others
+    // are a predict+correct+publish each), so all 5 publish to the same
+    // topic below rather than needing 5 separate ones -- callers just see
+    // "how long did localization's last piece of work take", whichever
+    // stream triggered it.
+    auto timingPub = node.Advertise<gz::msgs::UInt64>("/timing/localization");
+    auto publishTiming = [&timingPub](int64_t _us)
+    {
+        gz::msgs::UInt64 msg;
+        msg.set_data(static_cast<uint64_t>(_us));
+        timingPub.Publish(msg);
+    };
+
     // Predict() needs elapsed SIM time, not wall time -- this sim runs well
     // under real-time under the current sensor load (measured ~0.1x
     // real-time factor with 3 cameras + lidar + YOLO all running), so wall
@@ -176,6 +194,7 @@ int main()
     std::function<void(const gz::msgs::Odometry &)> onGroundSpeed =
         [&](const gz::msgs::Odometry &_msg)
     {
+        fsd::ScopedTimer timer(publishTiming);
         predictTo(StampToSeconds(_msg.header().stamp()));
         ekf.CorrectBodyVelocity(_msg.twist().linear().x(), _msg.twist().linear().y(),
                                  kGroundSpeedStddev, kGroundSpeedStddev);
@@ -190,6 +209,7 @@ int main()
     std::function<void(const gz::msgs::IMU &)> onImu =
         [&](const gz::msgs::IMU &_msg)
     {
+        fsd::ScopedTimer timer(publishTiming);
         predictTo(StampToSeconds(_msg.header().stamp()));
         ekf.CorrectYawRate(_msg.angular_velocity().z(), kGyroZStddev);
         publishEstimate();
@@ -203,6 +223,7 @@ int main()
     std::function<void(const gz::msgs::NavSat &)> onGnssFront =
         [&](const gz::msgs::NavSat &_msg)
     {
+        fsd::ScopedTimer timer(publishTiming);
         predictTo(StampToSeconds(_msg.header().stamp()));
         const auto enu = geo.ToEnu(_msg.latitude_deg(), _msg.longitude_deg(), _msg.altitude());
         ekf.CorrectGnssPosition(enu.east, enu.north, kFrontAntennaX, kFrontAntennaY,
@@ -220,6 +241,7 @@ int main()
     std::function<void(const gz::msgs::NavSat &)> onGnssRear =
         [&](const gz::msgs::NavSat &_msg)
     {
+        fsd::ScopedTimer timer(publishTiming);
         predictTo(StampToSeconds(_msg.header().stamp()));
         const auto enu = geo.ToEnu(_msg.latitude_deg(), _msg.longitude_deg(), _msg.altitude());
         ekf.CorrectGnssPosition(enu.east, enu.north, kRearAntennaX, kRearAntennaY,
@@ -237,6 +259,7 @@ int main()
     std::function<void(const gz::msgs::Pose_V &)> onConeDetections =
         [&](const gz::msgs::Pose_V &_msg)
     {
+        fsd::ScopedTimer timer(publishTiming);
         // No predictTo() here: perception never sets Pose_V's header stamp
         // (see perception.cpp), and the other three sensor streams already
         // keep the state's prediction reasonably current between detection
