@@ -30,18 +30,12 @@ ml/models/
 *.engine
 .ipynb_checkpoints/
 
-# Training run outputs (metrics, plots, logs) are ignored, except the
-# checkpoint below, which is tracked via Git LFS (see .gitattributes).
-# Git won't apply a negation to a file inside an ignored directory, so each
-# level has to be carved out individually rather than just ignoring ml/runs/.
-ml/runs/*
-!ml/runs/detect/
-ml/runs/detect/*
-!ml/runs/detect/train/
-ml/runs/detect/train/*
-!ml/runs/detect/train/weights/
-ml/runs/detect/train/weights/*
-!ml/runs/detect/train/weights/best.pt
+# Training run outputs (metrics, plots, weights) -- the .onnx/.engine model
+# formats perception.cpp actually loads are already covered by the *.onnx/
+# *.engine rules above; the PyTorch .pt checkpoint is deliberately never
+# needed (nothing in this pipeline loads a .pt file at runtime), so nothing
+# under here needs a tracked exception anymore.
+ml/runs/
 
 # Defensive only -- train.py's project default used to be a bare relative
 # "runs/detect", which ultralytics resolved against the CALLING PROCESS's
