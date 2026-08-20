@@ -127,7 +127,15 @@ void Ekf::CorrectBodyVelocity(double _vx, double _vy, double _stddevVx, double _
 
     m_x += K * y;
     m_x(2) = NormalizeAngle(m_x(2));
-    m_P = (Eigen::MatrixXd::Identity(n, n) - K * H) * m_P;
+    // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
+    // equivalent but forms a dense n x n (I-K*H) matrix and multiplies it
+    // by P, an O(n^3) operation Eigen has no way to avoid on its own. H
+    // only has 1-2 nonzero rows, so H*P is O(n) rows worth of work (O(n)
+    // per row = O(n) here since k<=2), and K*(H*P) is (n x k)*(k x n) =
+    // O(k*n^2) -- with k a small constant, that's O(n^2) overall, not
+    // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
+    // map), that difference is the entire performance budget.
+    m_P = m_P - K * (H * m_P);
 }
 
 void Ekf::CorrectYawRate(double _yawRate, double _stddev)
@@ -142,7 +150,15 @@ void Ekf::CorrectYawRate(double _yawRate, double _stddev)
 
     m_x += K * y;
     m_x(2) = NormalizeAngle(m_x(2));
-    m_P = (Eigen::MatrixXd::Identity(n, n) - K * H) * m_P;
+    // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
+    // equivalent but forms a dense n x n (I-K*H) matrix and multiplies it
+    // by P, an O(n^3) operation Eigen has no way to avoid on its own. H
+    // only has 1-2 nonzero rows, so H*P is O(n) rows worth of work (O(n)
+    // per row = O(n) here since k<=2), and K*(H*P) is (n x k)*(k x n) =
+    // O(k*n^2) -- with k a small constant, that's O(n^2) overall, not
+    // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
+    // map), that difference is the entire performance budget.
+    m_P = m_P - K * (H * m_P);
 }
 
 void Ekf::CorrectGnssPosition(double _measuredEast, double _measuredNorth,
@@ -173,7 +189,15 @@ void Ekf::CorrectGnssPosition(double _measuredEast, double _measuredNorth,
 
     m_x += K * y;
     m_x(2) = NormalizeAngle(m_x(2));
-    m_P = (Eigen::MatrixXd::Identity(n, n) - K * H) * m_P;
+    // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
+    // equivalent but forms a dense n x n (I-K*H) matrix and multiplies it
+    // by P, an O(n^3) operation Eigen has no way to avoid on its own. H
+    // only has 1-2 nonzero rows, so H*P is O(n) rows worth of work (O(n)
+    // per row = O(n) here since k<=2), and K*(H*P) is (n x k)*(k x n) =
+    // O(k*n^2) -- with k a small constant, that's O(n^2) overall, not
+    // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
+    // map), that difference is the entire performance budget.
+    m_P = m_P - K * (H * m_P);
 }
 
 void Ekf::CorrectHeading(double _measuredYaw, double _stddev)
@@ -188,7 +212,15 @@ void Ekf::CorrectHeading(double _measuredYaw, double _stddev)
 
     m_x += K * y;
     m_x(2) = NormalizeAngle(m_x(2));
-    m_P = (Eigen::MatrixXd::Identity(n, n) - K * H) * m_P;
+    // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
+    // equivalent but forms a dense n x n (I-K*H) matrix and multiplies it
+    // by P, an O(n^3) operation Eigen has no way to avoid on its own. H
+    // only has 1-2 nonzero rows, so H*P is O(n) rows worth of work (O(n)
+    // per row = O(n) here since k<=2), and K*(H*P) is (n x k)*(k x n) =
+    // O(k*n^2) -- with k a small constant, that's O(n^2) overall, not
+    // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
+    // map), that difference is the entire performance budget.
+    m_P = m_P - K * (H * m_P);
 }
 
 void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
@@ -277,7 +309,15 @@ void Ekf::CorrectMatchedLandmark(int _landmarkIndex, double _measuredBodyX,
 
     m_x += K * y;
     m_x(2) = NormalizeAngle(m_x(2));
-    m_P = (Eigen::MatrixXd::Identity(n, n) - K * H) * m_P;
+    // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
+    // equivalent but forms a dense n x n (I-K*H) matrix and multiplies it
+    // by P, an O(n^3) operation Eigen has no way to avoid on its own. H
+    // only has 1-2 nonzero rows, so H*P is O(n) rows worth of work (O(n)
+    // per row = O(n) here since k<=2), and K*(H*P) is (n x k)*(k x n) =
+    // O(k*n^2) -- with k a small constant, that's O(n^2) overall, not
+    // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
+    // map), that difference is the entire performance budget.
+    m_P = m_P - K * (H * m_P);
 }
 
 void Ekf::AddLandmark(double _measuredBodyX, double _measuredBodyY,
