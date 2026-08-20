@@ -137,15 +137,14 @@ constexpr double kPanoHFovRad = 1.3963; // 80 deg
 
 // Run from the repo root (matches every other script/binary in this
 // project -- see dev_sim.sh), so this resolves relative to /workspace.
-// runs/detect/runs/detect/... (doubly-nested, and NOT under ml/, despite
-// train.py's project="runs/detect" default reading like it should resolve
-// under wherever it's invoked from) is where ultralytics actually wrote
-// this on the Jetson -- confirmed by listing the real directory over SSH,
-// not assumed from the default parameter alone. Git-ignored (see
-// .gitignore), so this only exists on whichever machine actually ran
-// training (the Jetson, as of this writing) -- doesn't need to, and isn't
-// meant to, exist in a fresh clone.
-constexpr const char *kModelPath = "runs/detect/runs/detect/train/weights/best.onnx";
+// train.py anchors its `project` default to its own file location (see
+// ml/train.py's DEFAULT_PROJECT), so training always writes here regardless
+// of which directory the training command itself was invoked from. Not
+// tracked in git (see .gitignore's ml/runs/* carve-out, which keeps only
+// the weights/best.pt checkpoint via LFS -- not this .onnx export), so this
+// only exists on whichever machine actually ran training and exported the
+// model -- doesn't need to, and isn't meant to, exist in a fresh clone.
+constexpr const char *kModelPath = "ml/runs/detect/train/weights/best.onnx";
 constexpr float kConfThreshold = 0.25f;
 
 // Matches ml/prepare_data.py's CLASSES list exactly -- same order, since

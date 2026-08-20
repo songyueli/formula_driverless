@@ -1,5 +1,6 @@
 """YOLO cone detection — training script."""
 
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -13,6 +14,16 @@ PROFILES = {
     "full": {"epochs": 100, "imgsz": 1440},
 }
 
+# Anchored to this file's own location, not left as a bare relative string --
+# ultralytics resolves a relative `project` against the CALLING PROCESS's
+# current working directory, not against train.py's location, so the same
+# "runs/detect" default silently landed in different places (ml/runs/detect
+# when run from within ml/, but a stray <repo_root>/runs/detect when invoked
+# from the repo root, e.g. via `python3 -c "from train import train; ..."`
+# from ~/formula_driverless on the Jetson) depending on how training was
+# kicked off. Anchoring here makes the output location invariant to that.
+DEFAULT_PROJECT = str(Path(__file__).parent / "runs" / "detect")
+
 
 def train(
     data_yaml: str,
@@ -20,7 +31,7 @@ def train(
     epochs: Optional[int] = None,
     imgsz: Optional[int] = None,
     profile: str = "auto",
-    project: str = "runs/detect",
+    project: str = DEFAULT_PROJECT,
     name: str = "train",
 ):
     if profile == "auto":

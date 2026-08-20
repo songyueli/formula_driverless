@@ -43,13 +43,13 @@ ml/runs/detect/train/*
 ml/runs/detect/train/weights/*
 !ml/runs/detect/train/weights/best.pt
 
-# Actual training output location (an ultralytics project-path quirk --
-# train.py's project="runs/detect" default resolves HERE, at the repo root,
-# not under ml/ as the parameter name suggests -- confirmed by inspecting
-# the real directory on the machine that ran training, not assumed). Not
-# tracked via LFS like ml/runs/detect/train/weights/best.pt above -- that's
-# a deliberately-versioned checkpoint; this is untracked scratch output
-# (training-batch preview images, metric plots, csvs) from the same run.
+# Defensive only -- train.py's project default used to be a bare relative
+# "runs/detect", which ultralytics resolved against the CALLING PROCESS's
+# CWD rather than train.py's own location, so training invoked from the repo
+# root (rather than from within ml/) landed here instead of under ml/runs/.
+# Fixed by anchoring train.py's DEFAULT_PROJECT to the script's own file
+# location, so nothing should land here anymore -- kept as a safety net in
+# case some other invocation still passes a bare relative project path.
 runs/
 
 # Gazebo logs and caches
