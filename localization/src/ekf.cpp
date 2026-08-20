@@ -18,6 +18,18 @@ double NormalizeAngle(double _angle)
 // under half that, so it isn't the limiting factor for a first
 // implementation.
 constexpr double kLandmarkGateDist = 1.0;
+
+// Sanity cap on total tracked landmarks. The actual track has ~246 cones
+// (confirmed via Gazebo's own scene service during earlier testing), so
+// this is generous headroom, not a tight limit meant to bind in normal
+// operation -- it exists purely as a backstop against runaway growth if
+// something else (a diverged pose estimate, a bad data association) makes
+// every subsequent detection look like a new landmark instead of a match.
+// Without this, that failure mode is self-reinforcing: more landmarks
+// makes each correction more expensive (O(n^2) in total state size), which
+// makes this process more likely to fall behind and produce the large
+// Predict() dt gaps that caused the bad pose estimate in the first place.
+constexpr size_t kMaxLandmarks = 600;
 } // namespace
 
 namespace fsd
@@ -38,6 +50,26 @@ void Ekf::Predict(double _dt)
     if (_dt <= 0.0)
     {
         return;
+    }
+
+    // Clamp rather than trust an arbitrarily large gap. gz-transport's
+    // pub/sub is lossy under backpressure (drops messages instead of
+    // queueing them when a subscriber falls behind), so if this process
+    // gets starved of CPU for a while -- competing with something else
+    // running on the machine, or just its own cost growing with a large
+    // landmark map -- the NEXT message it does process can carry a large
+    // gap since the last one actually handled. Applying that gap directly
+    // breaks the linearization this filter relies on and can make the
+    // pose estimate diverge outright, which then corrupts every
+    // subsequent landmark's data-association gating (see
+    // CorrectOrAddLandmark) -- a real failure observed in practice, not a
+    // theoretical concern. Clamping caps how far a single bad gap can
+    // throw the estimate off; it deliberately doesn't try to reconstruct
+    // what "really" happened during the missed interval.
+    constexpr double kMaxPredictDt = 1.0;  // seconds
+    if (_dt > kMaxPredictDt)
+    {
+        _dt = kMaxPredictDt;
     }
 
     const double yaw = m_x(2);
@@ -255,10 +287,13 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     {
         CorrectMatchedLandmark(bestIndex, _measuredBodyX, _measuredBodyY, _stddev);
     }
-    else
+    else if (m_landmarkColors.size() < kMaxLandmarks)
     {
         AddLandmark(_measuredBodyX, _measuredBodyY, _color, _stddev);
     }
+    // else: at the cap -- silently drop rather than keep growing. Existing
+    // landmarks (of any color) can still be matched and corrected
+    // normally; this only stops NEW ones from being created.
 }
 
 void Ekf::CorrectMatchedLandmark(int _landmarkIndex, double _measuredBodyX,
