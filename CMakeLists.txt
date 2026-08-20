@@ -152,3 +152,15 @@ target_link_libraries(foxglove_bridge
     gz-transport::gz-transport
     gz-msgs::gz-msgs
     foxglove_cpp)
+
+# ---------------------------------------------------------------------------
+# tegrastats -- Jetson-only system-monitoring tool (part of L4T/JetPack, not
+# a library to link against -- foxglove_bridge spawns it as a subprocess and
+# parses its stdout). Detected rather than assumed present so the Mac/x86
+# dev build (no tegrastats there at all) still compiles; when absent,
+# foxglove_bridge simply doesn't publish /jetson_stats.
+# ---------------------------------------------------------------------------
+find_program(TEGRASTATS_EXECUTABLE tegrastats)
+if(TEGRASTATS_EXECUTABLE)
+  target_compile_definitions(foxglove_bridge PRIVATE FOXGLOVE_BRIDGE_HAS_TEGRASTATS)
+endif()

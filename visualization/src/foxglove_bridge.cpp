@@ -1,7 +1,10 @@
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <iostream>
+#include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -13,9 +16,21 @@
 #include <gz/msgs/pose_v.pb.h>
 #include <gz/msgs/scene.pb.h>
 
+#include <foxglove/channel.hpp>
 #include <foxglove/error.hpp>
 #include <foxglove/messages.hpp>
+#include <foxglove/schema.hpp>
 #include <foxglove/websocket.hpp>
+
+#ifdef FOXGLOVE_BRIDGE_HAS_TEGRASTATS
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <atomic>
+#include <cstdio>
+#include <regex>
+#include <thread>
+#endif
 
 // Foxglove bridge process
 // -----------------------
@@ -121,6 +136,21 @@
 //        /cone_detections: it's already body-frame, so /tf places it with
 //        no transform math here either). Replaced wholesale every publish,
 //        same as /cone_detections, so it never shows a stale path.
+//
+// Jetson system stats (Jetson-only, guarded by FOXGLOVE_BRIDGE_HAS_TEGRASTATS
+// -- see CMakeLists.txt's find_program(tegrastats) check; absent entirely on
+// the Mac/x86 dev build):
+//   `tegrastats` doesn't originate from Gazebo/gz-transport at all -- it's a
+//   host-machine monitoring tool with no relationship to the sim, so unlike
+//   every other topic in this file it isn't a gz-transport subscription.
+//   Spawned ONCE as a long-lived subprocess (not re-spawned per sample --
+//   its own --interval flag controls sampling rate) on a background thread,
+//   parsed line-by-line, and logged to:
+//     -> /jetson_stats (custom JSON schema via foxglove::RawChannel -- none
+//        of the SDK's built-in typed channels fit a flat stats snapshot).
+//        Always includes a "raw" field with the unparsed tegrastats line
+//        alongside the best-effort-parsed fields, since tegrastats' text
+//        format isn't a stable/versioned API -- see ParseTegrastatsLineToJson.
 
 namespace
 {
@@ -402,6 +432,210 @@ foxglove::messages::SceneEntity BuildVehicleEntity(
     }
     return entity;
 }
+
+#ifdef FOXGLOVE_BRIDGE_HAS_TEGRASTATS
+// JSON Schema for /jetson_stats -- see ParseTegrastatsLineToJson for what
+// actually populates each field.
+constexpr const char *kJetsonStatsSchemaJson = R"({
+  "type": "object",
+  "properties": {
+    "ram_used_mb": {"type": "number"},
+    "ram_total_mb": {"type": "number"},
+    "cpu_core_pct": {"type": "array", "items": {"type": "number"}},
+    "gpu_pct": {"type": "number"},
+    "temps_c": {"type": "object"},
+    "power_mw": {"type": "object"},
+    "raw": {"type": "string"}
+  }
+})";
+
+// Escapes the characters tegrastats' own output can actually contain and
+// that would otherwise break a hand-built JSON string (quotes,
+// backslashes). Not a general-purpose JSON escaper -- tegrastats never
+// emits control characters or non-ASCII, so this covers everything that
+// can actually occur here.
+std::string JsonEscape(const std::string &_s)
+{
+    std::string out;
+    out.reserve(_s.size());
+    for (char c : _s)
+    {
+        if (c == '"' || c == '\\')
+        {
+            out.push_back('\\');
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+// Best-effort parse of a single tegrastats output line into a flat JSON
+// object. tegrastats' text format is NOT a stable, versioned API -- these
+// regexes were written against the documented/typical L4T format (RAM
+// X/YMB, CPU [n%@freq,...], GR3D_FREQ n%, name@temperatureC, VDD_RAIL
+// nmW/mW) but have NOT been verified against a live sample on the actual
+// target device (this was implemented in an isolated environment with no
+// access to the physical Jetson) -- confirm against a real `tegrastats`
+// invocation on this specific device/L4T release before trusting the
+// parsed fields, and adjust the regexes if any don't match. The full raw
+// line is always included as "raw" specifically so nothing is silently
+// lost if a field's regex doesn't match this device's actual output.
+std::string ParseTegrastatsLineToJson(const std::string &_line)
+{
+    std::ostringstream json;
+    json << "{";
+
+    std::smatch m;
+    if (std::regex_search(_line, m, std::regex(R"(RAM (\d+)/(\d+)MB)")))
+    {
+        json << "\"ram_used_mb\":" << m[1].str() << ",\"ram_total_mb\":" << m[2].str() << ",";
+    }
+
+    if (std::regex_search(_line, m, std::regex(R"(CPU \[([^\]]*)\])")))
+    {
+        const std::string coreList = m[1].str();
+        json << "\"cpu_core_pct\":[";
+        const std::regex corePct(R"((\d+)%@)");
+        bool first = true;
+        for (auto it = std::sregex_iterator(coreList.begin(), coreList.end(), corePct);
+             it != std::sregex_iterator(); ++it)
+        {
+            if (!first)
+            {
+                json << ",";
+            }
+            json << (*it)[1].str();
+            first = false;
+        }
+        json << "],";
+    }
+
+    if (std::regex_search(_line, m, std::regex(R"(GR3D_FREQ (\d+)%)")))
+    {
+        json << "\"gpu_pct\":" << m[1].str() << ",";
+    }
+
+    json << "\"temps_c\":{";
+    {
+        const std::regex tempPattern(R"((\w+)@(-?[\d.]+)C)");
+        bool first = true;
+        for (auto it = std::sregex_iterator(_line.begin(), _line.end(), tempPattern);
+             it != std::sregex_iterator(); ++it)
+        {
+            if (!first)
+            {
+                json << ",";
+            }
+            json << "\"" << JsonEscape((*it)[1].str()) << "\":" << (*it)[2].str();
+            first = false;
+        }
+    }
+    json << "},";
+
+    json << "\"power_mw\":{";
+    {
+        // Matches VDD_* rails (e.g. VDD_GPU_SOC) and VIN_* rails (e.g.
+        // VIN_SYS_5V0) -- confirmed against a real tegrastats line on the
+        // actual Jetson, which includes both prefixes, not just VDD_.
+        // Captures the full rail name (prefix included) as the JSON key,
+        // since VDD_ vs VIN_ is meaningful (voltage-domain vs. input rail).
+        const std::regex powerPattern(R"(((?:VDD|VIN)_\w+) (\d+)mW/\d+mW)");
+        bool first = true;
+        for (auto it = std::sregex_iterator(_line.begin(), _line.end(), powerPattern);
+             it != std::sregex_iterator(); ++it)
+        {
+            if (!first)
+            {
+                json << ",";
+            }
+            json << "\"" << JsonEscape((*it)[1].str()) << "\":" << (*it)[2].str();
+            first = false;
+        }
+    }
+    json << "},";
+
+    json << "\"raw\":\"" << JsonEscape(_line) << "\"";
+    json << "}";
+    return json.str();
+}
+
+// Runs tegrastats as a single long-lived child process (its own --interval
+// flag controls sampling rate -- this does NOT re-spawn it per sample) and
+// feeds each line it prints to _onLine as it arrives, blocking until either
+// the pipe closes or _stop becomes true. PR_SET_PDEATHSIG makes the child
+// die if this process dies first (e.g. Ctrl+C via dev_sim.sh's cleanup()),
+// rather than surviving as an orphan -- plain popen()/pclose() does NOT
+// guarantee that, since pclose() just waits for the child instead of
+// killing it.
+//
+// Shutdown note: _stop is only checked between lines, so if tegrastats is
+// mid-interval when _stop is set, this can block for up to one more
+// interval before returning -- acceptable for a monitoring sidecar with a
+// multi-second interval, not something this makes any effort to preempt
+// immediately.
+void RunTegrastats(int _intervalMs, const std::atomic<bool> &_stop,
+                    const std::function<void(const std::string &)> &_onLine)
+{
+    int pipeFds[2];
+    if (pipe(pipeFds) != 0)
+    {
+        std::cerr << "tegrastats: pipe() failed -- /jetson_stats will not be published\n";
+        return;
+    }
+
+    const pid_t pid = fork();
+    if (pid < 0)
+    {
+        std::cerr << "tegrastats: fork() failed -- /jetson_stats will not be published\n";
+        close(pipeFds[0]);
+        close(pipeFds[1]);
+        return;
+    }
+
+    if (pid == 0)
+    {
+        // Child: exec tegrastats with stdout wired to the pipe.
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        close(pipeFds[0]);
+        dup2(pipeFds[1], STDOUT_FILENO);
+        close(pipeFds[1]);
+        const std::string intervalArg = std::to_string(_intervalMs);
+        execlp("tegrastats", "tegrastats", "--interval", intervalArg.c_str(),
+               static_cast<char *>(nullptr));
+        _exit(127);  // execlp only returns on failure
+    }
+
+    // Parent
+    close(pipeFds[1]);
+    FILE *stream = fdopen(pipeFds[0], "r");
+    if (!stream)
+    {
+        std::cerr << "tegrastats: fdopen() failed -- /jetson_stats will not be published\n";
+        close(pipeFds[0]);
+        kill(pid, SIGKILL);
+        waitpid(pid, nullptr, 0);
+        return;
+    }
+
+    char buf[4096];
+    while (!_stop.load() && fgets(buf, sizeof(buf), stream))
+    {
+        std::string line(buf);
+        if (!line.empty() && line.back() == '\n')
+        {
+            line.pop_back();
+        }
+        if (!line.empty())
+        {
+            _onLine(line);
+        }
+    }
+
+    fclose(stream);
+    kill(pid, SIGKILL);
+    waitpid(pid, nullptr, 0);
+}
+#endif  // FOXGLOVE_BRIDGE_HAS_TEGRASTATS
 }  // namespace
 
 int main(int argc, char **argv)
@@ -902,6 +1136,48 @@ int main(int argc, char **argv)
         return 1;
     }
 
+#ifdef FOXGLOVE_BRIDGE_HAS_TEGRASTATS
+    // 2s interval: cheap in both senses -- tegrastats itself isn't a
+    // meaningful CPU cost at any reasonable rate, but system stats also
+    // don't need anything faster than this to be useful for tracking
+    // trends (thermal throttling, memory pressure, power draw) alongside a
+    // sim run; this is monitoring, not a control-loop input.
+    constexpr int kTegrastatsIntervalMs = 2000;
+
+    std::atomic<bool> stopTegrastats{false};
+    std::thread tegrastatsThread;
+
+    auto tegrastatsSchema = foxglove::Schema{
+        "JetsonStats", "jsonschema",
+        reinterpret_cast<const std::byte *>(kJetsonStatsSchemaJson),
+        std::strlen(kJetsonStatsSchemaJson)};
+    auto tegrastatsChannelResult =
+        foxglove::RawChannel::create("/jetson_stats", "json", tegrastatsSchema);
+    if (!tegrastatsChannelResult.has_value())
+    {
+        std::cerr << "Failed to create /jetson_stats channel: "
+                  << foxglove::strerror(tegrastatsChannelResult.error())
+                  << " -- system stats disabled\n";
+    }
+    else
+    {
+        auto tegrastatsChannel =
+            std::make_shared<foxglove::RawChannel>(std::move(tegrastatsChannelResult.value()));
+        tegrastatsThread = std::thread(
+            [tegrastatsChannel, &stopTegrastats]()
+            {
+                RunTegrastats(kTegrastatsIntervalMs, stopTegrastats,
+                              [tegrastatsChannel](const std::string &_line)
+                              {
+                                  const std::string json = ParseTegrastatsLineToJson(_line);
+                                  tegrastatsChannel->log(
+                                      reinterpret_cast<const std::byte *>(json.data()), json.size());
+                              });
+            });
+        std::cout << "tegrastats -> /jetson_stats (every " << kTegrastatsIntervalMs << "ms)\n";
+    }
+#endif
+
     std::cout << "Foxglove bridge listening on ws://0.0.0.0:8765 -- forwarding "
               << poseTopic << " -> /vehicle_pose, /scene, /vehicle, /tf; "
               << "/estimated_pose -> /estimated_vehicle, /tf; "
@@ -909,5 +1185,14 @@ int main(int argc, char **argv)
               << "3 cameras -> /camera/{front,left,right}, /lidar/points/points -> /lidar\n";
 
     gz::transport::waitForShutdown();
+
+#ifdef FOXGLOVE_BRIDGE_HAS_TEGRASTATS
+    stopTegrastats = true;
+    if (tegrastatsThread.joinable())
+    {
+        tegrastatsThread.join();
+    }
+#endif
+
     return 0;
 }
