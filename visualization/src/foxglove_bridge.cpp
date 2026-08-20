@@ -107,6 +107,13 @@
 //        shape as /vehicle (BuildVehicleEntity(), shared with it) but
 //        translucent green so it reads as a ghost overlay for comparing
 //        against /vehicle (ground truth) rather than obscuring it.
+//   /estimated_landmarks (gz.msgs.Pose_V, published by localization -- the
+//     SLAM map's current landmark estimates, WORLD frame, name() = class
+//     name; see ekf.hpp)
+//     -> /estimated_landmarks (Foxglove SceneUpdate), a translucent cone
+//        per landmark (reuses DetectionConeSpec for size/color), frame_id
+//        "world" -- overlay this against /scene's opaque ground-truth
+//        cones to watch the SLAM map converge as the car drives.
 //   /planned_path (gz.msgs.Pose_V, published by planning -- ordered
 //     centerline waypoints, body frame, nearest-ahead first)
 //     -> /planned_path (Foxglove SceneUpdate), a single LINE_STRIP through
@@ -729,6 +736,63 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    auto estimated_landmarks_channel_result =
+        foxglove::messages::SceneUpdateChannel::create("/estimated_landmarks");
+    if (!estimated_landmarks_channel_result.has_value())
+    {
+        std::cerr << "Failed to create /estimated_landmarks channel: "
+                  << foxglove::strerror(estimated_landmarks_channel_result.error()) << '\n';
+        return 1;
+    }
+    auto estimated_landmarks_channel = std::move(estimated_landmarks_channel_result.value());
+
+    // Localization's SLAM map, in the world frame (unlike /cone_detections,
+    // which is per-frame and body-frame) -- translucent so it reads as an
+    // overlay against /scene's opaque ground-truth cones, letting you watch
+    // the estimated map converge onto the real one as the car drives.
+    std::function<void(const gz::msgs::Pose_V &)> onEstimatedLandmarks =
+        [&estimated_landmarks_channel](const gz::msgs::Pose_V &_msg)
+    {
+        foxglove::messages::SceneEntity entity;
+        entity.timestamp = Now();
+        entity.frame_id = kFrameId;
+        entity.id = "estimated_landmarks";
+
+        for (const auto &pose : _msg.pose())
+        {
+            ConeSpec spec;
+            if (!DetectionConeSpec(pose.name(), &spec))
+            {
+                continue;
+            }
+
+            foxglove::messages::Pose fgPose;
+            // Landmark z isn't tracked (2D SLAM) or published -- place the
+            // marker resting on the ground plane (half its own height)
+            // rather than centered through it at an implicit z=0.
+            fgPose.position = foxglove::messages::Vector3{
+                pose.position().x(), pose.position().y(), spec.length / 2.0};
+            fgPose.orientation = foxglove::messages::Quaternion{0, 0, 0, 1};
+
+            foxglove::messages::CylinderPrimitive marker;
+            marker.pose = fgPose;
+            marker.size = foxglove::messages::Vector3{spec.radius * 2, spec.radius * 2, spec.length};
+            marker.bottom_scale = 1.0;
+            marker.top_scale = 0.0;  // cone shape, matching ground truth
+            marker.color = foxglove::messages::Color{spec.color.r, spec.color.g, spec.color.b, 0.5};
+            entity.cylinders.push_back(marker);
+        }
+
+        foxglove::messages::SceneUpdate update;
+        update.entities.push_back(std::move(entity));
+        estimated_landmarks_channel.log(update);
+    };
+    if (!node.Subscribe("/estimated_landmarks", onEstimatedLandmarks))
+    {
+        std::cerr << "Failed to subscribe to /estimated_landmarks\n";
+        return 1;
+    }
+
     // Cones are static — gz-transport may only include their pose in the
     // first Pose_V message rather than every tick, so cache what we've seen
     // instead of relying on it being present in the message currently in hand.
@@ -841,6 +905,7 @@ int main(int argc, char **argv)
     std::cout << "Foxglove bridge listening on ws://0.0.0.0:8765 -- forwarding "
               << poseTopic << " -> /vehicle_pose, /scene, /vehicle, /tf; "
               << "/estimated_pose -> /estimated_vehicle, /tf; "
+              << "/estimated_landmarks -> /estimated_landmarks; "
               << "3 cameras -> /camera/{front,left,right}, /lidar/points/points -> /lidar\n";
 
     gz::transport::waitForShutdown();

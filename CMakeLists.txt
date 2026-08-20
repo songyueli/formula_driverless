@@ -129,7 +129,7 @@ add_executable(localization
     localization/src/localization.cpp
     localization/src/ekf.cpp
     localization/src/geodetic.cpp
-    localization/src/cone_map.cpp)
+    localization/src/cone_color.cpp)
 target_include_directories(localization PRIVATE
     localization/include
     ${eigen_SOURCE_DIR})

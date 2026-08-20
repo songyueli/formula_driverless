@@ -12,36 +12,46 @@
 #include <gz/msgs/pose_v.pb.h>
 #include <gz/msgs/time.pb.h>
 
-#include "cone_map.hpp"
+#include "cone_color.hpp"
 #include "ekf.hpp"
 #include "geodetic.hpp"
 
 // Localization process
 // ---------------------
-// Fuses the car's sensors into a single pose/velocity estimate via a 6-state
-// EKF (see ekf.hpp for the state definition and motion model). This is an
-// ESTIMATE, not ground truth -- unlike /vehicle (foxglove_bridge), which is
-// driven directly from Gazebo's own true pose, this is only as good as the
-// sensors and the filter, same as it would be on the real car.
+// Fuses the car's sensors into a joint vehicle-pose + cone-landmark
+// estimate via EKF-SLAM (see ekf.hpp for the full state definition, motion
+// model, and why this is SLAM rather than localization-against-a-known-
+// map). This is an ESTIMATE, not ground truth -- unlike /vehicle
+// (foxglove_bridge), which is driven directly from Gazebo's own true pose,
+// this is only as good as the sensors and the filter, same as it would be
+// on the real car. The landmark map is built ENTIRELY from what the car
+// itself has observed -- nothing here reads Gazebo's ground-truth cone
+// positions (that was the pre-SLAM version; see git history for
+// cone_map.hpp/cpp, which this replaces).
 //
 // Inputs (subscribe):
-//   /ground_speed   gz.msgs.Odometry  (Sensoric-emulated ground speed sensor
-//                   -- body-frame vx/vy, see fsd_car/model.sdf)
-//   /imu            gz.msgs.IMU       (VN-300-emulated IMU -- angular_velocity.z
-//                   used as a yaw_rate measurement)
-//   /gnss/front,    gz.msgs.NavSat    (VN-300-emulated dual-antenna GNSS --
-//   /gnss/rear                        each antenna's lat/lon is a position
-//                                      fix; the pair together gives an
-//                                      absolute GNSS-compass heading fix)
+//   /ground_speed    gz.msgs.Odometry  (Sensoric-emulated ground speed
+//                    sensor -- body-frame vx/vy, see fsd_car/model.sdf)
+//   /imu             gz.msgs.IMU       (VN-300-emulated IMU --
+//                    angular_velocity.z used as a yaw_rate measurement)
+//   /gnss/front,     gz.msgs.NavSat    (VN-300-emulated dual-antenna GNSS
+//   /gnss/rear                         -- each antenna's lat/lon is a
+//                                        position fix; the pair together
+//                                        gives an absolute GNSS-compass
+//                                        heading fix)
+//   /cone_detections gz.msgs.Pose_V    (perception's localized cone
+//                    detections, body frame -- matched against this
+//                    process's OWN growing landmark map, or added as a new
+//                    landmark if unmatched; see Ekf::CorrectOrAddLandmark)
 //
 // Output (publish):
-//   /estimated_pose gz.msgs.Pose      (x, y, yaw -- see PublishEstimate())
-//
-//   /cone_detections gz.msgs.Pose_V   (perception's localized cone
-//                     detections, body frame -- matched against the known
-//                     track map fetched at startup via the scene service,
-//                     see cone_map.hpp, for an additional position
-//                     correction independent of GNSS)
+//   /estimated_pose      gz.msgs.Pose    (x, y, yaw)
+//   /estimated_landmarks gz.msgs.Pose_V  (every tracked landmark's current
+//                        estimated WORLD position -- unlike
+//                        /cone_detections, which is per-frame and body-
+//                        frame, this is the filter's persistent, growing
+//                        map, republished after each /cone_detections
+//                        batch)
 //
 // Deliberately NOT yet included (next step, not done here):
 //   - AckermannSteering's own /model/fsd_car/odometry (redundant with
@@ -51,10 +61,6 @@
 
 namespace
 {
-// Hardcoded rather than a CLI arg (unlike foxglove_bridge's world_name)
-// since this whole project only ever runs one world -- see dev_sim.sh.
-constexpr const char *kWorldName = "trackdrive";
-
 // Must match simulation/worlds/trackdrive.sdf's <spherical_coordinates>.
 constexpr double kRefLatDeg = 32.9;
 constexpr double kRefLonDeg = -117.1;
@@ -78,9 +84,21 @@ constexpr double kGnssHeadingStddev = kGnssHeadingStddevDeg * M_PI / 180.0;
 
 // Cone-landmark correction tuning. Unlike the sensor noise figures above,
 // there's no datasheet for "how accurate is our own lidar+YOLO pipeline's
-// cone localization" -- this is an engineering estimate, not a spec.
-constexpr double kLandmarkStddev = 0.1;    // meters
-constexpr double kLandmarkGateDist = 1.0;  // meters -- see FindNearestSameColor
+// cone localization" -- this is an engineering estimate, not a spec. The
+// data-association GATE distance lives in ekf.cpp now (it's an internal
+// detail of matching against the filter's own landmark state), not here.
+constexpr double kLandmarkStddev = 0.1;  // meters
+
+const char *ConeColorName(fsd::ConeColor _color)
+{
+    switch (_color)
+    {
+        case fsd::ConeColor::Blue:   return "blue";
+        case fsd::ConeColor::Yellow: return "yellow";
+        case fsd::ConeColor::Orange: return "orange";
+        default:                     return "unknown";
+    }
+}
 
 double StampToSeconds(const gz::msgs::Time &_stamp)
 {
@@ -94,12 +112,8 @@ int main()
     fsd::Ekf ekf;
     const fsd::GeodeticConverter geo(kRefLatDeg, kRefLonDeg, kRefAltM);
 
-    const std::string sceneService = std::string("/world/") + kWorldName + "/scene/info";
-    const auto coneMap = fsd::FetchConeMap(node, sceneService);
-    std::cout << "localization: fetched " << coneMap.size()
-              << " known cone position(s) from " << sceneService << '\n';
-
     auto posePub = node.Advertise<gz::msgs::Pose>("/estimated_pose");
+    auto landmarksPub = node.Advertise<gz::msgs::Pose_V>("/estimated_landmarks");
 
     // Predict() needs elapsed SIM time, not wall time -- this sim runs well
     // under real-time under the current sensor load (measured ~0.1x
@@ -118,14 +132,26 @@ int main()
 
     auto publishEstimate = [&]()
     {
-        const auto &x = ekf.State();
         gz::msgs::Pose msg;
-        msg.mutable_position()->set_x(x(0));
-        msg.mutable_position()->set_y(x(1));
-        const double halfYaw = x(2) / 2.0;
+        msg.mutable_position()->set_x(ekf.X());
+        msg.mutable_position()->set_y(ekf.Y());
+        const double halfYaw = ekf.Yaw() / 2.0;
         msg.mutable_orientation()->set_z(std::sin(halfYaw));
         msg.mutable_orientation()->set_w(std::cos(halfYaw));
         posePub.Publish(msg);
+    };
+
+    auto publishLandmarks = [&]()
+    {
+        gz::msgs::Pose_V msg;
+        for (const auto &lm : ekf.Landmarks())
+        {
+            gz::msgs::Pose *p = msg.add_pose();
+            p->set_name(ConeColorName(lm.color));
+            p->mutable_position()->set_x(lm.x);
+            p->mutable_position()->set_y(lm.y);
+        }
+        landmarksPub.Publish(msg);
     };
 
     // Antenna ENU fixes are cached so a heading correction can be computed
@@ -222,27 +248,13 @@ int main()
             {
                 continue;
             }
-
-            // Re-fetched every iteration (not hoisted above the loop) so a
-            // detection later in the SAME message benefits from an earlier
-            // one's correction already having tightened the state estimate,
-            // rather than every detection in this frame transforming off
-            // one stale pre-loop snapshot.
-            const auto &x = ekf.State();
-            const double yaw = x(2);
-            const double bodyX = pose.position().x();
-            const double bodyY = pose.position().y();
-            const double worldX = x(0) + bodyX * std::cos(yaw) - bodyY * std::sin(yaw);
-            const double worldY = x(1) + bodyX * std::sin(yaw) + bodyY * std::cos(yaw);
-
-            const auto matched = fsd::FindNearestSameColor(coneMap, worldX, worldY, color,
-                                                             kLandmarkGateDist);
-            if (!matched)
-            {
-                continue; // no map cone nearby -- skip rather than risk a bad association
-            }
-            ekf.CorrectLandmark(bodyX, bodyY, matched->x, matched->y, kLandmarkStddev);
+            // Data association (match vs. new-landmark) happens INSIDE the
+            // EKF now, against its own tracked landmark state -- not
+            // against a ground-truth map, see Ekf::CorrectOrAddLandmark.
+            ekf.CorrectOrAddLandmark(pose.position().x(), pose.position().y(),
+                                      color, kLandmarkStddev);
         }
+        publishLandmarks();
         publishEstimate();
     };
     if (!node.Subscribe("/cone_detections", onConeDetections))
@@ -252,7 +264,7 @@ int main()
     }
 
     std::cout << "localization: fusing /ground_speed, /imu, /gnss/{front,rear}, "
-              << "/cone_detections -> /estimated_pose\n";
+              << "/cone_detections -> /estimated_pose, /estimated_landmarks\n";
 
     gz::transport::waitForShutdown();
     return 0;
