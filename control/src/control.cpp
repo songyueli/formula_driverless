@@ -5,7 +5,9 @@
 #include <gz/transport/Node.hh>
 #include <gz/msgs/pose_v.pb.h>
 #include <gz/msgs/twist.pb.h>
+#include <gz/msgs/uint64.pb.h>
 
+#include <common/scoped_timer.hpp>
 #include <common/types.hpp>
 
 // Control process
@@ -59,9 +61,22 @@ int main()
 
     auto cmdPub = node.Advertise<gz::msgs::Twist>("/cmd_ackermann");
 
+    // Per-cycle compute time (microseconds) -- currently trivial pure
+    // pursuit, but wrapping the whole callback body (rather than hand-
+    // picking which lines to time) means this keeps working unchanged if
+    // this later grows into something heavier (e.g. MPC, per TODO 3 above).
+    auto timingPub = node.Advertise<gz::msgs::UInt64>("/timing/control");
+
     std::function<void(const gz::msgs::Pose_V &)> onPlannedPath =
-        [&cmdPub](const gz::msgs::Pose_V &_msg)
+        [&cmdPub, &timingPub](const gz::msgs::Pose_V &_msg)
     {
+        fsd::ScopedTimer timer([&timingPub](int64_t _us)
+        {
+            gz::msgs::UInt64 msg;
+            msg.set_data(static_cast<uint64_t>(_us));
+            timingPub.Publish(msg);
+        });
+
         if (_msg.pose_size() == 0)
         {
             // No path this cycle -- stop rather than keep driving on a

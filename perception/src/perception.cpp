@@ -2,10 +2,12 @@
 #include <gz/msgs/image.pb.h>
 #include <gz/msgs/pointcloud_packed.pb.h>
 #include <gz/msgs/pose_v.pb.h>
+#include <gz/msgs/uint64.pb.h>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <common/scoped_timer.hpp>
 #include <common/types.hpp>
 #include "camera_stitcher.hpp"
 #include "cone_detector.hpp"
@@ -268,6 +270,12 @@ int main()
     // /cone_detections (TODO 4), which only carries localized ones.
     auto detectionsImgPub = node.Advertise<gz::msgs::Image>("/camera/detections/image");
 
+    // Per-cycle compute time (microseconds), covering the actual stitch +
+    // detect + localize + publish work in tryStitchAndPublish below -- see
+    // common/scoped_timer.hpp. NOT the whole callback: the "waiting for all
+    // 3 camera frames to arrive" early-return path isn't real work.
+    auto timingPub = node.Advertise<gz::msgs::UInt64>("/timing/perception");
+
     std::mutex mtx;
     cv::Mat latestFront, latestLeft, latestRight;
     StampKey stampFront{}, stampLeft{}, stampRight{};
@@ -307,6 +315,13 @@ int main()
         {
             return;
         }
+
+        fsd::ScopedTimer timer([&timingPub](int64_t _us)
+        {
+            gz::msgs::UInt64 msg;
+            msg.set_data(static_cast<uint64_t>(_us));
+            timingPub.Publish(msg);
+        });
 
         const cv::Mat stitched = stitcher.Stitch({latestFront, latestLeft, latestRight});
         stitchedPub.Publish(ToImageMsg(stitched));
