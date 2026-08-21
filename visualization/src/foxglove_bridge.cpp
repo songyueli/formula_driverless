@@ -565,7 +565,15 @@ std::string ParseTegrastatsLineToJson(const std::string &_line)
             first = false;
         }
     }
-    json << "}";
+    // Two closing braces: power_mw's own object, then the outer object
+    // opened by this function's very first `json << "{"`. BUG FIX: this
+    // was a single "}" (closing only power_mw), silently truncating every
+    // published message -- confirmed directly via Foxglove's own parser
+    // error ("Expected ',' or '}' after property value") once a client
+    // actually validated the JSON instead of just eyeballing the printed
+    // text, which happens to look complete at a glance since the missing
+    // brace is invisible unless you count.
+    json << "}}";
     return json.str();
 }
 
@@ -1042,6 +1050,10 @@ int main(int argc, char **argv)
     constexpr const char *kTimingSchemaJson =
         R"({"type":"object","properties":{)"
         R"("perception_us":{"type":"integer"},)"
+        R"("perception_stitch_us":{"type":"integer"},)"
+        R"("perception_detect_us":{"type":"integer"},)"
+        R"("perception_postprocess_us":{"type":"integer"},)"
+        R"("perception_log_us":{"type":"integer"},)"
         R"("localization_us":{"type":"integer"},)"
         R"("planning_us":{"type":"integer"},)"
         R"("control_us":{"type":"integer"}}})";
@@ -1065,10 +1077,19 @@ int main(int argc, char **argv)
     // its own /timing/<stage> topic ticks (different stages, different
     // rates), and the full struct is republished together every time ANY
     // one field updates, so /timing always reflects the most recent known
-    // duration for all 4 stages at once.
+    // duration for all stages at once. The 4 perception_* sub-fields mirror
+    // perception.cpp's own /timing/perception/{stitch,detect,postprocess,
+    // log} breakdown (see that file) -- added once the aggregate
+    // /timing/perception number alone wasn't enough to see WHICH part of
+    // perception's ~65ms/cycle cost was dominant (turned out to be
+    // stitching, not detection or logging).
     struct StageTimingUs
     {
         uint64_t perception = 0;
+        uint64_t perceptionStitch = 0;
+        uint64_t perceptionDetect = 0;
+        uint64_t perceptionPostprocess = 0;
+        uint64_t perceptionLog = 0;
         uint64_t localization = 0;
         uint64_t planning = 0;
         uint64_t control = 0;
@@ -1077,10 +1098,16 @@ int main(int argc, char **argv)
 
     auto publishTiming = [&timing_channel, &stageTiming]()
     {
-        char buf[160];
+        char buf[320];
         const int len = std::snprintf(buf, sizeof(buf),
-            R"({"perception_us":%llu,"localization_us":%llu,"planning_us":%llu,"control_us":%llu})",
+            R"({"perception_us":%llu,"perception_stitch_us":%llu,"perception_detect_us":%llu,)"
+            R"("perception_postprocess_us":%llu,"perception_log_us":%llu,)"
+            R"("localization_us":%llu,"planning_us":%llu,"control_us":%llu})",
             static_cast<unsigned long long>(stageTiming.perception),
+            static_cast<unsigned long long>(stageTiming.perceptionStitch),
+            static_cast<unsigned long long>(stageTiming.perceptionDetect),
+            static_cast<unsigned long long>(stageTiming.perceptionPostprocess),
+            static_cast<unsigned long long>(stageTiming.perceptionLog),
             static_cast<unsigned long long>(stageTiming.localization),
             static_cast<unsigned long long>(stageTiming.planning),
             static_cast<unsigned long long>(stageTiming.control));
@@ -1096,6 +1123,54 @@ int main(int argc, char **argv)
     if (!node.Subscribe("/timing/perception", onPerceptionTiming))
     {
         std::cerr << "Failed to subscribe to /timing/perception\n";
+        return 1;
+    }
+
+    std::function<void(const gz::msgs::UInt64 &)> onPerceptionStitchTiming =
+        [&stageTiming, &publishTiming](const gz::msgs::UInt64 &_msg)
+    {
+        stageTiming.perceptionStitch = _msg.data();
+        publishTiming();
+    };
+    if (!node.Subscribe("/timing/perception/stitch", onPerceptionStitchTiming))
+    {
+        std::cerr << "Failed to subscribe to /timing/perception/stitch\n";
+        return 1;
+    }
+
+    std::function<void(const gz::msgs::UInt64 &)> onPerceptionDetectTiming =
+        [&stageTiming, &publishTiming](const gz::msgs::UInt64 &_msg)
+    {
+        stageTiming.perceptionDetect = _msg.data();
+        publishTiming();
+    };
+    if (!node.Subscribe("/timing/perception/detect", onPerceptionDetectTiming))
+    {
+        std::cerr << "Failed to subscribe to /timing/perception/detect\n";
+        return 1;
+    }
+
+    std::function<void(const gz::msgs::UInt64 &)> onPerceptionPostprocessTiming =
+        [&stageTiming, &publishTiming](const gz::msgs::UInt64 &_msg)
+    {
+        stageTiming.perceptionPostprocess = _msg.data();
+        publishTiming();
+    };
+    if (!node.Subscribe("/timing/perception/postprocess", onPerceptionPostprocessTiming))
+    {
+        std::cerr << "Failed to subscribe to /timing/perception/postprocess\n";
+        return 1;
+    }
+
+    std::function<void(const gz::msgs::UInt64 &)> onPerceptionLogTiming =
+        [&stageTiming, &publishTiming](const gz::msgs::UInt64 &_msg)
+    {
+        stageTiming.perceptionLog = _msg.data();
+        publishTiming();
+    };
+    if (!node.Subscribe("/timing/perception/log", onPerceptionLogTiming))
+    {
+        std::cerr << "Failed to subscribe to /timing/perception/log\n";
         return 1;
     }
 

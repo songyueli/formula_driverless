@@ -129,6 +129,24 @@ int main()
 
     auto posePub = node.Advertise<gz::msgs::Pose>("/estimated_pose");
     auto landmarksPub = node.Advertise<gz::msgs::Pose_V>("/estimated_landmarks");
+    // TEMPORARY (rigorous jitter measurement): a SEPARATE topic, not
+    // /estimated_landmarks itself -- foxglove_bridge.cpp's DetectionConeSpec
+    // does an EXACT string match on name() ("blue"/"yellow"/"orange") to
+    // pick each cone's visualization color/size, so encoding a landmark's
+    // stable uid (see Ekf::LandmarkEstimate::uid in ekf.hpp) into THAT
+    // field would silently make every landmark vanish from the live
+    // Foxglove view (DetectionConeSpec returns false on no match, and the
+    // caller just skips the cone) instead of just adding debug info.
+    // Publishing the SAME data plus a "<color>#<uid>" name on this second
+    // topic instead means external tooling can group by uid to track one
+    // SPECIFIC physical landmark's position over time unambiguously --
+    // /estimated_landmarks itself has no per-entry identity, so measuring
+    // "did this landmark's position actually change" from outside used to
+    // require fragile nearest-same-color-position matching between polls,
+    // which is exactly what breaks down in the dense-landmark regime
+    // jitter needs to be measured in. Remove once jitter is fully
+    // characterized.
+    auto landmarksDebugPub = node.Advertise<gz::msgs::Pose_V>("/estimated_landmarks_debug");
 
     // Per-cycle compute time (microseconds). Unlike the other 3 processes,
     // localization has 5 distinct callbacks (one per sensor stream) rather
@@ -174,8 +192,10 @@ int main()
 
     auto publishLandmarks = [&]()
     {
+        const auto landmarks = ekf.Landmarks();
+
         gz::msgs::Pose_V msg;
-        for (const auto &lm : ekf.Landmarks())
+        for (const auto &lm : landmarks)
         {
             gz::msgs::Pose *p = msg.add_pose();
             p->set_name(ConeColorName(lm.color));
@@ -183,6 +203,19 @@ int main()
             p->mutable_position()->set_y(lm.y);
         }
         landmarksPub.Publish(msg);
+
+        // TEMPORARY (rigorous jitter measurement) -- see landmarksDebugPub's
+        // declaration above for why this is a separate topic/message rather
+        // than folded into the loop above.
+        gz::msgs::Pose_V debugMsg;
+        for (const auto &lm : landmarks)
+        {
+            gz::msgs::Pose *p = debugMsg.add_pose();
+            p->set_name(std::string(ConeColorName(lm.color)) + "#" + std::to_string(lm.uid));
+            p->mutable_position()->set_x(lm.x);
+            p->mutable_position()->set_y(lm.y);
+        }
+        landmarksDebugPub.Publish(debugMsg);
     };
 
     // Antenna ENU fixes are cached so a heading correction can be computed

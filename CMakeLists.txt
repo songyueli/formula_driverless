@@ -107,6 +107,36 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
 endif()
 
 # ---------------------------------------------------------------------------
+# VPI (NVIDIA Vision Programming Interface) -- Jetson-only, used by
+# CameraStitcher to run the 3-camera panorama remap on the GPU (VPI_BACKEND_
+# CUDA) instead of plain CPU cv::remap. Confirmed directly via /timing/
+# perception/stitch that the CPU path costs ~36-38ms/frame -- more than 2x
+# YOLO/TensorRT inference itself, and the dominant cost in perception's
+# entire ~65ms cycle -- while tegrastats showed the GPU mostly idle
+# (GR3D_FREQ 0-39%) during that same window. VPI is a JetPack-provided
+# library (installed to /opt/nvidia/vpi4, not a normal system prefix, hence
+# the explicit include PATHS below), not something the x86 dev machine has,
+# so this follows the exact same detect-and-fall-back pattern as TensorRT
+# above: PERCEPTION_USE_VPI only gets defined when VPI is actually found,
+# and camera_stitcher.cpp falls back to its existing CPU cv::remap path
+# otherwise (see that file). Deliberately a SEPARATE find block from
+# TensorRT's, even though both are Jetson-only GPU acceleration for the
+# same perception binary -- they're unrelated libraries (VPI doesn't need
+# CUDAToolkit's own find_package the way TensorRT's plugin linking does)
+# and either one can be present without the other.
+# ---------------------------------------------------------------------------
+set(PERCEPTION_USE_VPI FALSE)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  find_path(VPI_INCLUDE_DIR vpi/Image.h PATHS /opt/nvidia/vpi4/include)
+  find_library(VPI_LIB nvvpi PATHS /opt/nvidia/vpi4/lib/aarch64-linux-gnu)
+  if(VPI_INCLUDE_DIR AND VPI_LIB)
+    set(PERCEPTION_USE_VPI TRUE)
+  else()
+    message(WARNING "VPI not found on this aarch64 host -- CameraStitcher will fall back to CPU cv::remap")
+  endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Eigen -- header-only, used by localization for the EKF's matrix math
 # (state covariance propagation, Kalman gain). Fetched via Populate (not
 # MakeAvailable) deliberately: Eigen's own CMakeLists.txt configures a full
@@ -158,6 +188,12 @@ if(PERCEPTION_USE_TENSORRT)
       ${TENSORRT_NVINFER_PLUGIN_LIB}
       CUDA::cudart)
   target_compile_definitions(perception PRIVATE PERCEPTION_USE_TENSORRT)
+endif()
+
+if(PERCEPTION_USE_VPI)
+  target_include_directories(perception PRIVATE ${VPI_INCLUDE_DIR})
+  target_link_libraries(perception ${VPI_LIB})
+  target_compile_definitions(perception PRIVATE PERCEPTION_USE_VPI)
 endif()
 
 add_executable(localization

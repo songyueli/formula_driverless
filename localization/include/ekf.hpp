@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -86,6 +87,24 @@ public:
         // uncertainty forward gives an honest tolerance instead.
         double varX = 0.0;
         double varY = 0.0;
+        // Stable identity, assigned once when a landmark is FIRST created
+        // (see AddLandmark) and preserved across every eviction/
+        // reactivation cycle after that -- unlike the index into
+        // m_x/m_landmarkColors (which shifts every time ANY OTHER active
+        // landmark is added/removed) or list position within
+        // m_retiredLandmarks, this is the only thing that reliably
+        // identifies "the same physical landmark" across time from OUTSIDE
+        // this class. Needed because /estimated_landmarks (a plain
+        // Pose_V, one entry per CURRENTLY discovered landmark, no index
+        // stability guaranteed between messages) made rigorous jitter
+        // measurement impossible: matching landmarks between two
+        // consecutive polls by nearest-same-color-position is exactly the
+        // kind of thing that silently confuses "this landmark moved" with
+        // "a DIFFERENT nearby landmark got matched instead" once landmark
+        // density is high -- which is precisely the regime jitter needs to
+        // be measured in. See localization.cpp's publishLandmarks for how
+        // this gets exposed externally.
+        uint64_t uid = 0;
     };
 
     Ekf();
@@ -303,6 +322,12 @@ private:
     // none needed): comfortably under the >=5m real cone spacing this file
     // already relies on elsewhere, so it can only catch genuine duplicates
     // of the same physical cone, never two distinct real ones.
+    //
+    // Throttled to every 20th call (see the .cpp) -- cost is O(retired *
+    // active), and retired count isn't bounded the way active is, so on a
+    // long-running drive this became a confirmed, real regression
+    // (/timing/localization climbing to 1.5-3.7ms as the retired list grew
+    // into the hundreds over several minutes).
     void PruneStaleRetiredDuplicates();
     // Same idea as PruneStaleRetiredDuplicates, but for TWO ACTIVE
     // landmarks of the same color sitting on top of each other -- confirmed
@@ -323,7 +348,38 @@ private:
     // seen more recently (m_landmarkLastSeen) -- the same recency signal
     // EvictStaleIfOverCapacity already uses elsewhere -- and removes the
     // other via RemoveActiveLandmark.
+    //
+    // Also throttled to every 20th call (see the .cpp) -- O(active^2),
+    // bounded by kMaxActiveLandmarks unlike the retired one above, but
+    // still a measurable avoidable cost run on every single correction.
     void PruneStaleActiveDuplicates();
+
+    // Packs the grid cell containing world position (_x, _y) into a single
+    // key for m_retiredGrid -- see that member's comment for the grid this
+    // indexes into and the coverage guarantee it relies on.
+    static int64_t RetiredGridCellKey(double _x, double _y);
+    // Adds m_retiredLandmarks[_index] to its grid cell's bucket. Called
+    // once when a landmark is newly retired (EvictStaleIfOverCapacity) and
+    // once when EraseRetiredLandmark relocates the former last element into
+    // a freed slot.
+    void RetiredGridInsert(size_t _index);
+    // Removes m_retiredLandmarks[_index] via swap-with-last-element +
+    // pop_back (O(1)) instead of .erase() (O(retired), and -- worse for
+    // the grid specifically -- silently invalidates every index the grid
+    // has stored for elements originally past _index, since .erase() shifts
+    // them all down by one without the grid ever finding out). Also
+    // updates the grid: removes _index from its own bucket, and if a
+    // relocation happened, repoints the moved (formerly-last) element's
+    // grid entry from its old index to _index.
+    void EraseRetiredLandmark(size_t _index);
+    // Gathers indices into m_retiredLandmarks for every entry within the
+    // 3x3 grid-cell neighborhood around world position (_x, _y) -- see
+    // m_retiredGrid's comment for the coverage guarantee. Candidates are
+    // NOT pre-filtered by color or further distance here; callers still
+    // apply the real Mahalanobis/variance gate exactly as before -- this
+    // only narrows which retired landmarks are even considered, the same
+    // role the active-search loop's own coarse Euclidean pre-filter plays.
+    void RetiredGridQuery(double _x, double _y, std::vector<size_t> &_candidates) const;
 
     Eigen::VectorXd m_x;
     Eigen::MatrixXd m_P;
@@ -333,11 +389,41 @@ private:
     // value at the most recent match or add for that landmark.
     std::vector<ConeColor> m_landmarkColors;
     std::vector<uint64_t> m_landmarkLastSeen;
+    // Parallel to m_landmarkColors -- see LandmarkEstimate::uid's comment
+    // for why this exists. Assigned once (m_nextLandmarkUid++) the first
+    // time a landmark is genuinely newly created, then carried forward
+    // through every eviction/reactivation via LandmarkEstimate::uid (see
+    // AddLandmark).
+    std::vector<uint64_t> m_landmarkUid;
+    uint64_t m_nextLandmarkUid = 1;
     uint64_t m_tick = 0;
     // Evicted landmarks -- no longer part of the joint state (see the
     // class comment), kept only for Landmarks() reporting and for
     // CorrectOrAddLandmark's reactivation check.
     std::vector<LandmarkEstimate> m_retiredLandmarks;
+    // Spatial hash grid over m_retiredLandmarks, keyed by a packed (cellX,
+    // cellY) grid cell (see RetiredGridCellKey) -- see kRetiredGridCellSize
+    // in ekf.cpp for the cell size and the proof that a 3x3 cell
+    // neighborhood search around any query point is guaranteed not to miss
+    // a valid candidate. Added to fix a confirmed O(retired) scaling
+    // problem: CorrectOrAddLandmark's retired-landmark search (step 2, and
+    // PruneStaleRetiredDuplicates) used to linearly scan the ENTIRE
+    // m_retiredLandmarks list on every detection that didn't match an
+    // active landmark, and unlike the active list (bounded by
+    // kMaxActiveLandmarks), the retired list grows without bound over a
+    // long drive (only the overall kMaxLandmarks backstop limits it, sized
+    // for a full track's worth of cones -- hundreds). This turns that
+    // search from O(retired) into O(1) average (a small, bounded number of
+    // candidates per query, regardless of total retired count), the same
+    // complexity class every other per-detection cost in this file is
+    // already held to.
+    //
+    // Values are INDICES into m_retiredLandmarks, not landmark data itself
+    // -- kept valid only because every removal from m_retiredLandmarks now
+    // goes through EraseRetiredLandmark (swap-and-pop + grid maintenance)
+    // instead of a raw .erase() (which would silently invalidate every
+    // index past the erased one, without the grid ever finding out).
+    std::unordered_map<int64_t, std::vector<size_t>> m_retiredGrid;
 };
 
 } // namespace fsd

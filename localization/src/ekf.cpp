@@ -55,33 +55,35 @@ double NormalizeAngle(double _angle)
 // x = -2*ln(0.05) = 5.99).
 constexpr double kLandmarkGateChiSq = 5.99;
 
-// TEMPORARY: dropped tremendously (from 600) while debugging the
-// landmark-duplication problem -- a lower cap means a real duplication
-// bug hits it, and stops growing, within seconds instead of requiring a
-// long test run to even notice, and keeps the retired-match search loop
-// (O(m) per detection over retired count) cheap and easy to reason about
-// by hand. 60 is 6x kMaxActiveLandmarks below, generous margin without
-// being so large a real bug takes a while to surface. Restore to a real
-// value once debugged.
-constexpr size_t kMaxLandmarks = 60;
+// Restored to 600 (real track has 246 cones, confirmed directly via
+// Gazebo's own scene service) -- was dropped to 60 while debugging the
+// landmark-duplication problem specifically so a real duplication bug
+// would hit the cap and visibly stop growing within seconds instead of
+// requiring a long test run to even notice. That debugging is done (the
+// active/retired duplicate-matching and pruning bugs are fixed and
+// verified), and the tiny cap is now actively breaking things instead of
+// helping: confirmed directly during a real driving test that the car
+// covered ~80m of track, discovered exactly 60 landmarks, hit this cap,
+// and then silently stopped tracking every cone after that point even
+// though it kept driving into new territory -- AddLandmark drops anything
+// past the cap (see CorrectOrAddLandmark step 3), so /estimated_landmarks
+// just froze while the car kept moving.
+constexpr size_t kMaxLandmarks = 600;
 
-// TEMPORARY: dropped tremendously (from 80, per explicit instruction) while
-// debugging the landmark-duplication problem -- this is normally the
-// performance-driven cap (bounds every correction's O(n^2) cost via
-// n = kVehicleStateDim + 2*kMaxActiveLandmarks). Raised from 10 to 25 while
-// debugging landmark jitter: confirmed directly that 10 was FAR below how
-// many distinct cones are visible at once, causing near-constant evict/
-// reactivate churn -- every landmark kept getting bounced out of the joint
-// state (discarding its accumulated correlation structure, only a plain
-// diagonal variance snapshot surviving via reactivation blending) before
-// it ever got the chance to converge through several consecutive, properly
-// -correlated Kalman updates the way a landmark's variance is supposed to
-// monotonically shrink under this file's math (landmarks are static, so
-// Predict() adds zero process noise to their dimensions -- every real
-// observation should only ever tighten Pll, never re-widen it). Still well
-// below the real value of 80, so debug output stays tractable. Restore to
-// a real value once jitter is fully debugged.
-constexpr size_t kMaxActiveLandmarks = 25;
+// Restored to 80 (the real, performance-validated value -- bounds every
+// correction's O(n^2) cost via n = kVehicleStateDim + 2*kMaxActiveLandmarks).
+// Was dropped to 10, then 25, while debugging landmark jitter: 10 was FAR
+// below how many distinct cones are visible at once, causing near-constant
+// evict/reactivate churn that kept interrupting convergence before Pll
+// could tighten through several consecutive Kalman updates the way it's
+// supposed to (landmarks are static, so Predict() adds zero process noise
+// to their dimensions -- every real observation should only ever tighten
+// Pll, never re-widen it). That debugging is done (the reactivation
+// blending and duplicate-pruning fixes address the actual root causes),
+// and with the sparse-aware ApplyCorrection/StabilizeCovariance rewrite
+// from earlier this session, 80 active landmarks (n=166) already measured
+// well within real-time budget (sub-millisecond corrections).
+constexpr size_t kMaxActiveLandmarks = 80;
 
 // A brand-new landmark's initial world position is computed directly from
 // the CURRENT vehicle pose estimate (see AddLandmark) -- if that estimate
@@ -165,6 +167,34 @@ const std::vector<int> kVehicleDims = {0, 1, 2, 3, 4, 5};
 // duplicate distance actually observed so far, while staying well clear
 // of merging two genuinely distinct adjacent cones.
 constexpr double kDuplicatePruneRadius = 1.5; // meters
+
+// Shared generous coarse-filter margin (Euclidean) for BOTH the active-
+// landmark search's coarse pre-filter (CorrectOrAddLandmark step 1) and the
+// retired-landmark spatial grid below -- deliberately much larger than the
+// real gate's typical effective radius under normal, converged uncertainty,
+// so it can only ever SKIP a candidate the real (Mahalanobis) gate would
+// also have rejected, never one it would have accepted (P legitimately
+// grows during real drift/uncertainty, and this must never reject a
+// candidate the real gate would accept). Hoisted to one shared constant --
+// rather than two independently-chosen numbers -- specifically so the
+// retired grid's cell size (kRetiredGridCellSize below) can be set to
+// exactly this value and get a PROVABLE guarantee, not just a "probably
+// fine" one: for a uniform grid with cell size C, a 3x3 cell neighborhood
+// around a query point's own cell is guaranteed to contain every point
+// within distance C of it (worst case: the query point sits at a cell's
+// extreme edge, and the farthest a C-radius neighbor can then land is
+// exactly one cell further out in any direction -- verified directly by
+// working the 1-D case: p = i*C + f for 0<=f<C, p-C = (i-1)*C+f always
+// floors to cell i-1, p+C = (i+1)*C+f always floors to cell i+1, so the
+// needed window is exactly [i-1, i+1] whenever the search radius equals
+// the cell size).
+constexpr double kCoarseGateRadius = 15.0; // meters
+
+// See kCoarseGateRadius's comment directly above for why this equals it
+// exactly (not a separately-tuned value) and why that specific equality is
+// what makes RetiredGridQuery's fixed 3x3 neighborhood search provably
+// correct rather than just empirically adequate.
+constexpr double kRetiredGridCellSize = kCoarseGateRadius; // meters
 } // namespace
 
 namespace fsd
@@ -641,13 +671,9 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
         {
             closestActiveDistSq = distSq;
         }
-        constexpr double kCoarseGateRadius = 15.0; // meters -- generous margin above the
-                                                    // real gate's typical effective radius,
-                                                    // since a converged filter's P is small
-                                                    // but P legitimately grows during real
-                                                    // drift/uncertainty, and this must never
-                                                    // reject a candidate the real (uncertainty
-                                                    // -aware) Mahalanobis gate would accept
+        // kCoarseGateRadius: see its declaration in this file's anonymous
+        // namespace above (shared with the retired-landmark grid's cell
+        // size).
         if (distSq > kCoarseGateRadius * kCoarseGateRadius)
         {
             continue;
@@ -744,12 +770,22 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     // across ALL retired candidates, same as the active search, and only
     // erases/reactivates that one.
     bool reactivated = false;
-    LandmarkEstimate reactivatedPrior{}; // saved before erase() invalidates it -- passed to AddLandmark below
+    LandmarkEstimate reactivatedPrior{}; // saved before erase invalidates it -- passed to AddLandmark below
     int bestRetiredIndex = -1;
     double bestRetiredMahalanobisSq = kLandmarkGateChiSq;
     double closestRetiredDistSq = -1.0;
     double closestRetiredMahalanobisSq = -1.0;
-    for (size_t i = 0; i < m_retiredLandmarks.size(); ++i)
+    // Candidates narrowed to the 3x3 grid-cell neighborhood around
+    // (worldX, worldY) instead of the full m_retiredLandmarks list -- see
+    // m_retiredGrid's comment in ekf.hpp. This is what actually fixes the
+    // O(retired) scaling this search used to have (a full linear scan on
+    // every detection that didn't match an active landmark, against a list
+    // that grows unboundedly over a long drive); the earlier fix to this
+    // function (best-match-not-first-match) addressed correctness, not
+    // this cost.
+    std::vector<size_t> retiredCandidates;
+    RetiredGridQuery(worldX, worldY, retiredCandidates);
+    for (size_t i : retiredCandidates)
     {
         if (m_retiredLandmarks[i].color != _color)
         {
@@ -780,7 +816,7 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     if (bestRetiredIndex >= 0)
     {
         reactivatedPrior = m_retiredLandmarks[bestRetiredIndex];
-        m_retiredLandmarks.erase(m_retiredLandmarks.begin() + bestRetiredIndex);
+        EraseRetiredLandmark(static_cast<size_t>(bestRetiredIndex));
         reactivated = true;
     }
 
@@ -1038,6 +1074,11 @@ void Ekf::AddLandmark(double _measuredBodyX, double _measuredBodyY,
 
     m_landmarkColors.push_back(_color);
     m_landmarkLastSeen.push_back(++m_tick);
+    // Reactivation carries the retired landmark's OWN uid forward -- it's
+    // the same physical landmark rediscovered, not a new one -- while a
+    // genuinely new landmark gets the next fresh uid. See
+    // LandmarkEstimate::uid's comment in ekf.hpp.
+    m_landmarkUid.push_back(hasPrior ? _priorEstimate->uid : m_nextLandmarkUid++);
 }
 
 std::vector<Ekf::LandmarkEstimate> Ekf::Landmarks() const
@@ -1047,7 +1088,8 @@ std::vector<Ekf::LandmarkEstimate> Ekf::Landmarks() const
     for (size_t i = 0; i < m_landmarkColors.size(); ++i)
     {
         const int li = kVehicleStateDim + 2 * static_cast<int>(i);
-        result.push_back(LandmarkEstimate{m_x(li), m_x(li + 1), m_landmarkColors[i]});
+        result.push_back(LandmarkEstimate{
+            m_x(li), m_x(li + 1), m_landmarkColors[i], 0.0, 0.0, m_landmarkUid[i]});
     }
     // Retired landmarks are no longer part of the joint state (see the
     // class comment), but /estimated_landmarks should still show the full
@@ -1090,6 +1132,7 @@ void Ekf::RemoveActiveLandmark(size_t _index)
     StabilizeCovariance(kVehicleDims);
     m_landmarkColors.erase(m_landmarkColors.begin() + static_cast<long>(_index));
     m_landmarkLastSeen.erase(m_landmarkLastSeen.begin() + static_cast<long>(_index));
+    m_landmarkUid.erase(m_landmarkUid.begin() + static_cast<long>(_index));
 }
 
 void Ekf::EvictStaleIfOverCapacity()
@@ -1110,44 +1153,86 @@ void Ekf::EvictStaleIfOverCapacity()
         const int li = kVehicleStateDim + 2 * static_cast<int>(staleIndex);
         m_retiredLandmarks.push_back(LandmarkEstimate{
             m_x(li), m_x(li + 1), m_landmarkColors[staleIndex],
-            m_P(li, li), m_P(li + 1, li + 1)});
+            m_P(li, li), m_P(li + 1, li + 1), m_landmarkUid[staleIndex]});
+        RetiredGridInsert(m_retiredLandmarks.size() - 1);
         RemoveActiveLandmark(staleIndex);
     }
 }
 
 void Ekf::PruneStaleRetiredDuplicates()
 {
-    for (size_t r = 0; r < m_retiredLandmarks.size();)
+    // Throttled -- see this method's declaration in ekf.hpp for why.
+    // Running this every Nth call instead of every single one still catches
+    // a stale duplicate within a small fraction of a second at typical
+    // correction rates -- duplicate cleanup doesn't need to be
+    // instantaneous, just prompt.
+    static int callCount = 0;
+    if (++callCount % 20 != 0)
     {
-        bool isDuplicate = false;
-        for (size_t a = 0; a < m_landmarkColors.size(); ++a)
+        return;
+    }
+
+    // Loop INVERTED from the original retired-outer/active-inner version:
+    // this now iterates the BOUNDED active list (<=kMaxActiveLandmarks) and
+    // queries the retired grid for nearby candidates, instead of iterating
+    // the UNBOUNDED retired list and scanning all active landmarks against
+    // each one. The original was a confirmed, real O(retired * active)
+    // regression on long-running drives (/timing/localization climbing to
+    // 1.5-3.7ms as the retired list grew into the hundreds) -- throttling
+    // alone only dampened that, since the outer loop itself still grew with
+    // drive duration. This inversion removes the retired-count dependence
+    // entirely: cost is now O(active * grid_neighborhood_size), where the
+    // neighborhood size is a small, bounded constant regardless of how many
+    // landmarks have ever been retired -- the same complexity class the
+    // retired-search fix in CorrectOrAddLandmark already achieved for the
+    // analogous problem there.
+    //
+    // A relocated-index edge case: if TWO retired duplicates for the same
+    // active landmark both live in the queried neighborhood, erasing the
+    // first (via EraseRetiredLandmark's swap-and-pop) can relocate a
+    // DIFFERENT, not-yet-checked retired landmark into the erased slot,
+    // while that slot's original index may still appear later in this same
+    // candidates list -- meaning that relocated landmark could be skipped
+    // this pass. Left unhandled deliberately: this is the same
+    // "correctness eventually, not instantaneously" tradeoff the throttling
+    // above already accepts (the very next throttled call re-queries fresh
+    // and catches it), and two duplicates stacked on the exact same active
+    // landmark in one neighborhood is already the rare case.
+    std::vector<size_t> candidates;
+    for (size_t a = 0; a < m_landmarkColors.size(); ++a)
+    {
+        const int li = kVehicleStateDim + 2 * static_cast<int>(a);
+        RetiredGridQuery(m_x(li), m_x(li + 1), candidates);
+        for (size_t r : candidates)
         {
-            if (m_landmarkColors[a] != m_retiredLandmarks[r].color)
+            if (r >= m_retiredLandmarks.size() || m_retiredLandmarks[r].color != m_landmarkColors[a])
             {
                 continue;
             }
-            const int li = kVehicleStateDim + 2 * static_cast<int>(a);
             const double dx = m_x(li) - m_retiredLandmarks[r].x;
             const double dy = m_x(li + 1) - m_retiredLandmarks[r].y;
             if (dx * dx + dy * dy < kDuplicatePruneRadius * kDuplicatePruneRadius)
             {
-                isDuplicate = true;
-                break;
+                EraseRetiredLandmark(r);
             }
-        }
-        if (isDuplicate)
-        {
-            m_retiredLandmarks.erase(m_retiredLandmarks.begin() + static_cast<long>(r));
-        }
-        else
-        {
-            ++r;
         }
     }
 }
 
 void Ekf::PruneStaleActiveDuplicates()
 {
+    // Throttled -- see PruneStaleRetiredDuplicates's comment above (same
+    // reasoning). This one's cost is O(active^2) per call, bounded by
+    // kMaxActiveLandmarks (80 -> 6400 comparisons worst case) rather than
+    // growing unboundedly like the retired list does, but confirmed
+    // directly as still a measurable, avoidable per-message cost when run
+    // on every single correction instead of periodically.
+    static int callCount = 0;
+    if (++callCount % 20 != 0)
+    {
+        return;
+    }
+
     for (size_t a = 0; a < m_landmarkColors.size();)
     {
         bool removed = false;
@@ -1179,6 +1264,105 @@ void Ekf::PruneStaleActiveDuplicates()
         // shifted every later index down by one, so whatever is now at
         // position a (or, if a itself was removed, whatever slid into it)
         // still needs to be checked against the rest of the list.
+    }
+}
+
+int64_t Ekf::RetiredGridCellKey(double _x, double _y)
+{
+    const int64_t cx = static_cast<int64_t>(std::floor(_x / kRetiredGridCellSize));
+    const int64_t cy = static_cast<int64_t>(std::floor(_y / kRetiredGridCellSize));
+    // Packed via unsigned shifts, not signed ones -- left-shifting a
+    // NEGATIVE signed value is undefined behavior pre-C++20 (this file is
+    // C++17), and cx/cy are legitimately negative for any world position
+    // south/west of the origin. Converting to uint64_t first is
+    // well-defined (standard signed->unsigned conversion, effectively
+    // mod 2^64), and shifting/OR-ing unsigned values is always
+    // well-defined regardless of the original sign.
+    const uint64_t ucx = static_cast<uint64_t>(cx);
+    const uint64_t ucy = static_cast<uint64_t>(cy);
+    return static_cast<int64_t>((ucx << 32) | (ucy & 0xFFFFFFFFULL));
+}
+
+void Ekf::RetiredGridInsert(size_t _index)
+{
+    const int64_t key = RetiredGridCellKey(m_retiredLandmarks[_index].x, m_retiredLandmarks[_index].y);
+    m_retiredGrid[key].push_back(_index);
+}
+
+void Ekf::EraseRetiredLandmark(size_t _index)
+{
+    const size_t lastIndex = m_retiredLandmarks.size() - 1;
+
+    // Remove _index from its OWN grid bucket first, before anything moves
+    // -- swap-and-pop WITHIN the bucket too, since bucket order is never
+    // meaningful.
+    {
+        const int64_t key = RetiredGridCellKey(m_retiredLandmarks[_index].x, m_retiredLandmarks[_index].y);
+        auto it = m_retiredGrid.find(key);
+        if (it != m_retiredGrid.end())
+        {
+            auto &bucket = it->second;
+            for (size_t b = 0; b < bucket.size(); ++b)
+            {
+                if (bucket[b] == _index)
+                {
+                    bucket[b] = bucket.back();
+                    bucket.pop_back();
+                    break;
+                }
+            }
+            if (bucket.empty())
+            {
+                m_retiredGrid.erase(it);
+            }
+        }
+    }
+
+    if (_index != lastIndex)
+    {
+        // The former last element is about to be relocated into the freed
+        // slot at _index -- its grid entry still points at lastIndex, so
+        // that needs repointing to _index, or every future query near this
+        // landmark's actual position would resolve to a stale/out-of-range
+        // index.
+        const int64_t lastKey = RetiredGridCellKey(m_retiredLandmarks[lastIndex].x, m_retiredLandmarks[lastIndex].y);
+        auto it = m_retiredGrid.find(lastKey);
+        if (it != m_retiredGrid.end())
+        {
+            for (auto &v : it->second)
+            {
+                if (v == lastIndex)
+                {
+                    v = _index;
+                    break;
+                }
+            }
+        }
+        m_retiredLandmarks[_index] = m_retiredLandmarks[lastIndex];
+    }
+    m_retiredLandmarks.pop_back();
+}
+
+void Ekf::RetiredGridQuery(double _x, double _y, std::vector<size_t> &_candidates) const
+{
+    _candidates.clear();
+    const int64_t cx = static_cast<int64_t>(std::floor(_x / kRetiredGridCellSize));
+    const int64_t cy = static_cast<int64_t>(std::floor(_y / kRetiredGridCellSize));
+    // 3x3 neighborhood -- see kRetiredGridCellSize's comment for the proof
+    // this can't miss a valid candidate (cell size == kCoarseGateRadius).
+    for (int64_t dx = -1; dx <= 1; ++dx)
+    {
+        for (int64_t dy = -1; dy <= 1; ++dy)
+        {
+            const uint64_t ucx = static_cast<uint64_t>(cx + dx);
+            const uint64_t ucy = static_cast<uint64_t>(cy + dy);
+            const int64_t key = static_cast<int64_t>((ucx << 32) | (ucy & 0xFFFFFFFFULL));
+            auto it = m_retiredGrid.find(key);
+            if (it != m_retiredGrid.end())
+            {
+                _candidates.insert(_candidates.end(), it->second.begin(), it->second.end());
+            }
+        }
     }
 }
 

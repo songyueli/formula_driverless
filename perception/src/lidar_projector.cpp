@@ -7,8 +7,11 @@
 namespace
 {
 // Known, fixed extrinsics from simulation/models/fsd_car/model.sdf -- see
-// lidar_projector.hpp's class comment.
-constexpr double kLidarX = 0.3, kLidarY = 0.0, kLidarZ = 0.35;
+// lidar_projector.hpp's class comment. kLidarZ raised from the original
+// 0.35 (settled on 0.6 after 0.9 measured better accuracy but sat too high
+// in practice) -- MUST stay in sync with the lidar sensor's <pose> in
+// model.sdf (see that file's comment for why the mount height changed).
+constexpr double kLidarX = 0.3, kLidarY = 0.0, kLidarZ = 0.6;
 constexpr double kCamX = 0.9, kCamY = 0.0, kCamZ = 1.0;
 constexpr double kCamPitchRad = 0.3;
 

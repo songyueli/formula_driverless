@@ -56,7 +56,23 @@
            ================================================================ -->
 
       <sensor name="os1_128" type="gpu_lidar">
-        <pose>0.3 0 0.35 0 0 0</pose>
+        <!-- Raised from the original 0.35 -- that put it below chassis/nose
+             height, giving it a shallow grazing angle onto both the ground
+             and any cone at real detection range, which made lidar returns
+             that happened to project inside a cone's 2-D bounding box more
+             likely to actually be a mismatched ground/occlusion return
+             rather than the cone's own surface (see lidar_projector.cpp's
+             class comment -- Localize() has no way to tell the difference,
+             it just takes whichever in-box point has the smallest range).
+             Confirmed directly as a real accuracy problem, not theoretical:
+             cross-checking live /estimated_landmarks against Gazebo's own
+             real cone positions found a median 1.36m error with a long
+             tail past 14m at 0.35. 0.9 (matching the 1.0m camera mount)
+             fixed that (median dropped to 0.54m) but was too high in
+             practice; 0.6 is the middle-ground settled on. kLidarZ in
+             lidar_projector.cpp MUST be kept in sync with this value --
+             see that file's class comment. -->
+        <pose>0.3 0 0.6 0 0 0</pose>
         <update_rate>10</update_rate>
         <lidar>
           <scan>

@@ -16,6 +16,7 @@
 #endif
 #include "lidar_projector.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -321,6 +322,26 @@ int main()
     // 3 camera frames to arrive" early-return path isn't real work.
     auto timingPub = node.Advertise<gz::msgs::UInt64>("/timing/perception");
 
+    // Sub-stage breakdown of the same total /timing/perception covers --
+    // added because the aggregate number alone (confirmed live at
+    // 64-68ms/cycle, far above planning/control's 30-50us and even
+    // localization's) couldn't say WHICH part was actually costing that:
+    // tegrastats showed one CPU core pinned at 100% while GR3D_FREQ (GPU)
+    // stayed mostly idle (0-39%), meaning the bottleneck is plausibly
+    // CPU-bound work -- stitching, YOLO post-processing, or synchronous
+    // stdout logging (kLogTimeUs's own comment elsewhere in this file
+    // already flagged per-detection printing as a real latency
+    // contributor) -- rather than GPU inference itself. These let that be
+    // confirmed instead of guessed.
+    auto stitchTimingPub = node.Advertise<gz::msgs::UInt64>("/timing/perception/stitch");
+    auto detectTimingPub = node.Advertise<gz::msgs::UInt64>("/timing/perception/detect");
+    // Localize() calls + annotation drawing + coneMsg construction --
+    // everything in the per-detection loop EXCEPT the std::cout calls
+    // (see /timing/perception/log below, measured separately specifically
+    // to isolate that suspected cost rather than leave it folded in here).
+    auto postprocessTimingPub = node.Advertise<gz::msgs::UInt64>("/timing/perception/postprocess");
+    auto logTimingPub = node.Advertise<gz::msgs::UInt64>("/timing/perception/log");
+
     std::mutex mtx;
     cv::Mat latestFront, latestLeft, latestRight;
     StampKey stampFront{}, stampLeft{}, stampRight{};
@@ -367,8 +388,17 @@ int main()
             msg.set_data(static_cast<uint64_t>(_us));
             timingPub.Publish(msg);
         });
+        auto publishTimingUs = [](gz::transport::Node::Publisher &_pub, int64_t _us)
+        {
+            gz::msgs::UInt64 msg;
+            msg.set_data(static_cast<uint64_t>(_us));
+            _pub.Publish(msg);
+        };
 
+        const auto stitchStart = std::chrono::steady_clock::now();
         const cv::Mat stitched = stitcher.Stitch({latestFront, latestLeft, latestRight});
+        publishTimingUs(stitchTimingPub, std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - stitchStart).count());
         stitchedPub.Publish(ToImageMsg(stitched));
 
         // Still prints every detection either way (matching the same
@@ -381,9 +411,15 @@ int main()
         // and ConeDetectorTrt have structurally-identical but DISTINCT Detection
         // types (no shared base), so this must deduce via auto rather than
         // naming either one explicitly.
+        const auto detectStart = std::chrono::steady_clock::now();
         const auto detections = detector->Detect(stitched);
+        publishTimingUs(detectTimingPub, std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - detectStart).count());
+
         gz::msgs::Pose_V coneMsg;
         cv::Mat annotated = stitched.clone();
+        int64_t logUs = 0;
+        const auto postprocessStart = std::chrono::steady_clock::now();
         for (const auto &d : detections)
         {
             const bool knownClass = d.classId >= 0 && static_cast<size_t>(d.classId) <
@@ -391,14 +427,21 @@ int main()
             const char *className = knownClass ? kClassNames[d.classId] : "unknown";
             const cv::Scalar color = knownClass ? kClassColorsRgb[d.classId] : cv::Scalar(255, 255, 255);
 
-            std::cout << "  cone: " << className << " conf=" << d.confidence << " bbox=["
-                       << d.x1 << "," << d.y1 << "," << d.x2 << "," << d.y2 << "]";
-
             const bool touchesPanoEdge =
                 d.x1 <= kPanoEdgeMarginPx || d.x2 >= static_cast<float>(kPanoWidth) - kPanoEdgeMarginPx;
             const auto pos = touchesPanoEdge
                                   ? std::nullopt
                                   : lidarProjector.Localize(d.x1, d.y1, d.x2, d.y2);
+
+            // Logging isolated into its own contiguous, separately-timed
+            // block (see /timing/perception/log's comment above) rather
+            // than interleaved with the touchesPanoEdge/pos computation
+            // above -- both to get a clean timed span and because
+            // std::cout's own cost shouldn't be attributed to the
+            // Localize()/annotation work measured below.
+            const auto logStart = std::chrono::steady_clock::now();
+            std::cout << "  cone: " << className << " conf=" << d.confidence << " bbox=["
+                       << d.x1 << "," << d.y1 << "," << d.x2 << "," << d.y2 << "]";
             if (touchesPanoEdge)
             {
                 std::cout << " pos=none (touches panorama edge, excluded)";
@@ -407,18 +450,23 @@ int main()
             {
                 std::cout << " pos=(" << pos->x << "," << pos->y << "," << pos->z
                            << ") range=" << pos->range << "m";
-
-                gz::msgs::Pose *p = coneMsg.add_pose();
-                p->set_name(className);
-                p->mutable_position()->set_x(pos->x);
-                p->mutable_position()->set_y(pos->y);
-                p->mutable_position()->set_z(pos->z);
             }
             else
             {
                 std::cout << " pos=none";
             }
             std::cout << '\n';
+            logUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - logStart).count();
+
+            if (!touchesPanoEdge && pos)
+            {
+                gz::msgs::Pose *p = coneMsg.add_pose();
+                p->set_name(className);
+                p->mutable_position()->set_x(pos->x);
+                p->mutable_position()->set_y(pos->y);
+                p->mutable_position()->set_z(pos->z);
+            }
 
             cv::rectangle(annotated, cv::Point(static_cast<int>(d.x1), static_cast<int>(d.y1)),
                           cv::Point(static_cast<int>(d.x2), static_cast<int>(d.y2)), color, 2);
@@ -427,6 +475,11 @@ int main()
             cv::putText(annotated, label, cv::Point(static_cast<int>(d.x1), static_cast<int>(d.y1) - 4),
                         cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
         }
+        const int64_t postprocessTotalUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - postprocessStart).count();
+        publishTimingUs(postprocessTimingPub, postprocessTotalUs - logUs);
+        publishTimingUs(logTimingPub, logUs);
+
         detectionsPub.Publish(coneMsg);
         detectionsImgPub.Publish(ToImageMsg(annotated));
     };
