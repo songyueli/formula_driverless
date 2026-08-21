@@ -1,6 +1,29 @@
 #include "ekf.hpp"
 
 #include <cmath>
+#include <cstdio>
+
+// TEMPORARY diagnostic instrumentation -- prints every kDiagLogEvery-th call
+// to each correction/predict function in full detail, indefinitely. Meant to
+// be stripped back out once the current early-divergence investigation is
+// resolved; NOT meant to stay in the codebase long-term (unthrottled verbose
+// logging like this is exactly the kind of stdout cost perception's own
+// per-detection printing was just flagged as contributing to real
+// per-cycle latency).
+//
+// Deliberately throttled-but-indefinite, NOT a first-N-calls cutoff -- a
+// first-N-calls cutoff was tried first and was a real bug in its own right:
+// GNSS/ground_speed fire at ~500-1000Hz, so even a generous few-thousand-call
+// budget is exhausted within seconds of process start, going permanently
+// silent well before a divergence event that only shows up later in a
+// longer test (confirmed directly: a manual-drive test's actual divergence
+// was invisible in the log because logging had already stopped by the time
+// it happened, even though live /estimated_pose vs. ground-truth comparison
+// showed the error growing in real time).
+namespace
+{
+constexpr int kDiagLogEvery = 50;
+} // namespace
 
 namespace
 {
@@ -101,6 +124,66 @@ Ekf::Ekf()
     m_P = Eigen::MatrixXd::Identity(kVehicleStateDim, kVehicleStateDim) * 1.0e6;
 }
 
+void Ekf::StabilizeCovariance()
+{
+    // Symmetrize: average P with its own transpose. Cheap (O(n^2), same
+    // order as the update that just happened) and mathematically
+    // harmless for a matrix that SHOULD already be symmetric -- this only
+    // ever cancels out accumulated rounding-error asymmetry, never
+    // changes a genuinely symmetric matrix.
+    m_P = 0.5 * (m_P + m_P.transpose());
+
+    // Floor the diagonal: a negative "variance" is not just imprecise,
+    // it's meaningless (see this method's declaration in ekf.hpp for the
+    // concrete P(1,1)<0 case that motivated this). A tiny positive floor
+    // (not zero) keeps every future correction's Kalman gain
+    // well-defined -- a hard zero could still produce a degenerate S in
+    // some later correction.
+    constexpr double kMinVariance = 1.0e-9;
+    for (int i = 0; i < m_P.rows(); ++i)
+    {
+        if (m_P(i, i) < kMinVariance)
+        {
+            m_P(i, i) = kMinVariance;
+        }
+    }
+
+    // Clamp every off-diagonal entry to the range a VALID covariance
+    // matrix permits: |P(i,j)| <= sqrt(P(i,i)*P(j,j)) (Cauchy-Schwarz --
+    // a correlation coefficient can't exceed 1 in magnitude). The
+    // diagonal floor above only fixes negative variances; it does nothing
+    // about an off-diagonal entry that's merely too LARGE relative to its
+    // own diagonal, which is just as invalid and, unlike a negative
+    // diagonal, doesn't visibly break anything at the moment it happens --
+    // it silently sits there until some LATER correction's Kalman gain
+    // (K = P*H^T/S) leans on that exact entry. That's especially dangerous
+    // for a correction whose H is rank-1 and touches only ONE state
+    // dimension directly (CorrectHeading: only m_x(2); CorrectYawRate:
+    // only m_x(5)) -- its entire effect on every OTHER dimension (e.g.
+    // position) flows purely through that one off-diagonal correlation,
+    // so a corrupted P(i,2) or P(i,5) can inject an arbitrarily large,
+    // physically nonsensical jump into a state the sensor never measured.
+    // O(n^2), same order as the symmetrize step just above, so this adds
+    // no new complexity class.
+    for (int i = 0; i < m_P.rows(); ++i)
+    {
+        for (int j = i + 1; j < m_P.cols(); ++j)
+        {
+            const double bound = std::sqrt(m_P(i, i) * m_P(j, j));
+            if (m_P(i, j) > bound)
+            {
+                m_P(i, j) = bound;
+                m_P(j, i) = bound;
+            }
+            else if (m_P(i, j) < -bound)
+            {
+                m_P(i, j) = -bound;
+                m_P(j, i) = -bound;
+            }
+        }
+    }
+}
+
 void Ekf::Predict(double _dt)
 {
     if (_dt <= 0.0)
@@ -135,8 +218,21 @@ void Ekf::Predict(double _dt)
     const double cosYaw = std::cos(yaw);
     const double sinYaw = std::sin(yaw);
 
-    m_x(0) += (vx * cosYaw - vy * sinYaw) * _dt;
-    m_x(1) += (vx * sinYaw + vy * cosYaw) * _dt;
+    const double dx = (vx * cosYaw - vy * sinYaw) * _dt;
+    const double dy = (vx * sinYaw + vy * cosYaw) * _dt;
+    {
+        static int calls = 0;
+        if (calls % kDiagLogEvery == 0)
+        {
+            std::fprintf(stderr,
+                "[DIAG Predict] #%d dt=%.6f yaw=%.4f vx=%.4f vy=%.4f yawRate=%.4f -> dx=%.6f dy=%.6f | x=%.3f y=%.3f\n",
+                calls, _dt, yaw, vx, vy, yawRate, dx, dy, m_x(0), m_x(1));
+        }
+        ++calls;
+    }
+
+    m_x(0) += dx;
+    m_x(1) += dy;
     m_x(2) = NormalizeAngle(yaw + yawRate * _dt);
     // vx, vy, yaw_rate, and every landmark: F is identity for all of them
     // (constant-velocity vehicle assumption; landmarks are static cones).
@@ -235,6 +331,7 @@ void Ekf::Predict(double _dt)
     newP(2, 2) += kYawNoiseDensity * _dt;
 
     m_P = std::move(newP);
+    StabilizeCovariance();
 }
 
 void Ekf::CorrectBodyVelocity(double _vx, double _vy, double _stddevVx, double _stddevVy)
@@ -255,6 +352,15 @@ void Ekf::CorrectBodyVelocity(double _vx, double _vy, double _stddevVx, double _
     const Eigen::Matrix2d S = H * m_P * H.transpose() + R;
     const Eigen::MatrixXd K = m_P * H.transpose() * S.inverse();
 
+    static int diagCalls = 0;
+    if (diagCalls % kDiagLogEvery == 0)
+    {
+        std::fprintf(stderr,
+            "[DIAG BodyVel] #%d z=(%.4f,%.4f) h=(%.4f,%.4f) y=(%.4f,%.4f) K30=%.4f K41=%.4f\n",
+            diagCalls, z(0), z(1), h(0), h(1), y(0), y(1), K(3, 0), K(4, 1));
+    }
+    ++diagCalls;
+
     m_x += K * y;
     m_x(2) = NormalizeAngle(m_x(2));
     // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
@@ -266,6 +372,7 @@ void Ekf::CorrectBodyVelocity(double _vx, double _vy, double _stddevVx, double _
     // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
     // map), that difference is the entire performance budget.
     m_P = m_P - K * (H * m_P);
+    StabilizeCovariance();
 }
 
 void Ekf::CorrectYawRate(double _yawRate, double _stddev)
@@ -278,8 +385,22 @@ void Ekf::CorrectYawRate(double _yawRate, double _stddev)
     const double S = (H * m_P * H.transpose())(0, 0) + _stddev * _stddev;
     const Eigen::MatrixXd K = m_P * H.transpose() / S;
 
+    static int diagCalls = 0;
+    if (diagCalls % kDiagLogEvery == 0)
+    {
+        std::fprintf(stderr,
+            "[DIAG YawRate] #%d z=%.4f h=%.4f y=%.4f K1=%.4f | before x=%.3f y=%.3f -> ",
+            diagCalls, _yawRate, m_x(5), y, K(1, 0), m_x(0), m_x(1));
+    }
+
     m_x += K * y;
     m_x(2) = NormalizeAngle(m_x(2));
+
+    if (diagCalls % kDiagLogEvery == 0)
+    {
+        std::fprintf(stderr, "after x=%.3f y=%.3f\n", m_x(0), m_x(1));
+    }
+    ++diagCalls;
     // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
     // equivalent but forms a dense n x n (I-K*H) matrix and multiplies it
     // by P, an O(n^3) operation Eigen has no way to avoid on its own. H
@@ -289,6 +410,7 @@ void Ekf::CorrectYawRate(double _yawRate, double _stddev)
     // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
     // map), that difference is the entire performance budget.
     m_P = m_P - K * (H * m_P);
+    StabilizeCovariance();
 }
 
 void Ekf::CorrectGnssPosition(double _measuredEast, double _measuredNorth,
@@ -317,6 +439,17 @@ void Ekf::CorrectGnssPosition(double _measuredEast, double _measuredNorth,
     const Eigen::Matrix2d S = H * m_P * H.transpose() + R;
     const Eigen::MatrixXd K = m_P * H.transpose() * S.inverse();
 
+    static int diagCalls = 0;
+    const bool diag = diagCalls % kDiagLogEvery == 0;
+    double beforeX = 0, beforeY = 0, beforeP00 = 0, beforeP11 = 0;
+    if (diag)
+    {
+        beforeX = m_x(0);
+        beforeY = m_x(1);
+        beforeP00 = m_P(0, 0);
+        beforeP11 = m_P(1, 1);
+    }
+
     m_x += K * y;
     m_x(2) = NormalizeAngle(m_x(2));
     // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
@@ -328,6 +461,17 @@ void Ekf::CorrectGnssPosition(double _measuredEast, double _measuredNorth,
     // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
     // map), that difference is the entire performance budget.
     m_P = m_P - K * (H * m_P);
+    StabilizeCovariance();
+
+    if (diag)
+    {
+        std::fprintf(stderr,
+            "[DIAG GNSS] #%d z=(%.3f,%.3f) h=(%.3f,%.3f) y=(%.3f,%.3f) K00=%.4f K11=%.4f | "
+            "before x=%.3f y=%.3f P00=%.3e P11=%.3e -> after x=%.3f y=%.3f P00=%.3e P11=%.3e\n",
+            diagCalls, z(0), z(1), h(0), h(1), y(0), y(1), K(0, 0), K(1, 1),
+            beforeX, beforeY, beforeP00, beforeP11, m_x(0), m_x(1), m_P(0, 0), m_P(1, 1));
+    }
+    ++diagCalls;
 }
 
 void Ekf::CorrectHeading(double _measuredYaw, double _stddev)
@@ -340,8 +484,22 @@ void Ekf::CorrectHeading(double _measuredYaw, double _stddev)
     const double S = (H * m_P * H.transpose())(0, 0) + _stddev * _stddev;
     const Eigen::MatrixXd K = m_P * H.transpose() / S;
 
+    static int diagCalls = 0;
+    if (diagCalls % kDiagLogEvery == 0)
+    {
+        std::fprintf(stderr,
+            "[DIAG Heading] #%d z=%.4f h=%.4f y=%.4f K1=%.4f | before x=%.3f y=%.3f -> ",
+            diagCalls, _measuredYaw, m_x(2), y, K(1, 0), m_x(0), m_x(1));
+    }
+
     m_x += K * y;
     m_x(2) = NormalizeAngle(m_x(2));
+
+    if (diagCalls % kDiagLogEvery == 0)
+    {
+        std::fprintf(stderr, "after x=%.3f y=%.3f\n", m_x(0), m_x(1));
+    }
+    ++diagCalls;
     // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
     // equivalent but forms a dense n x n (I-K*H) matrix and multiplies it
     // by P, an O(n^3) operation Eigen has no way to avoid on its own. H
@@ -351,6 +509,7 @@ void Ekf::CorrectHeading(double _measuredYaw, double _stddev)
     // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
     // map), that difference is the entire performance budget.
     m_P = m_P - K * (H * m_P);
+    StabilizeCovariance();
 }
 
 void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
@@ -563,6 +722,7 @@ void Ekf::CorrectMatchedLandmark(int _landmarkIndex, double _measuredBodyX,
     // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
     // map), that difference is the entire performance budget.
     m_P = m_P - K * (H * m_P);
+    StabilizeCovariance();
 
     m_landmarkLastSeen[static_cast<size_t>(_landmarkIndex)] = ++m_tick;
 }
@@ -667,6 +827,7 @@ void Ekf::RemoveActiveLandmark(size_t _index)
 
     m_x = std::move(newX);
     m_P = std::move(newP);
+    StabilizeCovariance();
     m_landmarkColors.erase(m_landmarkColors.begin() + static_cast<long>(_index));
     m_landmarkLastSeen.erase(m_landmarkLastSeen.begin() + static_cast<long>(_index));
 }

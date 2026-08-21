@@ -126,6 +126,26 @@ public:
     std::vector<LandmarkEstimate> Landmarks() const;
 
 private:
+    // Symmetrizes m_P and floors its diagonal to a small positive value --
+    // called after every m_P update. The simplified covariance-update form
+    // used throughout this file (P - K*(H*P), chosen for its O(n^2) cost
+    // vs. O(n^3) for a naive dense update) is NOT guaranteed to stay
+    // symmetric/positive-semi-definite under floating-point rounding error
+    // the way the mathematically-equivalent-in-exact-arithmetic Joseph
+    // form is -- confirmed as a REAL, not theoretical, failure mode here:
+    // diagnostic instrumentation caught P(1,1) going negative at the
+    // SECOND EVER GNSS correction, a direct result of the startup P=1e6
+    // sitting right next to an already-converged ~1e-4 entry in the same
+    // matrix (huge dynamic range = the exact condition that amplifies
+    // rounding error). A full Joseph-form rewrite of every correction
+    // function would also stay O(n^2) with the same sparse-extraction
+    // technique already used elsewhere in this file, but touches 5
+    // separate, structurally-different functions; this is a smaller,
+    // easier-to-verify-correct fix that directly targets the confirmed
+    // symptom, at the same O(n^2) cost (this file's state size is bounded
+    // by kMaxActiveLandmarks now, so that's cheap).
+    void StabilizeCovariance();
+
     // The measurement Jacobian H, innovation y = z - h(x), and innovation
     // covariance S = H*P*H^T + R for a given EXISTING landmark against a
     // fresh detection -- shared by CorrectMatchedLandmark (which needs all
