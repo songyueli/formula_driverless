@@ -142,7 +142,10 @@ target_link_libraries(planning
     gz-transport::gz-transport
     gz-msgs::gz-msgs)
 
-add_executable(control       control/src/control.cpp)
+add_executable(control
+    control/src/control.cpp
+    control/src/pure_pursuit_controller.cpp)
+target_include_directories(control PRIVATE control/include)
 target_link_libraries(control
     gz-transport::gz-transport
     gz-msgs::gz-msgs)
