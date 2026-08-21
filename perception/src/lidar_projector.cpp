@@ -16,24 +16,25 @@ constexpr double kCamPitchRad = 0.3;
 // everything landing inside a detection's 2-D box -- it has no notion of
 // whether that point is actually a good depth match for what's IN the box,
 // just that its projection happens to overlap it. Near-ground and
-// self-referential returns close to the car (verified directly: real
-// lidar scans have on the order of 100 such points landing inside valid
-// panorama pixel space at ~3m range, clustered near the panorama's lower
-// edge where the ground is visible close to the car) will always win that
-// comparison against a real cone's actual, farther surface if their
-// projections happen to overlap the same box -- silently mislocalizing
-// the detection to wherever the car currently is instead of the cone.
-// That produces landmarks that trace the car's own path rather than real
-// cone positions, confirmed directly against a live capture. A real cone
-// is never legitimately localized this close: it has to be resolvable as
-// a several-pixel-wide box from the camera to be detected as a cone shape
-// at all, which in this rig's geometry doesn't happen inside ~1.5m.
-// Excluding points below this range removes the near-car returns from
-// consideration entirely, rather than trying to disambiguate which
-// in-box point is "the right one" by depth clustering or box-center
-// proximity -- a more thorough fix, but well past what this specific
-// failure mode needs.
-constexpr float kMinValidRange = 1.5f; // meters
+// self-referential returns close to the car (verified directly against a
+// real lidar scan: ~100+ such points, ALL measuring 2.94-3.0m range,
+// landing inside valid panorama pixel space near its lower edge, where
+// the ground close to the car is visible) will always win that comparison
+// against a real cone's actual, farther surface if their projections
+// happen to overlap the same box -- silently mislocalizing the detection
+// to wherever the car currently is instead of the cone. That produces
+// landmarks that trace the car's own path rather than real cone
+// positions, confirmed directly against a live capture.
+//
+// 4.0m gives that measured 2.94-3.0m cluster comfortable margin, while
+// staying well under every real cone detection range actually observed
+// live (6m+ once the panorama-edge duplicate case is excluded separately
+// -- see perception.cpp's kPanoEdgeMarginPx). An earlier version of this
+// fix used 1.5m -- comfortably WRONG, since it sat entirely below the
+// measured 2.94-3.0m artifact range and excluded nothing; left here as a
+// reminder to verify a threshold against the actual measured data driving
+// it, not just what "sounds" plausible.
+constexpr float kMinValidRange = 4.0f; // meters
 } // namespace
 
 LidarProjector::LidarProjector(int panoWidth, int panoHeight, double fPano)
