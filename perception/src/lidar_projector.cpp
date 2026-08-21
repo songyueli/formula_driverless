@@ -11,6 +11,29 @@ namespace
 constexpr double kLidarX = 0.3, kLidarY = 0.0, kLidarZ = 0.35;
 constexpr double kCamX = 0.9, kCamY = 0.0, kCamZ = 1.0;
 constexpr double kCamPitchRad = 0.3;
+
+// Localize() picks whichever cached point has the smallest RANGE among
+// everything landing inside a detection's 2-D box -- it has no notion of
+// whether that point is actually a good depth match for what's IN the box,
+// just that its projection happens to overlap it. Near-ground and
+// self-referential returns close to the car (verified directly: real
+// lidar scans have on the order of 100 such points landing inside valid
+// panorama pixel space at ~3m range, clustered near the panorama's lower
+// edge where the ground is visible close to the car) will always win that
+// comparison against a real cone's actual, farther surface if their
+// projections happen to overlap the same box -- silently mislocalizing
+// the detection to wherever the car currently is instead of the cone.
+// That produces landmarks that trace the car's own path rather than real
+// cone positions, confirmed directly against a live capture. A real cone
+// is never legitimately localized this close: it has to be resolvable as
+// a several-pixel-wide box from the camera to be detected as a cone shape
+// at all, which in this rig's geometry doesn't happen inside ~1.5m.
+// Excluding points below this range removes the near-car returns from
+// consideration entirely, rather than trying to disambiguate which
+// in-box point is "the right one" by depth clustering or box-center
+// proximity -- a more thorough fix, but well past what this specific
+// failure mode needs.
+constexpr float kMinValidRange = 1.5f; // meters
 } // namespace
 
 LidarProjector::LidarProjector(int panoWidth, int panoHeight, double fPano)
@@ -111,6 +134,10 @@ std::optional<LidarProjector::ConePosition> LidarProjector::Localize(
     for (const auto &p : m_points)
     {
         if (p.u < x1 || p.u > x2 || p.v < y1 || p.v > y2)
+        {
+            continue;
+        }
+        if (p.pos.range < kMinValidRange)
         {
             continue;
         }
