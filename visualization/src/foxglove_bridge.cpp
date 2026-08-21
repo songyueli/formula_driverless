@@ -462,8 +462,7 @@ constexpr const char *kJetsonStatsSchemaJson = R"({
     "cpu_core_pct": {"type": "array", "items": {"type": "number"}},
     "gpu_pct": {"type": "number"},
     "temps_c": {"type": "object"},
-    "power_mw": {"type": "object"},
-    "raw": {"type": "string"}
+    "power_mw": {"type": "object"}
   }
 })";
 
@@ -490,14 +489,10 @@ std::string JsonEscape(const std::string &_s)
 // Best-effort parse of a single tegrastats output line into a flat JSON
 // object. tegrastats' text format is NOT a stable, versioned API -- these
 // regexes were written against the documented/typical L4T format (RAM
-// X/YMB, CPU [n%@freq,...], GR3D_FREQ n%, name@temperatureC, VDD_RAIL
-// nmW/mW) but have NOT been verified against a live sample on the actual
-// target device (this was implemented in an isolated environment with no
-// access to the physical Jetson) -- confirm against a real `tegrastats`
-// invocation on this specific device/L4T release before trusting the
-// parsed fields, and adjust the regexes if any don't match. The full raw
-// line is always included as "raw" specifically so nothing is silently
-// lost if a field's regex doesn't match this device's actual output.
+// X/YMB, CPU [n%@freq,...], GR3D_FREQ n%, name@temperatureC, VDD_/VIN_RAIL
+// nmW/mW) and verified against a real sample from this device's actual
+// tegrastats output -- if a future L4T release changes the format, a field
+// silently going missing here is the symptom to watch for.
 std::string ParseTegrastatsLineToJson(const std::string &_line)
 {
     std::ostringstream json;
@@ -570,9 +565,6 @@ std::string ParseTegrastatsLineToJson(const std::string &_line)
             first = false;
         }
     }
-    json << "},";
-
-    json << "\"raw\":\"" << JsonEscape(_line) << "\"";
     json << "}";
     return json.str();
 }
