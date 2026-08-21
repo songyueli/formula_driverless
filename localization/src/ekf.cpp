@@ -19,17 +19,30 @@ double NormalizeAngle(double _angle)
 // implementation.
 constexpr double kLandmarkGateDist = 1.0;
 
-// Sanity cap on total tracked landmarks. The actual track has ~246 cones
-// (confirmed via Gazebo's own scene service during earlier testing), so
-// this is generous headroom, not a tight limit meant to bind in normal
-// operation -- it exists purely as a backstop against runaway growth if
-// something else (a diverged pose estimate, a bad data association) makes
-// every subsequent detection look like a new landmark instead of a match.
-// Without this, that failure mode is self-reinforcing: more landmarks
-// makes each correction more expensive (O(n^2) in total state size), which
-// makes this process more likely to fall behind and produce the large
-// Predict() dt gaps that caused the bad pose estimate in the first place.
+// Sanity cap on total DISCOVERED landmarks (active + retired combined --
+// see the class comment's "Submap / local correlation" section). The
+// actual track has ~246 cones (confirmed via Gazebo's own scene service
+// during earlier testing), so this is generous headroom, not a tight
+// limit meant to bind in normal operation -- it exists purely as a
+// backstop against unbounded growth in m_retiredLandmarks (a plain
+// vector append, cheap per-item but not something that should grow
+// forever) if something else keeps making every detection look like a
+// brand new landmark instead of a match. This no longer bounds
+// correction cost by itself -- kMaxActiveLandmarks below does that now --
+// but it's still worth keeping as a backstop for this separate,
+// unbounded-growth concern.
 constexpr size_t kMaxLandmarks = 600;
+
+// Bounds how many landmarks stay in the joint (correlated) state at once
+// -- THIS is what actually bounds every correction's O(n^2) cost now, not
+// kMaxLandmarks above. Sized to comfortably exceed how many cones are
+// ever visible in one camera frame in practice (observed up to ~15-20 in
+// a dense frame) with real margin, while keeping n = kVehicleStateDim +
+// 2*kMaxActiveLandmarks small enough that a single correction's matrix
+// math is negligible: at 80, n=166, vs. the ~800+ that was measured
+// costing 250-300ms per /cone_detections message (far slower than the
+// ~33ms between messages) before this fix existed.
+constexpr size_t kMaxActiveLandmarks = 80;
 
 // A brand-new landmark's initial world position is computed directly from
 // the CURRENT vehicle pose estimate (see AddLandmark) -- if that estimate
@@ -337,6 +350,7 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     const double worldX = m_x(0) + _measuredBodyX * cosYaw - _measuredBodyY * sinYaw;
     const double worldY = m_x(1) + _measuredBodyX * sinYaw + _measuredBodyY * cosYaw;
 
+    // 1. Try to match against an ACTIVE (in the joint state) landmark.
     int bestIndex = -1;
     double bestDistSq = kLandmarkGateDist * kLandmarkGateDist;
     for (size_t i = 0; i < m_landmarkColors.size(); ++i)
@@ -359,9 +373,38 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     if (bestIndex >= 0)
     {
         CorrectMatchedLandmark(bestIndex, _measuredBodyX, _measuredBodyY, _stddev);
+        EvictStaleIfOverCapacity();
+        return;
     }
-    else if (m_P(0, 0) > kMaxVehiclePosVarianceForNewLandmark ||
-             m_P(1, 1) > kMaxVehiclePosVarianceForNewLandmark)
+
+    // 2. No active match -- check RETIRED landmarks (same gate). A match
+    // here means the car is revisiting a landmark it previously evicted
+    // from the active state (see the class comment). Reactivate it by
+    // dropping it from m_retiredLandmarks and falling through to the
+    // "add" path below, using THIS detection -- simpler and safer than
+    // inventing a second, seeded-from-the-retired-estimate covariance
+    // construction; AddLandmark's existing Jacobian-based augmentation
+    // already correctly handles "new landmark from a fresh detection",
+    // and reusing it here means there's only one place that math needs
+    // to be right.
+    for (size_t i = 0; i < m_retiredLandmarks.size(); ++i)
+    {
+        if (m_retiredLandmarks[i].color != _color)
+        {
+            continue;
+        }
+        const double dx = m_retiredLandmarks[i].x - worldX;
+        const double dy = m_retiredLandmarks[i].y - worldY;
+        if (dx * dx + dy * dy < kLandmarkGateDist * kLandmarkGateDist)
+        {
+            m_retiredLandmarks.erase(m_retiredLandmarks.begin() + static_cast<long>(i));
+            break;
+        }
+    }
+
+    // 3. Genuinely new (or just-reactivated) landmark.
+    if (m_P(0, 0) > kMaxVehiclePosVarianceForNewLandmark ||
+        m_P(1, 1) > kMaxVehiclePosVarianceForNewLandmark)
     {
         // Vehicle's own position estimate isn't converged enough yet to
         // trust seeding a brand-new landmark from it -- see
@@ -369,14 +412,18 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
         // this detection simply gets no landmark this cycle, same as if
         // it had no lidar match at all; it'll be tried again next cycle
         // once (or if) the filter has converged further.
+        return;
     }
-    else if (m_landmarkColors.size() < kMaxLandmarks)
+    if (m_landmarkColors.size() + m_retiredLandmarks.size() >= kMaxLandmarks)
     {
-        AddLandmark(_measuredBodyX, _measuredBodyY, _color, _stddev);
+        // At the overall discovered-landmark cap -- silently drop rather
+        // than keep growing. Existing landmarks (active or retired, any
+        // color) can still be matched/reactivated normally; this only
+        // stops brand new ones from being created.
+        return;
     }
-    // else: at the cap -- silently drop rather than keep growing. Existing
-    // landmarks (of any color) can still be matched and corrected
-    // normally; this only stops NEW ones from being created.
+    AddLandmark(_measuredBodyX, _measuredBodyY, _color, _stddev);
+    EvictStaleIfOverCapacity();
 }
 
 void Ekf::CorrectMatchedLandmark(int _landmarkIndex, double _measuredBodyX,
@@ -436,6 +483,8 @@ void Ekf::CorrectMatchedLandmark(int _landmarkIndex, double _measuredBodyX,
     // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
     // map), that difference is the entire performance budget.
     m_P = m_P - K * (H * m_P);
+
+    m_landmarkLastSeen[static_cast<size_t>(_landmarkIndex)] = ++m_tick;
 }
 
 void Ekf::AddLandmark(double _measuredBodyX, double _measuredBodyY,
@@ -488,18 +537,80 @@ void Ekf::AddLandmark(double _measuredBodyX, double _measuredBodyY,
     m_P.block(n, n, 2, 2) = Pll;
 
     m_landmarkColors.push_back(_color);
+    m_landmarkLastSeen.push_back(++m_tick);
 }
 
 std::vector<Ekf::LandmarkEstimate> Ekf::Landmarks() const
 {
     std::vector<LandmarkEstimate> result;
-    result.reserve(m_landmarkColors.size());
+    result.reserve(m_landmarkColors.size() + m_retiredLandmarks.size());
     for (size_t i = 0; i < m_landmarkColors.size(); ++i)
     {
         const int li = kVehicleStateDim + 2 * static_cast<int>(i);
         result.push_back(LandmarkEstimate{m_x(li), m_x(li + 1), m_landmarkColors[i]});
     }
+    // Retired landmarks are no longer part of the joint state (see the
+    // class comment), but /estimated_landmarks should still show the full
+    // discovered map, not just whichever subset happens to still be
+    // actively correlated with the vehicle.
+    for (const auto &retired : m_retiredLandmarks)
+    {
+        result.push_back(retired);
+    }
     return result;
+}
+
+void Ekf::RemoveActiveLandmark(size_t _index)
+{
+    const int li = kVehicleStateDim + 2 * static_cast<int>(_index);
+    const int n = static_cast<int>(m_x.size());
+    const int tail = n - li - 2; // size of the surviving "after" region
+
+    // Rebuilt into fresh, smaller objects rather than shifted in place --
+    // see this method's declaration in ekf.hpp for why an in-place block
+    // shift is riskier than it looks (Eigen aliasing).
+    Eigen::VectorXd newX(n - 2);
+    newX.segment(0, li) = m_x.segment(0, li);
+    if (tail > 0)
+    {
+        newX.segment(li, tail) = m_x.segment(li + 2, tail);
+    }
+
+    Eigen::MatrixXd newP(n - 2, n - 2);
+    newP.block(0, 0, li, li) = m_P.block(0, 0, li, li);
+    if (tail > 0)
+    {
+        newP.block(0, li, li, tail) = m_P.block(0, li + 2, li, tail);
+        newP.block(li, 0, tail, li) = m_P.block(li + 2, 0, tail, li);
+        newP.block(li, li, tail, tail) = m_P.block(li + 2, li + 2, tail, tail);
+    }
+
+    m_x = std::move(newX);
+    m_P = std::move(newP);
+    m_landmarkColors.erase(m_landmarkColors.begin() + static_cast<long>(_index));
+    m_landmarkLastSeen.erase(m_landmarkLastSeen.begin() + static_cast<long>(_index));
+}
+
+void Ekf::EvictStaleIfOverCapacity()
+{
+    while (m_landmarkColors.size() > kMaxActiveLandmarks)
+    {
+        size_t staleIndex = 0;
+        uint64_t oldest = m_landmarkLastSeen[0];
+        for (size_t i = 1; i < m_landmarkLastSeen.size(); ++i)
+        {
+            if (m_landmarkLastSeen[i] < oldest)
+            {
+                oldest = m_landmarkLastSeen[i];
+                staleIndex = i;
+            }
+        }
+
+        const int li = kVehicleStateDim + 2 * static_cast<int>(staleIndex);
+        m_retiredLandmarks.push_back(
+            LandmarkEstimate{m_x(li), m_x(li + 1), m_landmarkColors[staleIndex]});
+        RemoveActiveLandmark(staleIndex);
+    }
 }
 
 } // namespace fsd

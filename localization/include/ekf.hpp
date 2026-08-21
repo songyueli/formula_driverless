@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -36,6 +37,27 @@
 // visibly on loop closure (driving back past cones seen early in a lap),
 // where accumulated drift can partially collapse in one update instead of
 // only ever being corrected by GNSS.
+//
+// Submap / local correlation (bounds the state, and therefore every
+// correction's cost): a full joint covariance means EVERY correction --
+// even one from a single freshly-observed landmark -- touches the ENTIRE
+// P matrix, not just that landmark's own rows/columns, because H*P is
+// dense (P correlates every landmark with every other one and with the
+// vehicle). At n state dimensions that's O(n^2) per correction; verified
+// directly in practice, this made a full track's worth of landmarks
+// (n ~ 800+) cost 250-300ms PER /cone_detections message -- far slower
+// than the ~33ms between messages, causing localization to fall
+// catastrophically behind real time. Landmarks NOT currently visible
+// don't need to stay in that expensive joint state at all -- they only
+// need to be revisited (reactivated) if the car drives back near them.
+// So m_landmarkColors/m_x/m_P only ever hold up to kMaxActiveLandmarks
+// landmarks; anything evicted (see EvictStaleIfOverCapacity) moves to
+// m_retiredLandmarks -- its last known estimate, no longer correlated
+// with the vehicle or with other landmarks, no longer touched by any
+// correction math, but still reported by Landmarks() (so
+// /estimated_landmarks keeps showing the full discovered map, active or
+// not) and still eligible to be matched again on CorrectOrAddLandmark
+// (reactivating it back into the active state) if the car revisits it.
 namespace fsd
 {
 
@@ -76,12 +98,18 @@ public:
 
     // A cone detection in the vehicle's own body frame, from
     // /cone_detections. Internally: try to match it (Euclidean-gated, see
-    // kLandmarkGateDist in ekf.cpp) against an existing SAME-COLOR tracked
+    // kLandmarkGateDist in ekf.cpp) against an existing SAME-COLOR ACTIVE
     // landmark; if found, apply a joint vehicle+landmark correction (both
-    // get updated, see the class comment above); if not, add it as a new
-    // landmark, growing the state by 2 via a proper covariance-
-    // augmentation Jacobian (not just a bare append with a guessed
-    // uncertainty -- see AddLandmark in ekf.cpp for why that matters).
+    // get updated, see the class comment above). If not, try the same
+    // gate against RETIRED landmarks -- a match there means the car is
+    // revisiting a landmark it previously evicted from the active state,
+    // so it's reactivated (added back into the joint state fresh, from
+    // this detection). Only if neither matches is it truly new -- added
+    // via a proper covariance-augmentation Jacobian (not just a bare
+    // append with a guessed uncertainty -- see AddLandmark for why that
+    // matters). Either kind of addition may in turn evict the now-
+    // stalest active landmark if this pushes the active count over
+    // kMaxActiveLandmarks -- see EvictStaleIfOverCapacity.
     void CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
                                ConeColor _color, double _stddev);
 
@@ -89,6 +117,11 @@ public:
     double Y() const { return m_x(1); }
     double Yaw() const { return m_x(2); }
 
+    // Every discovered landmark, active or retired -- see the class
+    // comment's "Submap / local correlation" section. Active landmarks'
+    // positions are read live from the joint state; retired ones are
+    // whatever their estimate was at the moment they were evicted (no
+    // longer updated by anything unless reactivated).
     std::vector<LandmarkEstimate> Landmarks() const;
 
 private:
@@ -96,12 +129,39 @@ private:
                                  double _measuredBodyY, double _stddev);
     void AddLandmark(double _measuredBodyX, double _measuredBodyY,
                       ConeColor _color, double _stddev);
+    // Removes active landmark _index from m_x/m_P/m_landmarkColors/
+    // m_landmarkLastSeen entirely (NOT a retirement -- caller is
+    // responsible for saving its estimate into m_retiredLandmarks first
+    // if that's the intent, see EvictStaleIfOverCapacity). Rebuilds
+    // m_x/m_P into fresh, smaller objects rather than shifting the
+    // existing ones in place -- an in-place block shift risks Eigen
+    // aliasing bugs (reading and writing overlapping regions of the same
+    // matrix in one assignment); this is a rare, one-off-per-eviction
+    // operation, so a temporary allocation costs nothing meaningful.
+    void RemoveActiveLandmark(size_t _index);
+    // If the active count exceeds kMaxActiveLandmarks, repeatedly retires
+    // the LEAST RECENTLY matched/added active landmark (m_landmarkLastSeen)
+    // until back at capacity. Recency, not distance from the vehicle's
+    // current position estimate, is deliberately used as the eviction
+    // signal: it doesn't depend on the very pose estimate this whole
+    // mechanism exists to help keep correctable, and since the car moves
+    // through the track roughly continuously (no teleporting), "not seen
+    // in a while" is already a good proxy for "physically far away now".
+    void EvictStaleIfOverCapacity();
 
     Eigen::VectorXd m_x;
     Eigen::MatrixXd m_P;
-    // m_landmarkColors[i] corresponds to state indices
-    // kVehicleStateDim + 2*i (x) and kVehicleStateDim + 2*i + 1 (y).
+    // m_landmarkColors[i] / m_landmarkLastSeen[i] correspond to state
+    // indices kVehicleStateDim + 2*i (x) and kVehicleStateDim + 2*i + 1
+    // (y) -- ACTIVE landmarks only. m_landmarkLastSeen[i] is the m_tick
+    // value at the most recent match or add for that landmark.
     std::vector<ConeColor> m_landmarkColors;
+    std::vector<uint64_t> m_landmarkLastSeen;
+    uint64_t m_tick = 0;
+    // Evicted landmarks -- no longer part of the joint state (see the
+    // class comment), kept only for Landmarks() reporting and for
+    // CorrectOrAddLandmark's reactivation check.
+    std::vector<LandmarkEstimate> m_retiredLandmarks;
 };
 
 } // namespace fsd
