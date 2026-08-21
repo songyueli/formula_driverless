@@ -71,6 +71,21 @@ public:
         double x;
         double y;
         ConeColor color;
+        // Positional variance (Pll diagonal) AT THE MOMENT OF RETIREMENT --
+        // zero/unused for still-active landmarks. Needed because the
+        // retired-landmark re-match gate (see CorrectOrAddLandmark) was
+        // using the VEHICLE's own current position variance as a stand-in
+        // for "how uncertain am I about this landmark", which collapses to
+        // ~1e-5 within the first second or two of any run (see
+        // StabilizeCovariance's confirmed P00/P11 convergence) regardless
+        // of whether the landmark itself was ever well-constrained -- an
+        // effective re-match tolerance of a few tenths of a meter, tighter
+        // than realistic re-detection noise, which was silently forcing
+        // every re-observation of a retired landmark to fail the gate and
+        // get re-added as brand new. Carrying the landmark's OWN retained
+        // uncertainty forward gives an honest tolerance instead.
+        double varX = 0.0;
+        double varY = 0.0;
     };
 
     Ekf();
@@ -142,25 +157,113 @@ private:
     // technique already used elsewhere in this file, but touches 5
     // separate, structurally-different functions; this is a smaller,
     // easier-to-verify-correct fix that directly targets the confirmed
-    // symptom, at the same O(n^2) cost (this file's state size is bounded
-    // by kMaxActiveLandmarks now, so that's cheap).
-    void StabilizeCovariance();
+    // symptom.
+    //
+    // The off-diagonal Cauchy-Schwarz clamp added alongside the diagonal
+    // floor (see the confirmed-negative-P00 story above -- the SAME
+    // instrumentation later caught an off-diagonal entry going invalid
+    // too, exploited by CorrectHeading/CorrectYawRate's rank-1 corrections
+    // into a 400+ meter single-call position jump) is deliberately scoped
+    // to only the dimensions THIS correction actually touched
+    // (_touchedIndices), NOT a full n x n scan -- confirmed directly as a
+    // real, severe regression when it WAS a full scan: at n=166
+    // (kMaxActiveLandmarks=80), a dense scan is ~14000 sqrt() calls, and
+    // with this called from every correction (hundreds of landmark
+    // corrections per /cone_detections message alone), per-message
+    // /timing/localization went from ~0.2ms to 7-17ms -- an order of
+    // magnitude past the ~1-2ms budget available between GNSS/ground-speed
+    // messages at their ~500-1000Hz rate, which starved localization of
+    // real-time and was the actual cause of /estimated_pose appearing
+    // "frozen" during real driving (it wasn't frozen, it was falling
+    // further and further behind processing a growing backlog of stale
+    // messages). Restricting the clamp to just the touched dims keeps it
+    // at the same sparse O(k^2) (k = 6 or 8) scale as every other
+    // correction in this file, while still directly guarding the exact
+    // mechanism that produced the confirmed corruption (a corrupted
+    // vehicle-vehicle or vehicle-landmark entry gets exploited by a LATER
+    // correction whose H touches those same dims -- which necessarily
+    // means that later correction's OWN _touchedIndices call already
+    // covers it, so this loses no real protection against the failure
+    // mode that was actually observed).
+    //
+    // The symmetrize step is ALSO scoped to _touchedIndices now (see the
+    // .cpp for the same reasoning applied there) -- scoping just the
+    // clamp wasn't enough on its own: the full O(n^2) symmetrize was
+    // confirmed as the dominant REMAINING cost even after that fix.
+    void StabilizeCovariance(const std::vector<int> &_touchedIndices);
 
-    // The measurement Jacobian H, innovation y = z - h(x), and innovation
-    // covariance S = H*P*H^T + R for a given EXISTING landmark against a
-    // fresh detection -- shared by CorrectMatchedLandmark (which needs all
-    // three to actually apply the correction) and CorrectOrAddLandmark's
-    // active-landmark search loop (which only needs y/S to compute a
-    // Mahalanobis distance for gating). Factored out specifically because
-    // this Jacobian is fiddly enough that duplicating it in two places
-    // would be a real correctness risk if they ever drifted out of sync.
+    // Applies one EKF correction step (K = P*H^T*S^-1, x += K*y, P -= K*H*P)
+    // for a measurement whose Jacobian H is zero everywhere EXCEPT the
+    // columns in _touchedIndices -- _Hsub is just those nonzero columns
+    // (measDim x _touchedIndices.size()), in the same order. Every
+    // correction function in this file used to build a full,
+    // mostly-zero kVehicleStateDim/landmark-wide H and hand it to Eigen's
+    // generic dense matrix multiply for K = P*H^T and (later) H*P -- Eigen
+    // has no way to know most of H is zero, so both of those were genuinely
+    // OPERATION-BY-OPERATION dense O(n^2) multiplies despite H's sparsity
+    // being "obvious" from the code around it. This was a confirmed, severe
+    // regression (7-17ms per /cone_detections message, when the ~1-2ms
+    // budget between GNSS/ground-speed messages at their ~500-1000Hz rate
+    // requires sub-millisecond corrections) that was NOT fixed by scoping
+    // StabilizeCovariance alone -- that only addressed a much cheaper part
+    // of the same per-correction cost. This method does the same
+    // extract-the-relevant-rows-of-P technique LandmarkInnovation already
+    // used for its S computation (P is symmetric, so P's touched COLUMNS
+    // equal its touched ROWS), reusing ONE such extraction for both S and
+    // K instead of Eigen silently doing the full O(n^2) multiply two or
+    // three times over across a correction's S/K/P-update. The final P
+    // update (P -= K*H*P) stays O(n^2) -- that part is unavoidable, since
+    // the RESULT is genuinely a dense n x n matrix -- but every step
+    // feeding into it drops from O(n^2) to O(k*n) (k = _touchedIndices.size(),
+    // a small constant: 6 for a vehicle-only correction, 8 for a landmark
+    // one). Also calls StabilizeCovariance(_touchedIndices) internally, so
+    // callers don't need a separate call. Returns the full n x measDim K
+    // (not reduced to just the touched rows) so callers can still read
+    // whatever entries their diagnostic prints reference.
+    Eigen::MatrixXd ApplyCorrection(const std::vector<int> &_touchedIndices,
+                                     const Eigen::MatrixXd &_Hsub,
+                                     const Eigen::VectorXd &_y,
+                                     const Eigen::MatrixXd &_R);
+
+    // The innovation y = z - h(x) and the measurement Jacobian's 5 nonzero
+    // columns (_Hcols, in column order {vehicle x, vehicle y, vehicle yaw,
+    // landmark x, landmark y} -- see ApplyCorrection for why this is just
+    // the nonzero columns rather than a full n-wide H) for a given EXISTING
+    // landmark against a fresh detection -- shared by CorrectMatchedLandmark
+    // (which needs y/H to actually apply the correction, via
+    // ApplyCorrection) and CorrectOrAddLandmark's active-landmark search
+    // loop (which only needs y/S to compute a Mahalanobis distance for
+    // gating). Factored out specifically because this Jacobian is fiddly
+    // enough that duplicating it in two places would be a real correctness
+    // risk if they ever drifted out of sync.
     void LandmarkInnovation(int _landmarkIndex, double _measuredBodyX, double _measuredBodyY,
                              double _stddev, Eigen::Vector2d &_y, Eigen::Matrix2d &_S,
-                             Eigen::MatrixXd &_H) const;
+                             Eigen::MatrixXd &_Hcols) const;
     void CorrectMatchedLandmark(int _landmarkIndex, double _measuredBodyX,
                                  double _measuredBodyY, double _stddev);
+    // _priorEstimate is non-null when this is a REACTIVATION (see
+    // CorrectOrAddLandmark) -- the retired landmark's own retained
+    // (x, y, varX, varY) from before it was evicted. When present, the
+    // new landmark's position is a proper inverse-variance-weighted blend
+    // of the prior and this fresh detection, not just the fresh detection
+    // alone -- confirmed as a real, direct cause of visible landmark
+    // jitter: with kMaxActiveLandmarks forcing frequent eviction/
+    // reactivation churn, blindly reseeding from a single fresh detection
+    // every time (discarding whatever positional confidence had already
+    // accumulated before eviction) means the reported position effectively
+    // resets to raw single-detection noise on every reactivation, which
+    // happens far more often than a genuinely new landmark is created.
+    // Deliberately only the POSITION is blended this way, not Pll/Pcross
+    // (the covariance/cross-correlation this landmark enters the joint
+    // state with) -- those stay derived purely from the fresh detection's
+    // Jacobians, same as the no-prior case, since the prior carries no
+    // cross-correlation information to fuse in and a from-scratch blend
+    // of two covariance representations is a materially bigger, riskier
+    // change than the confirmed symptom (position jitter, not a
+    // covariance-validity problem) calls for.
     void AddLandmark(double _measuredBodyX, double _measuredBodyY,
-                      ConeColor _color, double _stddev);
+                      ConeColor _color, double _stddev,
+                      const LandmarkEstimate *_priorEstimate = nullptr);
     // Removes active landmark _index from m_x/m_P/m_landmarkColors/
     // m_landmarkLastSeen entirely (NOT a retirement -- caller is
     // responsible for saving its estimate into m_retiredLandmarks first
@@ -180,6 +283,47 @@ private:
     // through the track roughly continuously (no teleporting), "not seen
     // in a while" is already a good proxy for "physically far away now".
     void EvictStaleIfOverCapacity();
+    // Discards any retired landmark sitting within kDuplicatePruneRadius of
+    // a SAME-COLOR active landmark. Needed because CorrectOrAddLandmark's
+    // matching order (active search first, unconditionally returning on a
+    // hit -- see step 1/2 there) means a retired entry only ever gets a
+    // chance to be reconsidered when NO active match exists for a fresh
+    // detection; if an active landmark representing the same physical cone
+    // already exists (however that duplicate arose -- e.g. an earlier
+    // detection matched a slightly-off active candidate instead of this
+    // one's retired copy), every future detection of that cone keeps
+    // matching the active one, and the retired twin is never looked at
+    // again -- confirmed directly: a retired entry sat completely frozen,
+    // unchanged, right next to a continuously-updating active landmark for
+    // 27+ seconds straight in a live test. This is separate cleanup, not
+    // folded into the matching gate itself, specifically because it must
+    // run regardless of whether a NEW detection ever triggers a retired
+    // search at all. kDuplicatePruneRadius is a plain Euclidean check (no
+    // live covariance available for a retired-vs-active landmark pair, and
+    // none needed): comfortably under the >=5m real cone spacing this file
+    // already relies on elsewhere, so it can only catch genuine duplicates
+    // of the same physical cone, never two distinct real ones.
+    void PruneStaleRetiredDuplicates();
+    // Same idea as PruneStaleRetiredDuplicates, but for TWO ACTIVE
+    // landmarks of the same color sitting on top of each other -- confirmed
+    // as a real, SEPARATE failure mode: raising kMaxActiveLandmarks (to
+    // reduce eviction churn and let landmarks actually converge -- see the
+    // jitter-debugging story elsewhere in this file) made duplicate counts
+    // get WORSE, not better, even though individual jitter dropped. Once
+    // two active entries for the same physical cone both exist (however
+    // that happened -- e.g. two near-simultaneous detections in an early,
+    // still-uncorrelated frame that didn't gate against each other), NEW
+    // detections always just match whichever ONE has the lower Mahalanobis
+    // distance -- the other sits there getting no further corrections,
+    // starved, and previously would eventually get evicted (forcing it
+    // through the retired-list path, where PruneStaleRetiredDuplicates or
+    // a later reactivation could catch it) -- but with a large enough
+    // active cap, eviction may never happen at all, so nothing EVER cleans
+    // it up. When a duplicate active pair is found, keeps whichever was
+    // seen more recently (m_landmarkLastSeen) -- the same recency signal
+    // EvictStaleIfOverCapacity already uses elsewhere -- and removes the
+    // other via RemoveActiveLandmark.
+    void PruneStaleActiveDuplicates();
 
     Eigen::VectorXd m_x;
     Eigen::MatrixXd m_P;

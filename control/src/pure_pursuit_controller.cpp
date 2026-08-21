@@ -2,7 +2,14 @@
 
 namespace
 {
-constexpr double kSpeed = 3.0;              // m/s, constant for now
+// TEMPORARY: dropped tremendously (from 3.0) to debug the localization/
+// landmark-duplication problem with the real-time performance ceiling out
+// of the way entirely -- at this speed there's no meaningful risk of
+// localization falling behind its message queue, so any remaining
+// landmark-matching misbehavior is isolated to the matching LOGIC itself,
+// not conflated with a lag artifact. Restore to a real value once that's
+// debugged.
+constexpr double kSpeed = 0.3;              // m/s
 constexpr double kLookaheadDistance = 3.0;  // meters
 }  // namespace
 

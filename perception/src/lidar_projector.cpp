@@ -35,6 +35,27 @@ constexpr double kCamPitchRad = 0.3;
 // reminder to verify a threshold against the actual measured data driving
 // it, not just what "sounds" plausible.
 constexpr float kMinValidRange = 4.0f; // meters
+
+// Localize() has no notion of whether the closest-range point inside a
+// box is actually a good depth match for what's in it (see this file's
+// class comment above) -- that's a real problem in BOTH directions, not
+// just the near-ground one kMinValidRange guards against. At long range a
+// detection's 2-D box is only a few pixels wide, so the angular resolution
+// covering it is coarse enough that unrelated background/terrain points
+// far behind the actual cone can easily land inside the same tiny box and
+// (being a valid, finite return) win the closest-range comparison just as
+// easily as a near-ground artifact would. Confirmed directly: landmarks
+// were appearing ~50m from the vehicle immediately at startup, before the
+// car had moved at all, tracing back to exactly this -- a detection whose
+// box happened to also contain a stray far-range point. A cone that far
+// away is also inherently a bad landmark candidate on its own merits even
+// when the match IS a genuine cone surface: bearing/range noise at that
+// distance is large relative to close-range detections, so seeding a
+// landmark from it starts that landmark's estimate from a much worse prior
+// than usual. 20m is comfortably beyond every real, reliable detection
+// actually observed live (2-6m for the near/working cases -- see
+// kMinValidRange's comment), while safely excluding the ~50m artifact.
+constexpr float kMaxValidRange = 20.0f; // meters
 } // namespace
 
 LidarProjector::LidarProjector(int panoWidth, int panoHeight, double fPano)
@@ -138,7 +159,7 @@ std::optional<LidarProjector::ConePosition> LidarProjector::Localize(
         {
             continue;
         }
-        if (p.pos.range < kMinValidRange)
+        if (p.pos.range < kMinValidRange || p.pos.range > kMaxValidRange)
         {
             continue;
         }

@@ -1,5 +1,6 @@
 #include "ekf.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -54,30 +55,33 @@ double NormalizeAngle(double _angle)
 // x = -2*ln(0.05) = 5.99).
 constexpr double kLandmarkGateChiSq = 5.99;
 
-// Sanity cap on total DISCOVERED landmarks (active + retired combined --
-// see the class comment's "Submap / local correlation" section). The
-// actual track has ~246 cones (confirmed via Gazebo's own scene service
-// during earlier testing), so this is generous headroom, not a tight
-// limit meant to bind in normal operation -- it exists purely as a
-// backstop against unbounded growth in m_retiredLandmarks (a plain
-// vector append, cheap per-item but not something that should grow
-// forever) if something else keeps making every detection look like a
-// brand new landmark instead of a match. This no longer bounds
-// correction cost by itself -- kMaxActiveLandmarks below does that now --
-// but it's still worth keeping as a backstop for this separate,
-// unbounded-growth concern.
-constexpr size_t kMaxLandmarks = 600;
+// TEMPORARY: dropped tremendously (from 600) while debugging the
+// landmark-duplication problem -- a lower cap means a real duplication
+// bug hits it, and stops growing, within seconds instead of requiring a
+// long test run to even notice, and keeps the retired-match search loop
+// (O(m) per detection over retired count) cheap and easy to reason about
+// by hand. 60 is 6x kMaxActiveLandmarks below, generous margin without
+// being so large a real bug takes a while to surface. Restore to a real
+// value once debugged.
+constexpr size_t kMaxLandmarks = 60;
 
-// Bounds how many landmarks stay in the joint (correlated) state at once
-// -- THIS is what actually bounds every correction's O(n^2) cost now, not
-// kMaxLandmarks above. Sized to comfortably exceed how many cones are
-// ever visible in one camera frame in practice (observed up to ~15-20 in
-// a dense frame) with real margin, while keeping n = kVehicleStateDim +
-// 2*kMaxActiveLandmarks small enough that a single correction's matrix
-// math is negligible: at 80, n=166, vs. the ~800+ that was measured
-// costing 250-300ms per /cone_detections message (far slower than the
-// ~33ms between messages) before this fix existed.
-constexpr size_t kMaxActiveLandmarks = 80;
+// TEMPORARY: dropped tremendously (from 80, per explicit instruction) while
+// debugging the landmark-duplication problem -- this is normally the
+// performance-driven cap (bounds every correction's O(n^2) cost via
+// n = kVehicleStateDim + 2*kMaxActiveLandmarks). Raised from 10 to 25 while
+// debugging landmark jitter: confirmed directly that 10 was FAR below how
+// many distinct cones are visible at once, causing near-constant evict/
+// reactivate churn -- every landmark kept getting bounced out of the joint
+// state (discarding its accumulated correlation structure, only a plain
+// diagonal variance snapshot surviving via reactivation blending) before
+// it ever got the chance to converge through several consecutive, properly
+// -correlated Kalman updates the way a landmark's variance is supposed to
+// monotonically shrink under this file's math (landmarks are static, so
+// Predict() adds zero process noise to their dimensions -- every real
+// observation should only ever tighten Pll, never re-widen it). Still well
+// below the real value of 80, so debug output stays tractable. Restore to
+// a real value once jitter is fully debugged.
+constexpr size_t kMaxActiveLandmarks = 25;
 
 // A brand-new landmark's initial world position is computed directly from
 // the CURRENT vehicle pose estimate (see AddLandmark) -- if that estimate
@@ -109,6 +113,58 @@ constexpr size_t kMaxActiveLandmarks = 80;
 // correction (GNSS, heading) converges past it well before the car would
 // plausibly already be near its first cone.
 constexpr double kMaxVehiclePosVarianceForNewLandmark = 4.0; // meters^2
+
+// Minimum variance (per axis) assumed when gating a retired-landmark
+// re-match, regardless of how tight the landmark's own retained Pll
+// diagonal or the vehicle's current position variance are. This gate's
+// two failure directions are NOT symmetric: a false reject means a
+// legitimately-revisited cone gets re-added as a brand new landmark --
+// confirmed directly as the dominant driver of runaway landmark growth
+// (600-landmark cap hit within ~12s of normal driving) -- and repeats
+// EVERY time that same cone is seen again, since the freshly-added
+// duplicate immediately becomes just as susceptible to the same failure
+// once IT retires in turn. A false accept just reactivates a nearby but
+// wrong landmark, which is comparatively harmless: real cones are >=5m
+// apart (Formula Student rules, same margin kMaxVehiclePosVarianceForNewLandmark
+// relies on), so this floor -- corresponding to a ~1m per-axis stddev,
+// chi-squared gate of kLandmarkGateChiSq across 2 DOF -- is nowhere near
+// large enough to confuse two distinct real cones.
+constexpr double kMinRetiredMatchVariance = 1.0; // meters^2
+
+// StabilizeCovariance's touched-indices scope for a vehicle-only
+// correction (BodyVel, YawRate, GNSS, Heading, Predict) -- see
+// StabilizeCovariance's declaration in ekf.hpp for why this is scoped at
+// all rather than a full n x n scan.
+const std::vector<int> kVehicleDims = {0, 1, 2, 3, 4, 5};
+
+// Shared by PruneStaleRetiredDuplicates/PruneStaleActiveDuplicates -- see
+// their declarations in ekf.hpp. BUG FIX: this was 2.0m, based on this
+// file's other comments repeatedly citing ">=5m real cone spacing (FSAE
+// rules)" -- that assumption is WRONG for this specific simulated track,
+// confirmed directly by querying Gazebo's own /world/trackdrive/scene/info
+// service for real cone_blue_* positions: consecutive cones measured
+// ~1.97m apart, not >=5m. At 2.0m, this was actively MERGING two
+// genuinely distinct, legitimately-closely-spaced real cones into one --
+// confirmed directly: a detection would correctly fail the (real,
+// statistical) Mahalanobis gate against its actual nearest neighbor
+// (Mahalanobis 20-1200, correctly signaling "this is a DIFFERENT cone"),
+// get created as a new landmark via AddLandmark (correct), and then
+// immediately get discarded by this prune check because it was within
+// 2.0m of that same, genuinely-different neighbor -- an infinite create-
+// then-immediately-prune cycle that looked identical to "landmark
+// disappearing" from outside.
+//
+// Then dropped to 0.75, which went too far the OTHER way: cross-checking
+// live /estimated_landmarks against Gazebo's real cone_* positions
+// directly (matching each estimate to its nearest same-color real cone)
+// found 5 confirmed straggler duplicate pairs sitting 0.76-1.35m apart --
+// a well-converged landmark plus a slightly-off duplicate that 0.75 was
+// too tight to catch. 1.5m sits roughly halfway between the worst
+// confirmed straggler (1.35m) and the confirmed real minimum spacing
+// (1.97m), with real margin on both sides: comfortably catches every
+// duplicate distance actually observed so far, while staying well clear
+// of merging two genuinely distinct adjacent cones.
+constexpr double kDuplicatePruneRadius = 1.5; // meters
 } // namespace
 
 namespace fsd
@@ -124,21 +180,49 @@ Ekf::Ekf()
     m_P = Eigen::MatrixXd::Identity(kVehicleStateDim, kVehicleStateDim) * 1.0e6;
 }
 
-void Ekf::StabilizeCovariance()
+void Ekf::StabilizeCovariance(const std::vector<int> &_touchedIndices)
 {
-    // Symmetrize: average P with its own transpose. Cheap (O(n^2), same
-    // order as the update that just happened) and mathematically
-    // harmless for a matrix that SHOULD already be symmetric -- this only
-    // ever cancels out accumulated rounding-error asymmetry, never
-    // changes a genuinely symmetric matrix.
-    m_P = 0.5 * (m_P + m_P.transpose());
+    // Symmetrize: average P with its own transpose, but ONLY the touched
+    // rows against the rest of the matrix (O(k*n), not a full O(n^2) pass
+    // -- this used to be a full m_P = 0.5*(m_P+m_P.transpose()), which was
+    // confirmed as the dominant remaining cost even AFTER scoping the
+    // off-diagonal clamp below: it's the same asymptotic order as the
+    // O(n^2) covariance update itself, called from every single
+    // correction (including the high-rate ones -- GNSS/ground-speed/IMU at
+    // ~500-1000Hz -- not just landmark corrections), and it allocates a
+    // FULL fresh n x n transpose temporary every time. The correction this
+    // follows (P -= K*HP) genuinely does perturb every entry of P, not
+    // just the touched rows/columns -- so in principle a scoped symmetrize
+    // could miss asymmetry elsewhere -- but the MAGNITUDE of that
+    // perturbation in an untouched entry P(i,j) is bounded by how
+    // correlated i,j are with the touched dims through K/HP, which decays
+    // for less-related state, and any asymmetry large enough to actually
+    // matter (i.e. get exploited by a LATER correction's K=P*H^T/S) can
+    // only appear in an entry that correction's OWN touched indices cover
+    // -- which its OWN call to this function fixes. Same argument as the
+    // clamp below, just applied to symmetry instead of the Cauchy-Schwarz
+    // bound.
+    for (int i : _touchedIndices)
+    {
+        for (int j = 0; j < m_P.cols(); ++j)
+        {
+            if (j == i)
+            {
+                continue;
+            }
+            const double avg = 0.5 * (m_P(i, j) + m_P(j, i));
+            m_P(i, j) = avg;
+            m_P(j, i) = avg;
+        }
+    }
 
     // Floor the diagonal: a negative "variance" is not just imprecise,
     // it's meaningless (see this method's declaration in ekf.hpp for the
     // concrete P(1,1)<0 case that motivated this). A tiny positive floor
     // (not zero) keeps every future correction's Kalman gain
     // well-defined -- a hard zero could still produce a degenerate S in
-    // some later correction.
+    // some later correction. O(n), not O(n^2) -- cheap regardless of
+    // scope, so this stays a full scan too.
     constexpr double kMinVariance = 1.0e-9;
     for (int i = 0; i < m_P.rows(); ++i)
     {
@@ -148,27 +232,26 @@ void Ekf::StabilizeCovariance()
         }
     }
 
-    // Clamp every off-diagonal entry to the range a VALID covariance
-    // matrix permits: |P(i,j)| <= sqrt(P(i,i)*P(j,j)) (Cauchy-Schwarz --
-    // a correlation coefficient can't exceed 1 in magnitude). The
-    // diagonal floor above only fixes negative variances; it does nothing
-    // about an off-diagonal entry that's merely too LARGE relative to its
-    // own diagonal, which is just as invalid and, unlike a negative
-    // diagonal, doesn't visibly break anything at the moment it happens --
-    // it silently sits there until some LATER correction's Kalman gain
-    // (K = P*H^T/S) leans on that exact entry. That's especially dangerous
-    // for a correction whose H is rank-1 and touches only ONE state
-    // dimension directly (CorrectHeading: only m_x(2); CorrectYawRate:
-    // only m_x(5)) -- its entire effect on every OTHER dimension (e.g.
-    // position) flows purely through that one off-diagonal correlation,
-    // so a corrupted P(i,2) or P(i,5) can inject an arbitrarily large,
-    // physically nonsensical jump into a state the sensor never measured.
-    // O(n^2), same order as the symmetrize step just above, so this adds
-    // no new complexity class.
-    for (int i = 0; i < m_P.rows(); ++i)
+    // Clamp off-diagonal entries among _touchedIndices to the range a
+    // VALID covariance matrix permits: |P(i,j)| <= sqrt(P(i,i)*P(j,j))
+    // (Cauchy-Schwarz -- a correlation coefficient can't exceed 1 in
+    // magnitude). See this method's declaration in ekf.hpp for why this
+    // is scoped to _touchedIndices (a handful of dims: the 6 vehicle ones,
+    // plus a landmark's own 2 when this call came from a landmark
+    // correction) rather than a full n x n scan -- a full scan here was
+    // a confirmed, severe (7-17ms/message) performance regression once
+    // active landmark count grew toward kMaxActiveLandmarks, and every
+    // exploitable corruption pathway in this file (a corrupted entry
+    // actually amplified into a state jump by some correction's K=P*H^T/S)
+    // provably falls within some correction's own _touchedIndices, since
+    // no H matrix in this file ever spans two DIFFERENT landmarks at once.
+    const size_t k = _touchedIndices.size();
+    for (size_t a = 0; a < k; ++a)
     {
-        for (int j = i + 1; j < m_P.cols(); ++j)
+        const int i = _touchedIndices[a];
+        for (size_t b = a + 1; b < k; ++b)
         {
+            const int j = _touchedIndices[b];
             const double bound = std::sqrt(m_P(i, i) * m_P(j, j));
             if (m_P(i, j) > bound)
             {
@@ -182,6 +265,47 @@ void Ekf::StabilizeCovariance()
             }
         }
     }
+}
+
+Eigen::MatrixXd Ekf::ApplyCorrection(const std::vector<int> &_touchedIndices,
+                                      const Eigen::MatrixXd &_Hsub,
+                                      const Eigen::VectorXd &_y,
+                                      const Eigen::MatrixXd &_R)
+{
+    const int n = static_cast<int>(m_x.size());
+    const int k = static_cast<int>(_touchedIndices.size());
+
+    // P's touched rows (k x n) -- P is symmetric, so these are also P's
+    // touched COLUMNS, which is what H*P actually needs (H is zero outside
+    // these columns). See this method's declaration in ekf.hpp for why
+    // this replaces a naive dense H*P/P*H^T that Eigen would otherwise
+    // compute in full despite H being mostly zero.
+    Eigen::MatrixXd Prows(k, n);
+    for (int r = 0; r < k; ++r)
+    {
+        Prows.row(r) = m_P.row(_touchedIndices[r]);
+    }
+
+    const Eigen::MatrixXd HP = _Hsub * Prows; // measDim x n -- O(measDim*k*n)
+
+    Eigen::MatrixXd HPtouched(_Hsub.rows(), k); // HP's touched columns
+    for (int c = 0; c < k; ++c)
+    {
+        HPtouched.col(c) = HP.col(_touchedIndices[c]);
+    }
+    const Eigen::MatrixXd S = HPtouched * _Hsub.transpose() + _R; // measDim x measDim
+
+    // K = P*H^T*S^-1 = (H*P)^T*S^-1 (P symmetric) -- reuses HP instead of
+    // computing P*H^T as a SEPARATE dense multiply the way the original
+    // per-function code did.
+    const Eigen::MatrixXd K = HP.transpose() * S.inverse(); // n x measDim -- O(n*measDim^2)
+
+    m_x += K * _y;
+    m_x(2) = NormalizeAngle(m_x(2));
+    m_P = m_P - K * HP; // n x n -- O(n^2), the one part that's genuinely unavoidable
+    StabilizeCovariance(_touchedIndices);
+
+    return K;
 }
 
 void Ekf::Predict(double _dt)
@@ -331,16 +455,11 @@ void Ekf::Predict(double _dt)
     newP(2, 2) += kYawNoiseDensity * _dt;
 
     m_P = std::move(newP);
-    StabilizeCovariance();
+    StabilizeCovariance(kVehicleDims);
 }
 
 void Ekf::CorrectBodyVelocity(double _vx, double _vy, double _stddevVx, double _stddevVy)
 {
-    const int n = static_cast<int>(m_x.size());
-    Eigen::MatrixXd H = Eigen::MatrixXd::Zero(2, n);
-    H(0, 3) = 1.0;
-    H(1, 4) = 1.0;
-
     const Eigen::Vector2d z(_vx, _vy);
     const Eigen::Vector2d h(m_x(3), m_x(4));
     const Eigen::Vector2d y = z - h;
@@ -349,8 +468,8 @@ void Ekf::CorrectBodyVelocity(double _vx, double _vy, double _stddevVx, double _
     R(0, 0) = _stddevVx * _stddevVx;
     R(1, 1) = _stddevVy * _stddevVy;
 
-    const Eigen::Matrix2d S = H * m_P * H.transpose() + R;
-    const Eigen::MatrixXd K = m_P * H.transpose() * S.inverse();
+    const Eigen::Matrix2d Hsub = Eigen::Matrix2d::Identity(); // touches {3,4}
+    const Eigen::MatrixXd K = ApplyCorrection({3, 4}, Hsub, y, R);
 
     static int diagCalls = 0;
     if (diagCalls % kDiagLogEvery == 0)
@@ -360,64 +479,43 @@ void Ekf::CorrectBodyVelocity(double _vx, double _vy, double _stddevVx, double _
             diagCalls, z(0), z(1), h(0), h(1), y(0), y(1), K(3, 0), K(4, 1));
     }
     ++diagCalls;
-
-    m_x += K * y;
-    m_x(2) = NormalizeAngle(m_x(2));
-    // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
-    // equivalent but forms a dense n x n (I-K*H) matrix and multiplies it
-    // by P, an O(n^3) operation Eigen has no way to avoid on its own. H
-    // only has 1-2 nonzero rows, so H*P is O(n) rows worth of work (O(n)
-    // per row = O(n) here since k<=2), and K*(H*P) is (n x k)*(k x n) =
-    // O(k*n^2) -- with k a small constant, that's O(n^2) overall, not
-    // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
-    // map), that difference is the entire performance budget.
-    m_P = m_P - K * (H * m_P);
-    StabilizeCovariance();
 }
 
 void Ekf::CorrectYawRate(double _yawRate, double _stddev)
 {
-    const int n = static_cast<int>(m_x.size());
-    Eigen::MatrixXd H = Eigen::MatrixXd::Zero(1, n);
-    H(0, 5) = 1.0;
-
-    const double y = _yawRate - m_x(5);
-    const double S = (H * m_P * H.transpose())(0, 0) + _stddev * _stddev;
-    const Eigen::MatrixXd K = m_P * H.transpose() / S;
+    const double h = m_x(5);
+    const double y = _yawRate - h;
 
     static int diagCalls = 0;
-    if (diagCalls % kDiagLogEvery == 0)
+    const bool diag = diagCalls % kDiagLogEvery == 0;
+    double beforeX = 0, beforeY = 0;
+    if (diag)
+    {
+        beforeX = m_x(0);
+        beforeY = m_x(1);
+    }
+
+    Eigen::MatrixXd Hsub(1, 1);
+    Hsub(0, 0) = 1.0; // touches {5}
+    Eigen::MatrixXd R(1, 1);
+    R(0, 0) = _stddev * _stddev;
+    Eigen::VectorXd yv(1);
+    yv(0) = y;
+    const Eigen::MatrixXd K = ApplyCorrection({5}, Hsub, yv, R);
+
+    if (diag)
     {
         std::fprintf(stderr,
-            "[DIAG YawRate] #%d z=%.4f h=%.4f y=%.4f K1=%.4f | before x=%.3f y=%.3f -> ",
-            diagCalls, _yawRate, m_x(5), y, K(1, 0), m_x(0), m_x(1));
-    }
-
-    m_x += K * y;
-    m_x(2) = NormalizeAngle(m_x(2));
-
-    if (diagCalls % kDiagLogEvery == 0)
-    {
-        std::fprintf(stderr, "after x=%.3f y=%.3f\n", m_x(0), m_x(1));
+            "[DIAG YawRate] #%d z=%.4f h=%.4f y=%.4f K1=%.4f | before x=%.3f y=%.3f -> after x=%.3f y=%.3f\n",
+            diagCalls, _yawRate, h, y, K(1, 0), beforeX, beforeY, m_x(0), m_x(1));
     }
     ++diagCalls;
-    // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
-    // equivalent but forms a dense n x n (I-K*H) matrix and multiplies it
-    // by P, an O(n^3) operation Eigen has no way to avoid on its own. H
-    // only has 1-2 nonzero rows, so H*P is O(n) rows worth of work (O(n)
-    // per row = O(n) here since k<=2), and K*(H*P) is (n x k)*(k x n) =
-    // O(k*n^2) -- with k a small constant, that's O(n^2) overall, not
-    // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
-    // map), that difference is the entire performance budget.
-    m_P = m_P - K * (H * m_P);
-    StabilizeCovariance();
 }
 
 void Ekf::CorrectGnssPosition(double _measuredEast, double _measuredNorth,
                                double _antennaOffsetX, double _antennaOffsetY,
                                double _stddev)
 {
-    const int n = static_cast<int>(m_x.size());
     const double yaw = m_x(2);
     const double cosYaw = std::cos(yaw);
     const double sinYaw = std::sin(yaw);
@@ -428,16 +526,15 @@ void Ekf::CorrectGnssPosition(double _measuredEast, double _measuredNorth,
     const Eigen::Vector2d z(_measuredEast, _measuredNorth);
     const Eigen::Vector2d y = z - h;
 
-    Eigen::MatrixXd H = Eigen::MatrixXd::Zero(2, n);
-    H(0, 0) = 1.0;
-    H(0, 2) = -_antennaOffsetX * sinYaw - _antennaOffsetY * cosYaw;
-    H(1, 1) = 1.0;
-    H(1, 2) = _antennaOffsetX * cosYaw - _antennaOffsetY * sinYaw;
+    Eigen::MatrixXd Hsub(2, 3); // touches {0, 1, 2}
+    Hsub(0, 0) = 1.0;
+    Hsub(0, 1) = 0.0;
+    Hsub(0, 2) = -_antennaOffsetX * sinYaw - _antennaOffsetY * cosYaw;
+    Hsub(1, 0) = 0.0;
+    Hsub(1, 1) = 1.0;
+    Hsub(1, 2) = _antennaOffsetX * cosYaw - _antennaOffsetY * sinYaw;
 
     const Eigen::Matrix2d R = Eigen::Matrix2d::Identity() * (_stddev * _stddev);
-
-    const Eigen::Matrix2d S = H * m_P * H.transpose() + R;
-    const Eigen::MatrixXd K = m_P * H.transpose() * S.inverse();
 
     static int diagCalls = 0;
     const bool diag = diagCalls % kDiagLogEvery == 0;
@@ -450,18 +547,7 @@ void Ekf::CorrectGnssPosition(double _measuredEast, double _measuredNorth,
         beforeP11 = m_P(1, 1);
     }
 
-    m_x += K * y;
-    m_x(2) = NormalizeAngle(m_x(2));
-    // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
-    // equivalent but forms a dense n x n (I-K*H) matrix and multiplies it
-    // by P, an O(n^3) operation Eigen has no way to avoid on its own. H
-    // only has 1-2 nonzero rows, so H*P is O(n) rows worth of work (O(n)
-    // per row = O(n) here since k<=2), and K*(H*P) is (n x k)*(k x n) =
-    // O(k*n^2) -- with k a small constant, that's O(n^2) overall, not
-    // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
-    // map), that difference is the entire performance budget.
-    m_P = m_P - K * (H * m_P);
-    StabilizeCovariance();
+    const Eigen::MatrixXd K = ApplyCorrection({0, 1, 2}, Hsub, y, R);
 
     if (diag)
     {
@@ -476,40 +562,33 @@ void Ekf::CorrectGnssPosition(double _measuredEast, double _measuredNorth,
 
 void Ekf::CorrectHeading(double _measuredYaw, double _stddev)
 {
-    const int n = static_cast<int>(m_x.size());
-    Eigen::MatrixXd H = Eigen::MatrixXd::Zero(1, n);
-    H(0, 2) = 1.0;
-
-    const double y = NormalizeAngle(_measuredYaw - m_x(2));
-    const double S = (H * m_P * H.transpose())(0, 0) + _stddev * _stddev;
-    const Eigen::MatrixXd K = m_P * H.transpose() / S;
+    const double h = m_x(2);
+    const double y = NormalizeAngle(_measuredYaw - h);
 
     static int diagCalls = 0;
-    if (diagCalls % kDiagLogEvery == 0)
+    const bool diag = diagCalls % kDiagLogEvery == 0;
+    double beforeX = 0, beforeY = 0;
+    if (diag)
+    {
+        beforeX = m_x(0);
+        beforeY = m_x(1);
+    }
+
+    Eigen::MatrixXd Hsub(1, 1);
+    Hsub(0, 0) = 1.0; // touches {2}
+    Eigen::MatrixXd R(1, 1);
+    R(0, 0) = _stddev * _stddev;
+    Eigen::VectorXd yv(1);
+    yv(0) = y;
+    const Eigen::MatrixXd K = ApplyCorrection({2}, Hsub, yv, R);
+
+    if (diag)
     {
         std::fprintf(stderr,
-            "[DIAG Heading] #%d z=%.4f h=%.4f y=%.4f K1=%.4f | before x=%.3f y=%.3f -> ",
-            diagCalls, _measuredYaw, m_x(2), y, K(1, 0), m_x(0), m_x(1));
-    }
-
-    m_x += K * y;
-    m_x(2) = NormalizeAngle(m_x(2));
-
-    if (diagCalls % kDiagLogEvery == 0)
-    {
-        std::fprintf(stderr, "after x=%.3f y=%.3f\n", m_x(0), m_x(1));
+            "[DIAG Heading] #%d z=%.4f h=%.4f y=%.4f K1=%.4f | before x=%.3f y=%.3f -> after x=%.3f y=%.3f\n",
+            diagCalls, _measuredYaw, h, y, K(1, 0), beforeX, beforeY, m_x(0), m_x(1));
     }
     ++diagCalls;
-    // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
-    // equivalent but forms a dense n x n (I-K*H) matrix and multiplies it
-    // by P, an O(n^3) operation Eigen has no way to avoid on its own. H
-    // only has 1-2 nonzero rows, so H*P is O(n) rows worth of work (O(n)
-    // per row = O(n) here since k<=2), and K*(H*P) is (n x k)*(k x n) =
-    // O(k*n^2) -- with k a small constant, that's O(n^2) overall, not
-    // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
-    // map), that difference is the entire performance budget.
-    m_P = m_P - K * (H * m_P);
-    StabilizeCovariance();
 }
 
 void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
@@ -530,17 +609,58 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     // bounds both n and the candidate count to something small.
     int bestIndex = -1;
     double bestMahalanobisSq = kLandmarkGateChiSq;
+    // TEMPORARY (landmark-duplication debugging): track the closest
+    // same-color active candidate's Mahalanobis value REGARDLESS of
+    // whether it passed the gate, and its Euclidean distance, so the
+    // AddLandmark diagnostic below can show WHY a real match was missed
+    // (nothing nearby at all, vs. something nearby that failed the gate
+    // and by how much) instead of just "no match found".
+    double closestActiveDistSq = -1.0;
+    double closestActiveMahalanobisSq = -1.0;
     for (size_t i = 0; i < m_landmarkColors.size(); ++i)
     {
         if (m_landmarkColors[i] != _color)
         {
             continue;
         }
+        // Cheap Euclidean pre-filter before paying for LandmarkInnovation's
+        // O(n) Prows extraction + matrix work: kMaxActiveLandmarks candidates
+        // get tried per detection, and most of them -- anything the car
+        // isn't currently near -- can never plausibly pass the real
+        // Mahalanobis gate, so there's no reason to build S for them at
+        // all. kCoarseGateRadius is deliberately generous (much larger
+        // than the real gate's effective radius under normal, converged
+        // uncertainty) so this can only ever SKIP a candidate the real
+        // gate would also have rejected -- it changes what gets computed,
+        // never what gets matched.
+        const int li = kVehicleStateDim + 2 * static_cast<int>(i);
+        const double dxCoarse = m_x(li) - worldX;
+        const double dyCoarse = m_x(li + 1) - worldY;
+        const double distSq = dxCoarse * dxCoarse + dyCoarse * dyCoarse;
+        if (closestActiveDistSq < 0.0 || distSq < closestActiveDistSq)
+        {
+            closestActiveDistSq = distSq;
+        }
+        constexpr double kCoarseGateRadius = 15.0; // meters -- generous margin above the
+                                                    // real gate's typical effective radius,
+                                                    // since a converged filter's P is small
+                                                    // but P legitimately grows during real
+                                                    // drift/uncertainty, and this must never
+                                                    // reject a candidate the real (uncertainty
+                                                    // -aware) Mahalanobis gate would accept
+        if (distSq > kCoarseGateRadius * kCoarseGateRadius)
+        {
+            continue;
+        }
         Eigen::Vector2d y;
         Eigen::Matrix2d S;
-        Eigen::MatrixXd H;
-        LandmarkInnovation(static_cast<int>(i), _measuredBodyX, _measuredBodyY, _stddev, y, S, H);
+        Eigen::MatrixXd Hcols; // unused here besides the out-param -- only y/S are needed for gating
+        LandmarkInnovation(static_cast<int>(i), _measuredBodyX, _measuredBodyY, _stddev, y, S, Hcols);
         const double mahalanobisSq = y.transpose() * S.inverse() * y;
+        if (closestActiveMahalanobisSq < 0.0 || mahalanobisSq < closestActiveMahalanobisSq)
+        {
+            closestActiveMahalanobisSq = mahalanobisSq;
+        }
         if (mahalanobisSq < bestMahalanobisSq)
         {
             bestMahalanobisSq = mahalanobisSq;
@@ -550,8 +670,23 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
 
     if (bestIndex >= 0)
     {
+        static int matchDiagCalls = 0;
+        if (matchDiagCalls % kDiagLogEvery == 0)
+        {
+            std::fprintf(stderr,
+                "[DIAG LandmarkMatch] #%d color=%d world=(%.2f,%.2f) matchedIndex=%d mahalanobisSq=%.3f active=%zu retired=%zu\n",
+                matchDiagCalls, static_cast<int>(_color), worldX, worldY, bestIndex,
+                bestMahalanobisSq, m_landmarkColors.size(), m_retiredLandmarks.size());
+        }
+        ++matchDiagCalls;
         CorrectMatchedLandmark(bestIndex, _measuredBodyX, _measuredBodyY, _stddev);
         EvictStaleIfOverCapacity();
+        // An active match means the retired list was never even consulted
+        // this call -- exactly the situation that lets a stale retired
+        // duplicate of THIS landmark linger forever (see
+        // PruneStaleRetiredDuplicates's declaration in ekf.hpp).
+        PruneStaleRetiredDuplicates();
+        PruneStaleActiveDuplicates();
         return;
     }
 
@@ -566,16 +701,54 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     // reusing it here means there's only one place that math needs to be
     // right.
     //
-    // A retired landmark has no tracked covariance to build a proper
-    // Mahalanobis distance from (see the class comment -- that's the
-    // whole point of retiring it). Approximated here using the vehicle's
-    // OWN current position variance as the dominant source of "how far
-    // off could this legitimately be" (a diagonal approximation: no
-    // cross-correlation term, since none is available post-retirement),
-    // plus the measurement variance as a floor so this doesn't become
-    // unreasonably tight right after a landmark has just converged the
-    // filter to a very small P. Compared against the same chi-squared
-    // threshold as the active gate for consistency.
+    // A retired landmark has no LIVE tracked covariance to build a proper
+    // Mahalanobis distance from (see the class comment -- that's the whole
+    // point of retiring it), but it DOES carry its own Pll diagonal
+    // snapshot from the moment it was retired (LandmarkEstimate::varX/varY
+    // -- see EvictStaleIfOverCapacity). That, not the vehicle's own
+    // CURRENT position variance, is the dominant source of "how far off
+    // could this legitimately be": the vehicle's own P(0,0)/P(1,1)
+    // converges to ~1e-5 within the first second or two of any run
+    // (confirmed directly via diagnostic instrumentation) regardless of
+    // how well-constrained any given landmark was, which made this gate's
+    // effective tolerance a few TENTHS of a meter -- tighter than
+    // realistic re-detection noise -- and silently forced nearly every
+    // re-observation of a retired landmark to fail the gate and get
+    // re-added as brand new, which is what was actually driving the
+    // landmark count to its cap on every real driving lap (confirmed: it
+    // hit the 600 cap within ~12 seconds of a normal drive). The vehicle's
+    // current variance is still added in (a diagonal approximation: no
+    // cross-correlation term, since none is available post-retirement) --
+    // the vehicle's own pose can still have drifted since the landmark was
+    // retired -- along with the measurement variance as a floor.
+    // TEMPORARY (landmark-duplication debugging): same closest-candidate
+    // tracking as the active search above, for the AddLandmark diagnostic
+    // below.
+    //
+    // BUG FIX: this used to erase and reactivate the FIRST retired
+    // candidate that passed the gate, in list order -- not the BEST
+    // (closest) one, unlike the active search above (which correctly
+    // tracks bestMahalanobisSq). With enough retired landmarks
+    // accumulated, a detection could match some coincidentally-nearby-
+    // enough retired entry that happened to come first in the list while
+    // the TRUE match (the actual same physical cone's retired copy,
+    // sitting right next to the detection) got left behind unclaimed --
+    // confirmed directly: a detection at (117.24,38.60) reactivated a
+    // retired candidate 2.01m away (barely under the gate) while the
+    // genuine match, evicted moments earlier from the exact same spot
+    // (117.20,38.53), was still sitting in the list. The abandoned true
+    // match then never gets reclaimed (nothing else has any reason to
+    // prefer it over whatever ELSE also happens to pass the gate first),
+    // so it just sits there as a near-duplicate of wherever the detection
+    // actually ended up. Now tracks the best (lowest Mahalanobis) match
+    // across ALL retired candidates, same as the active search, and only
+    // erases/reactivates that one.
+    bool reactivated = false;
+    LandmarkEstimate reactivatedPrior{}; // saved before erase() invalidates it -- passed to AddLandmark below
+    int bestRetiredIndex = -1;
+    double bestRetiredMahalanobisSq = kLandmarkGateChiSq;
+    double closestRetiredDistSq = -1.0;
+    double closestRetiredMahalanobisSq = -1.0;
     for (size_t i = 0; i < m_retiredLandmarks.size(); ++i)
     {
         if (m_retiredLandmarks[i].color != _color)
@@ -584,14 +757,31 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
         }
         const double dx = m_retiredLandmarks[i].x - worldX;
         const double dy = m_retiredLandmarks[i].y - worldY;
-        const double approxMahalanobisSq =
-            (dx * dx) / (m_P(0, 0) + _stddev * _stddev) +
-            (dy * dy) / (m_P(1, 1) + _stddev * _stddev);
-        if (approxMahalanobisSq < kLandmarkGateChiSq)
+        const double distSq = dx * dx + dy * dy;
+        if (closestRetiredDistSq < 0.0 || distSq < closestRetiredDistSq)
         {
-            m_retiredLandmarks.erase(m_retiredLandmarks.begin() + static_cast<long>(i));
-            break;
+            closestRetiredDistSq = distSq;
         }
+        const double varX = std::max(kMinRetiredMatchVariance,
+            m_retiredLandmarks[i].varX + m_P(0, 0) + _stddev * _stddev);
+        const double varY = std::max(kMinRetiredMatchVariance,
+            m_retiredLandmarks[i].varY + m_P(1, 1) + _stddev * _stddev);
+        const double approxMahalanobisSq = (dx * dx) / varX + (dy * dy) / varY;
+        if (closestRetiredMahalanobisSq < 0.0 || approxMahalanobisSq < closestRetiredMahalanobisSq)
+        {
+            closestRetiredMahalanobisSq = approxMahalanobisSq;
+        }
+        if (approxMahalanobisSq < bestRetiredMahalanobisSq)
+        {
+            bestRetiredMahalanobisSq = approxMahalanobisSq;
+            bestRetiredIndex = static_cast<int>(i);
+        }
+    }
+    if (bestRetiredIndex >= 0)
+    {
+        reactivatedPrior = m_retiredLandmarks[bestRetiredIndex];
+        m_retiredLandmarks.erase(m_retiredLandmarks.begin() + bestRetiredIndex);
+        reactivated = true;
     }
 
     // 3. Genuinely new (or just-reactivated) landmark.
@@ -614,13 +804,33 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
         // stops brand new ones from being created.
         return;
     }
-    AddLandmark(_measuredBodyX, _measuredBodyY, _color, _stddev);
+
+    // TEMPORARY (landmark-duplication debugging): every AddLandmark call
+    // is either a genuinely new cone or a symptom of a matching-gate
+    // failure -- this print shows which, and if it's the latter, how
+    // close the nearest real candidate actually was and why it didn't
+    // pass (distance alone doesn't say whether the failure was the
+    // active gate or the retired one, so both are reported).
+    std::fprintf(stderr,
+        "[DIAG AddLandmark] color=%d world=(%.2f,%.2f) reactivated=%d "
+        "closestActiveDist=%.2f closestActiveMahalanobisSq=%.2f "
+        "closestRetiredDist=%.2f closestRetiredMahalanobisSq=%.2f "
+        "active=%zu retired=%zu\n",
+        static_cast<int>(_color), worldX, worldY, reactivated ? 1 : 0,
+        closestActiveDistSq < 0.0 ? -1.0 : std::sqrt(closestActiveDistSq), closestActiveMahalanobisSq,
+        closestRetiredDistSq < 0.0 ? -1.0 : std::sqrt(closestRetiredDistSq), closestRetiredMahalanobisSq,
+        m_landmarkColors.size(), m_retiredLandmarks.size());
+
+    AddLandmark(_measuredBodyX, _measuredBodyY, _color, _stddev,
+                reactivated ? &reactivatedPrior : nullptr);
     EvictStaleIfOverCapacity();
+    PruneStaleRetiredDuplicates();
+    PruneStaleActiveDuplicates();
 }
 
 void Ekf::LandmarkInnovation(int _landmarkIndex, double _measuredBodyX, double _measuredBodyY,
                               double _stddev, Eigen::Vector2d &_y, Eigen::Matrix2d &_S,
-                              Eigen::MatrixXd &_H) const
+                              Eigen::MatrixXd &_Hcols) const
 {
     const int n = static_cast<int>(m_x.size());
     const int li = kVehicleStateDim + 2 * _landmarkIndex;
@@ -642,23 +852,29 @@ void Ekf::LandmarkInnovation(int _landmarkIndex, double _measuredBodyX, double _
     const Eigen::Vector2d h(bodyXPred, bodyYPred);
     _y = z - h;
 
-    _H = Eigen::MatrixXd::Zero(2, n);
-    // w.r.t. vehicle x, y, yaw (same form as the pre-SLAM landmark
-    // correction, since h()'s dependence on the vehicle sub-state is
-    // unchanged).
-    _H(0, 0) = -cosYaw;
-    _H(0, 1) = -sinYaw;
-    _H(0, 2) = bodyYPred;
-    _H(1, 0) = sinYaw;
-    _H(1, 1) = -cosYaw;
-    _H(1, 2) = -bodyXPred;
+    // H's 5 nonzero columns {0,1,2,li,li+1} (vehicle x/y/yaw + this
+    // landmark's own x/y), computed DIRECTLY into a small 2x5 matrix --
+    // never as a full 2 x n H that's mostly zero. That full-H-then-extract
+    // step used to exist here (build Zero(2,n), fill 10 entries, then copy
+    // the same 5 nonzero columns right back out into Hcols) purely to feed
+    // ApplyCorrection/CorrectMatchedLandmark's K computation -- once that
+    // was rewritten to take the sparse Hcols directly (see ApplyCorrection
+    // in ekf.hpp for why), the full H had no remaining use anywhere in this
+    // file, so building it at all was pure waste.
+    _Hcols = Eigen::MatrixXd(2, 5);
+    _Hcols(0, 0) = -cosYaw;
+    _Hcols(0, 1) = -sinYaw;
+    _Hcols(0, 2) = bodyYPred;
+    _Hcols(1, 0) = sinYaw;
+    _Hcols(1, 1) = -cosYaw;
+    _Hcols(1, 2) = -bodyXPred;
     // w.r.t. the matched landmark's own (x, y) state -- NEW vs. the
     // pre-SLAM version, since the landmark is now part of the state being
     // differentiated against, not a constant.
-    _H(0, li) = cosYaw;
-    _H(0, li + 1) = sinYaw;
-    _H(1, li) = -sinYaw;
-    _H(1, li + 1) = cosYaw;
+    _Hcols(0, 3) = cosYaw;
+    _Hcols(0, 4) = sinYaw;
+    _Hcols(1, 3) = -sinYaw;
+    _Hcols(1, 4) = cosYaw;
 
     const Eigen::Matrix2d R = Eigen::Matrix2d::Identity() * (_stddev * _stddev);
 
@@ -666,8 +882,8 @@ void Ekf::LandmarkInnovation(int _landmarkIndex, double _measuredBodyX, double _
     // nonzero only in 5 columns (vehicle x/y/yaw + this landmark's own
     // x/y), so H*P only depends on the matching 5 ROWS of P (same
     // sparse-aware technique already used throughout this file, e.g.
-    // Predict()'s A = Fd*P.topRows(6), or any Correct*'s own P-update
-    // comment). This matters MORE here than in a single accepted
+    // Predict()'s A = Fd*P.topRows(6), or ApplyCorrection's own Prows
+    // extraction). This matters MORE here than in a single accepted
     // correction: LandmarkInnovation is called once PER CANDIDATE during
     // data-association search (see CorrectOrAddLandmark), so a naive
     // O(n^2) S computation costs O(n^2) PER CANDIDATE evaluated, not just
@@ -675,13 +891,6 @@ void Ekf::LandmarkInnovation(int _landmarkIndex, double _measuredBodyX, double _
     // (localization briefly cost 400-500ms per /cone_detections message
     // again, worse than before the submap fix) before this optimization
     // was added.
-    Eigen::MatrixXd Hcols(2, 5); // H's 5 nonzero columns: {0,1,2,li,li+1}
-    Hcols.col(0) = _H.col(0);
-    Hcols.col(1) = _H.col(1);
-    Hcols.col(2) = _H.col(2);
-    Hcols.col(3) = _H.col(li);
-    Hcols.col(4) = _H.col(li + 1);
-
     Eigen::MatrixXd Prows(5, n); // P's matching 5 rows
     Prows.row(0) = m_P.row(0);
     Prows.row(1) = m_P.row(1);
@@ -689,7 +898,7 @@ void Ekf::LandmarkInnovation(int _landmarkIndex, double _measuredBodyX, double _
     Prows.row(3) = m_P.row(li);
     Prows.row(4) = m_P.row(li + 1);
 
-    const Eigen::MatrixXd HP = Hcols * Prows; // 2 x n -- O(n), not O(n^2)
+    const Eigen::MatrixXd HP = _Hcols * Prows; // 2 x n -- O(n), not O(n^2)
 
     Eigen::MatrixXd HPcols(2, 5); // HP's matching 5 columns
     HPcols.col(0) = HP.col(0);
@@ -698,45 +907,72 @@ void Ekf::LandmarkInnovation(int _landmarkIndex, double _measuredBodyX, double _
     HPcols.col(3) = HP.col(li);
     HPcols.col(4) = HP.col(li + 1);
 
-    _S = HPcols * Hcols.transpose() + R; // 2x5 * 5x2 -- O(1)
+    _S = HPcols * _Hcols.transpose() + R; // 2x5 * 5x2 -- O(1)
 }
 
 void Ekf::CorrectMatchedLandmark(int _landmarkIndex, double _measuredBodyX,
                                   double _measuredBodyY, double _stddev)
 {
     Eigen::Vector2d y;
-    Eigen::Matrix2d S;
-    Eigen::MatrixXd H;
-    LandmarkInnovation(_landmarkIndex, _measuredBodyX, _measuredBodyY, _stddev, y, S, H);
+    Eigen::Matrix2d S; // unused here -- ApplyCorrection recomputes S itself
+                       // from R below; S is only needed by the search loop
+                       // in CorrectOrAddLandmark, which shares this same
+                       // LandmarkInnovation call signature.
+    Eigen::MatrixXd Hcols;
+    LandmarkInnovation(_landmarkIndex, _measuredBodyX, _measuredBodyY, _stddev, y, S, Hcols);
 
-    const Eigen::MatrixXd K = m_P * H.transpose() * S.inverse();
-
-    m_x += K * y;
-    m_x(2) = NormalizeAngle(m_x(2));
-    // P_new = P - K*(H*P), NOT (I - K*H)*P -- the latter is mathematically
-    // equivalent but forms a dense n x n (I-K*H) matrix and multiplies it
-    // by P, an O(n^3) operation Eigen has no way to avoid on its own. H
-    // only has 1-2 nonzero rows, so H*P is O(n) rows worth of work (O(n)
-    // per row = O(n) here since k<=2), and K*(H*P) is (n x k)*(k x n) =
-    // O(k*n^2) -- with k a small constant, that's O(n^2) overall, not
-    // O(n^3). At a few hundred state dimensions (a landmark-heavy SLAM
-    // map), that difference is the entire performance budget.
-    m_P = m_P - K * (H * m_P);
-    StabilizeCovariance();
+    const Eigen::Matrix2d R = Eigen::Matrix2d::Identity() * (_stddev * _stddev);
+    const int li = kVehicleStateDim + 2 * _landmarkIndex;
+    ApplyCorrection({0, 1, 2, li, li + 1}, Hcols, y, R);
 
     m_landmarkLastSeen[static_cast<size_t>(_landmarkIndex)] = ++m_tick;
 }
 
 void Ekf::AddLandmark(double _measuredBodyX, double _measuredBodyY,
-                       ConeColor _color, double _stddev)
+                       ConeColor _color, double _stddev,
+                       const LandmarkEstimate *_priorEstimate)
 {
     const int n = static_cast<int>(m_x.size());
     const double yaw = m_x(2);
     const double cosYaw = std::cos(yaw);
     const double sinYaw = std::sin(yaw);
 
-    const double lmX = m_x(0) + _measuredBodyX * cosYaw - _measuredBodyY * sinYaw;
-    const double lmY = m_x(1) + _measuredBodyX * sinYaw + _measuredBodyY * cosYaw;
+    double lmX = m_x(0) + _measuredBodyX * cosYaw - _measuredBodyY * sinYaw;
+    double lmY = m_x(1) + _measuredBodyX * sinYaw + _measuredBodyY * cosYaw;
+
+    // Reactivation: blend the fresh detection's implied position with the
+    // retired landmark's own retained estimate, inverse-variance weighted
+    // -- standard fusion of two independent Gaussian estimates of the same
+    // quantity. See this method's declaration in ekf.hpp for why this
+    // matters (jitter from reseeding purely off one fresh, noisy detection
+    // every reactivation). _stddev here is the RAW measurement noise, not
+    // yet propagated through Gx/Gz below -- close enough as the "fresh"
+    // side of this blend, since Gx's own contribution (vehicle pose
+    // uncertainty) is typically small relative to _stddev by the time a
+    // landmark has already been active once (that's exactly the regime
+    // this blend applies in).
+    //
+    // fusedVarX/Y are ALSO applied to Pll/Pcross below (not just used here
+    // for the position blend) -- blending only the position and leaving
+    // Pll at its full fresh-detection width was tried first and confirmed
+    // insufficient: the landmark's reported uncertainty still looked
+    // barely-constrained, so the very NEXT correction (matched or another
+    // reactivation) applied just as large a Kalman gain to the next noisy
+    // detection as if this were genuinely brand new, and visible jitter
+    // persisted. fusedVar is guaranteed <= min(priorVar, freshVar) (a
+    // basic property of inverse-variance weighting), so substituting it
+    // into Pll's diagonal can only ever tighten, never invalidate, the
+    // landmark's uncertainty.
+    bool hasPrior = _priorEstimate != nullptr;
+    double fusedVarX = 0.0, fusedVarY = 0.0, scaleX = 1.0, scaleY = 1.0;
+    if (hasPrior)
+    {
+        const double freshVar = _stddev * _stddev;
+        fusedVarX = 1.0 / (1.0 / _priorEstimate->varX + 1.0 / freshVar);
+        fusedVarY = 1.0 / (1.0 / _priorEstimate->varY + 1.0 / freshVar);
+        lmX = fusedVarX * (_priorEstimate->x / _priorEstimate->varX + lmX / freshVar);
+        lmY = fusedVarY * (_priorEstimate->y / _priorEstimate->varY + lmY / freshVar);
+    }
 
     // State-augmentation Jacobians: the new landmark's position is a
     // function g(vehicle_state, measurement) of the CURRENT state and the
@@ -763,9 +999,33 @@ void Ekf::AddLandmark(double _measuredBodyX, double _measuredBodyY,
     // Cross-covariance with the FULL existing state (2 x n) -- only
     // depends on the vehicle sub-block (Gx is zero elsewhere), so this is
     // O(n) via P's top 3 rows rather than a full n x n multiply.
-    const Eigen::MatrixXd Pcross = Gx * m_P.topRows(3);  // 2 x n
-    const Eigen::Matrix2d Pll =
+    Eigen::MatrixXd Pcross = Gx * m_P.topRows(3);  // 2 x n
+    Eigen::Matrix2d Pll =
         Gx * m_P.topLeftCorner(3, 3) * Gx.transpose() + Gz * R * Gz.transpose();
+
+    if (hasPrior)
+    {
+        // Scale factors < 1 (fusedVar is always <= the fresh-only
+        // variance). Off-diagonal/cross terms are scaled by
+        // sqrt(scaleX*scaleY) rather than left alone, so the correlation
+        // COEFFICIENT (cov / sqrt(varX*varY)) is exactly preserved --
+        // shrinking the diagonal while leaving covariance entries
+        // unchanged would inflate the implied correlation coefficient,
+        // potentially past the Cauchy-Schwarz bound StabilizeCovariance
+        // enforces elsewhere in this file, for no reason grounded in the
+        // actual math (the prior contributes zero cross-correlation
+        // information, so there's no basis to change the correlation
+        // STRUCTURE here, only its overall magnitude).
+        scaleX = fusedVarX / Pll(0, 0);
+        scaleY = fusedVarY / Pll(1, 1);
+        const double offDiagScale = std::sqrt(scaleX * scaleY);
+        Pll(0, 0) = fusedVarX;
+        Pll(1, 1) = fusedVarY;
+        Pll(0, 1) *= offDiagScale;
+        Pll(1, 0) *= offDiagScale;
+        Pcross.row(0) *= scaleX;
+        Pcross.row(1) *= scaleY;
+    }
 
     m_x.conservativeResize(n + 2);
     m_x(n) = lmX;
@@ -827,7 +1087,7 @@ void Ekf::RemoveActiveLandmark(size_t _index)
 
     m_x = std::move(newX);
     m_P = std::move(newP);
-    StabilizeCovariance();
+    StabilizeCovariance(kVehicleDims);
     m_landmarkColors.erase(m_landmarkColors.begin() + static_cast<long>(_index));
     m_landmarkLastSeen.erase(m_landmarkLastSeen.begin() + static_cast<long>(_index));
 }
@@ -848,9 +1108,77 @@ void Ekf::EvictStaleIfOverCapacity()
         }
 
         const int li = kVehicleStateDim + 2 * static_cast<int>(staleIndex);
-        m_retiredLandmarks.push_back(
-            LandmarkEstimate{m_x(li), m_x(li + 1), m_landmarkColors[staleIndex]});
+        m_retiredLandmarks.push_back(LandmarkEstimate{
+            m_x(li), m_x(li + 1), m_landmarkColors[staleIndex],
+            m_P(li, li), m_P(li + 1, li + 1)});
         RemoveActiveLandmark(staleIndex);
+    }
+}
+
+void Ekf::PruneStaleRetiredDuplicates()
+{
+    for (size_t r = 0; r < m_retiredLandmarks.size();)
+    {
+        bool isDuplicate = false;
+        for (size_t a = 0; a < m_landmarkColors.size(); ++a)
+        {
+            if (m_landmarkColors[a] != m_retiredLandmarks[r].color)
+            {
+                continue;
+            }
+            const int li = kVehicleStateDim + 2 * static_cast<int>(a);
+            const double dx = m_x(li) - m_retiredLandmarks[r].x;
+            const double dy = m_x(li + 1) - m_retiredLandmarks[r].y;
+            if (dx * dx + dy * dy < kDuplicatePruneRadius * kDuplicatePruneRadius)
+            {
+                isDuplicate = true;
+                break;
+            }
+        }
+        if (isDuplicate)
+        {
+            m_retiredLandmarks.erase(m_retiredLandmarks.begin() + static_cast<long>(r));
+        }
+        else
+        {
+            ++r;
+        }
+    }
+}
+
+void Ekf::PruneStaleActiveDuplicates()
+{
+    for (size_t a = 0; a < m_landmarkColors.size();)
+    {
+        bool removed = false;
+        const int liA = kVehicleStateDim + 2 * static_cast<int>(a);
+        for (size_t b = a + 1; b < m_landmarkColors.size(); ++b)
+        {
+            if (m_landmarkColors[b] != m_landmarkColors[a])
+            {
+                continue;
+            }
+            const int liB = kVehicleStateDim + 2 * static_cast<int>(b);
+            const double dx = m_x(liA) - m_x(liB);
+            const double dy = m_x(liA + 1) - m_x(liB + 1);
+            if (dx * dx + dy * dy < kDuplicatePruneRadius * kDuplicatePruneRadius)
+            {
+                // Keep whichever was seen more recently -- same recency
+                // signal EvictStaleIfOverCapacity already uses.
+                const size_t toRemove = (m_landmarkLastSeen[a] < m_landmarkLastSeen[b]) ? a : b;
+                RemoveActiveLandmark(toRemove);
+                removed = true;
+                break;
+            }
+        }
+        if (!removed)
+        {
+            ++a;
+        }
+        // If removed, re-scan from the SAME index a: RemoveActiveLandmark
+        // shifted every later index down by one, so whatever is now at
+        // position a (or, if a itself was removed, whatever slid into it)
+        // still needs to be checked against the rest of the list.
     }
 }
 

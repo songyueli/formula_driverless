@@ -89,6 +89,19 @@ constexpr double kGnssHeadingStddev = kGnssHeadingStddevDeg * M_PI / 180.0;
 // cone localization" -- this is an engineering estimate, not a spec. The
 // data-association GATE distance lives in ekf.cpp now (it's an internal
 // detail of matching against the filter's own landmark state), not here.
+//
+// Briefly raised to 0.3 while chasing what looked like landmark
+// "overconfidence" (1.3-5m discrepancies failing the Mahalanobis gate
+// against a landmark's own nearest active neighbor) -- turned out to be a
+// DIFFERENT bug: this specific simulated track has real cones spaced only
+// ~1.97m apart (confirmed directly via Gazebo's own scene service), not
+// the >=5m this codebase assumed everywhere, and PruneStaleActiveDuplicates
+// (ekf.cpp) was using a 2.0m radius that actively merged genuinely
+// DISTINCT, closely-spaced real cones -- the Mahalanobis gate was
+// correctly rejecting them as different objects the whole time. Reverted
+// back to 0.1 now that the real bug (kDuplicatePruneRadius in ekf.cpp) is
+// fixed, to test that fix in isolation rather than have two changes
+// confound each other.
 constexpr double kLandmarkStddev = 0.1;  // meters
 
 const char *ConeColorName(fsd::ConeColor _color)
@@ -226,6 +239,18 @@ int main()
         fsd::ScopedTimer timer(publishTiming);
         predictTo(StampToSeconds(_msg.header().stamp()));
         const auto enu = geo.ToEnu(_msg.latitude_deg(), _msg.longitude_deg(), _msg.altitude());
+        {
+            static int diagCalls = 0;
+            if (diagCalls % 50 == 0)
+            {
+                std::cerr << "[DIAG GnssFrontRaw] #" << diagCalls
+                           << " lat=" << _msg.latitude_deg()
+                           << " lon=" << _msg.longitude_deg()
+                           << " alt=" << _msg.altitude()
+                           << " -> east=" << enu.east << " north=" << enu.north << "\n";
+            }
+            ++diagCalls;
+        }
         ekf.CorrectGnssPosition(enu.east, enu.north, kFrontAntennaX, kFrontAntennaY,
                                  kGnssPositionStddev);
         lastFrontEnu = enu;
