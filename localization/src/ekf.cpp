@@ -30,6 +30,37 @@ constexpr double kLandmarkGateDist = 1.0;
 // makes this process more likely to fall behind and produce the large
 // Predict() dt gaps that caused the bad pose estimate in the first place.
 constexpr size_t kMaxLandmarks = 600;
+
+// A brand-new landmark's initial world position is computed directly from
+// the CURRENT vehicle pose estimate (see AddLandmark) -- if that estimate
+// is still highly uncertain (e.g. early in a run, before GNSS/heading have
+// meaningfully reduced m_P's startup value of 1e6 -- see the Ekf()
+// constructor), the landmark gets permanently seeded at an essentially
+// arbitrary position. Its associated covariance (Pll in AddLandmark)
+// correctly reflects that uncertainty, but Landmarks() -- and everything
+// downstream (/estimated_landmarks, Foxglove) -- only ever reads the POINT
+// ESTIMATE, never the covariance, so a landmark added during this window
+// renders as a confident, precise marker that can be tens of meters from
+// the real cone -- exactly the "cones far in the distance, in addition to
+// the correct ones" failure observed in practice. Worse, since the vehicle
+// pose is still drifting frame-to-frame during this same window, the SAME
+// physical cone keeps failing kLandmarkGateDist's tight 1.0m gate against
+// its own just-added (already-wrong) estimate, so this doesn't happen
+// once per cone -- it can repeat every frame for every currently-visible
+// cone until the filter converges, which is what actually produces a
+// landmark count multiples of the real cone count, not just a handful of
+// outliers.
+//
+// Gating new landmark CREATION (not matching -- an existing landmark can
+// still be corrected regardless of current vehicle uncertainty) on the
+// vehicle's own position variance being below this threshold means a
+// landmark is only ever seeded once the filter already has a reasonably
+// trustworthy fix on where the car is. 4.0 (m^2, i.e. ~2m stddev) is
+// comfortably tighter than the >=5m cone spacing this file already relies
+// on elsewhere (kLandmarkGateDist), and loose enough that any real
+// correction (GNSS, heading) converges past it well before the car would
+// plausibly already be near its first cone.
+constexpr double kMaxVehiclePosVarianceForNewLandmark = 4.0; // meters^2
 } // namespace
 
 namespace fsd
@@ -286,6 +317,16 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     if (bestIndex >= 0)
     {
         CorrectMatchedLandmark(bestIndex, _measuredBodyX, _measuredBodyY, _stddev);
+    }
+    else if (m_P(0, 0) > kMaxVehiclePosVarianceForNewLandmark ||
+             m_P(1, 1) > kMaxVehiclePosVarianceForNewLandmark)
+    {
+        // Vehicle's own position estimate isn't converged enough yet to
+        // trust seeding a brand-new landmark from it -- see
+        // kMaxVehiclePosVarianceForNewLandmark's comment. Silently drop:
+        // this detection simply gets no landmark this cycle, same as if
+        // it had no lidar match at all; it'll be tried again next cycle
+        // once (or if) the filter has converged further.
     }
     else if (m_landmarkColors.size() < kMaxLandmarks)
     {

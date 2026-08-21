@@ -149,6 +149,23 @@ constexpr double kPanoHFovRad = 1.3963; // 80 deg
 constexpr const char *kModelPath = "ml/runs/detect/train/weights/best.onnx";
 constexpr float kConfThreshold = 0.25f;
 
+// A cone straddling the panorama's own left/right edge is only partially
+// visible there (its far side is simply outside the panorama's FOV
+// entirely, not occluded by anything -- see kPanoHFovRad above), and can
+// trigger two overlapping candidate boxes that the model's own baked-in
+// NMS doesn't merge -- confirmed directly: two near-identical boxes both
+// touching x=kPanoWidth, IoU high enough that a person would call them
+// the same detection, both surviving to Detect()'s output and both
+// separately matching the same nearest lidar point (same 3D position,
+// different pixel boxes) -- exactly the kind of duplicate a downstream
+// SLAM landmark gate can't distinguish from two real nearby cones.
+// Excluding any box that touches within this margin of either edge drops
+// the ambiguous case rather than trying to de-duplicate it after the
+// fact. Debug visualization (/camera/detections/image) still draws these
+// -- this only excludes them from lidar localization/publishing, since
+// that image's whole purpose is showing YOLO's raw, unfiltered output.
+constexpr float kPanoEdgeMarginPx = 5.0f;
+
 // Matches ml/prepare_data.py's CLASSES list exactly -- same order, since
 // that's the order the model was trained to output class indices in.
 constexpr const char *kClassNames[] = {"blue", "yellow", "orange", "large_orange"};
@@ -329,8 +346,9 @@ int main()
         // Still prints every detection either way (matching the same
         // "print to confirm it's actually working" pattern as TODO 1's
         // camera-dimension print), but only LOCALIZED ones (a lidar match
-        // exists) get packed into coneMsg and published -- an unlocalized
-        // detection has no (x,y) to give downstream consumers.
+        // exists, and the box doesn't touch the panorama edge -- see
+        // kPanoEdgeMarginPx) get packed into coneMsg and published -- an
+        // unlocalized detection has no (x,y) to give downstream consumers.
         const std::vector<ConeDetector::Detection> detections = detector->Detect(stitched);
         gz::msgs::Pose_V coneMsg;
         cv::Mat annotated = stitched.clone();
@@ -344,8 +362,16 @@ int main()
             std::cout << "  cone: " << className << " conf=" << d.confidence << " bbox=["
                        << d.x1 << "," << d.y1 << "," << d.x2 << "," << d.y2 << "]";
 
-            const auto pos = lidarProjector.Localize(d.x1, d.y1, d.x2, d.y2);
-            if (pos)
+            const bool touchesPanoEdge =
+                d.x1 <= kPanoEdgeMarginPx || d.x2 >= static_cast<float>(kPanoWidth) - kPanoEdgeMarginPx;
+            const auto pos = touchesPanoEdge
+                                  ? std::nullopt
+                                  : lidarProjector.Localize(d.x1, d.y1, d.x2, d.y2);
+            if (touchesPanoEdge)
+            {
+                std::cout << " pos=none (touches panorama edge, excluded)";
+            }
+            else if (pos)
             {
                 std::cout << " pos=(" << pos->x << "," << pos->y << "," << pos->z
                            << ") range=" << pos->range << "m";
