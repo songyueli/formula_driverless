@@ -502,7 +502,44 @@ void Ekf::LandmarkInnovation(int _landmarkIndex, double _measuredBodyX, double _
     _H(1, li + 1) = cosYaw;
 
     const Eigen::Matrix2d R = Eigen::Matrix2d::Identity() * (_stddev * _stddev);
-    _S = _H * m_P * _H.transpose() + R;
+
+    // S = H*P*H^T + R, WITHOUT a naive dense 2xn * nxn multiply -- H is
+    // nonzero only in 5 columns (vehicle x/y/yaw + this landmark's own
+    // x/y), so H*P only depends on the matching 5 ROWS of P (same
+    // sparse-aware technique already used throughout this file, e.g.
+    // Predict()'s A = Fd*P.topRows(6), or any Correct*'s own P-update
+    // comment). This matters MORE here than in a single accepted
+    // correction: LandmarkInnovation is called once PER CANDIDATE during
+    // data-association search (see CorrectOrAddLandmark), so a naive
+    // O(n^2) S computation costs O(n^2) PER CANDIDATE evaluated, not just
+    // once -- confirmed directly as a real regression during testing
+    // (localization briefly cost 400-500ms per /cone_detections message
+    // again, worse than before the submap fix) before this optimization
+    // was added.
+    Eigen::MatrixXd Hcols(2, 5); // H's 5 nonzero columns: {0,1,2,li,li+1}
+    Hcols.col(0) = _H.col(0);
+    Hcols.col(1) = _H.col(1);
+    Hcols.col(2) = _H.col(2);
+    Hcols.col(3) = _H.col(li);
+    Hcols.col(4) = _H.col(li + 1);
+
+    Eigen::MatrixXd Prows(5, n); // P's matching 5 rows
+    Prows.row(0) = m_P.row(0);
+    Prows.row(1) = m_P.row(1);
+    Prows.row(2) = m_P.row(2);
+    Prows.row(3) = m_P.row(li);
+    Prows.row(4) = m_P.row(li + 1);
+
+    const Eigen::MatrixXd HP = Hcols * Prows; // 2 x n -- O(n), not O(n^2)
+
+    Eigen::MatrixXd HPcols(2, 5); // HP's matching 5 columns
+    HPcols.col(0) = HP.col(0);
+    HPcols.col(1) = HP.col(1);
+    HPcols.col(2) = HP.col(2);
+    HPcols.col(3) = HP.col(li);
+    HPcols.col(4) = HP.col(li + 1);
+
+    _S = HPcols * Hcols.transpose() + R; // 2x5 * 5x2 -- O(1)
 }
 
 void Ekf::CorrectMatchedLandmark(int _landmarkIndex, double _measuredBodyX,
