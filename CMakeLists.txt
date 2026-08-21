@@ -82,6 +82,31 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(onnxruntime)
 
 # ---------------------------------------------------------------------------
+# TensorRT -- Jetson-only, used by perception for GPU cone-detection
+# inference (see cone_detector_trt.hpp). Installed via apt as part of
+# JetPack (libnvinfer-dev etc.), unlike Foxglove/ONNX Runtime above -- it's
+# already a proper system package with headers/libs in the normal search
+# paths, so find_path/find_library is enough, no FetchContent needed.
+# Absent entirely on the Mac/x86 dev machine (no NVIDIA GPU there), so this
+# whole block is optional: PERCEPTION_USE_TENSORRT only gets defined, and
+# cone_detector_trt.cpp only gets compiled in, when TensorRT is actually
+# found -- the x86 dev build keeps using ConeDetector (ONNX Runtime, CPU)
+# unchanged.
+# ---------------------------------------------------------------------------
+set(PERCEPTION_USE_TENSORRT FALSE)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  find_path(TENSORRT_INCLUDE_DIR NvInfer.h)
+  find_library(TENSORRT_NVINFER_LIB nvinfer)
+  find_library(TENSORRT_NVINFER_PLUGIN_LIB nvinfer_plugin)
+  if(TENSORRT_INCLUDE_DIR AND TENSORRT_NVINFER_LIB AND TENSORRT_NVINFER_PLUGIN_LIB)
+    set(PERCEPTION_USE_TENSORRT TRUE)
+    find_package(CUDAToolkit REQUIRED)
+  else()
+    message(WARNING "TensorRT not found on this aarch64 host -- perception will fall back to ONNX Runtime (CPU)")
+  endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Eigen -- header-only, used by localization for the EKF's matrix math
 # (state covariance propagation, Kalman gain). Fetched via Populate (not
 # MakeAvailable) deliberately: Eigen's own CMakeLists.txt configures a full
@@ -124,6 +149,16 @@ target_link_libraries(perception
     ${onnxruntime_SOURCE_DIR}/lib/libonnxruntime.so)
 set_target_properties(perception PROPERTIES
     BUILD_RPATH "${onnxruntime_SOURCE_DIR}/lib")
+
+if(PERCEPTION_USE_TENSORRT)
+  target_sources(perception PRIVATE perception/src/cone_detector_trt.cpp)
+  target_include_directories(perception PRIVATE ${TENSORRT_INCLUDE_DIR})
+  target_link_libraries(perception
+      ${TENSORRT_NVINFER_LIB}
+      ${TENSORRT_NVINFER_PLUGIN_LIB}
+      CUDA::cudart)
+  target_compile_definitions(perception PRIVATE PERCEPTION_USE_TENSORRT)
+endif()
 
 add_executable(localization
     localization/src/localization.cpp

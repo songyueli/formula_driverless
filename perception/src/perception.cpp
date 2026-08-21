@@ -11,6 +11,9 @@
 #include <common/types.hpp>
 #include "camera_stitcher.hpp"
 #include "cone_detector.hpp"
+#ifdef PERCEPTION_USE_TENSORRT
+#include "cone_detector_trt.hpp"
+#endif
 #include "lidar_projector.hpp"
 
 #include <cmath>
@@ -142,11 +145,29 @@ constexpr double kPanoHFovRad = 1.3963; // 80 deg
 // train.py anchors its `project` default to its own file location (see
 // ml/train.py's DEFAULT_PROJECT), so training always writes here regardless
 // of which directory the training command itself was invoked from. Not
-// tracked in git (see .gitignore's ml/runs/* carve-out, which keeps only
-// the weights/best.pt checkpoint via LFS -- not this .onnx export), so this
-// only exists on whichever machine actually ran training and exported the
-// model -- doesn't need to, and isn't meant to, exist in a fresh clone.
+// tracked in git (see .gitignore's ml/runs/ ignore -- nothing under there
+// is tracked at all now), so this only exists on whichever machine
+// actually ran training/exported the model -- doesn't need to, and isn't
+// meant to, exist in a fresh clone.
+//
+// Two backends, selected at COMPILE time (see CMakeLists.txt's
+// PERCEPTION_USE_TENSORRT block): TensorRT (GPU) when available -- Jetson
+// builds only, since that's the only place TensorRT actually gets found --
+// falling back to ConeDetector (ONNX Runtime, CPU) everywhere else (the
+// Mac/x86 dev machine has no NVIDIA GPU at all). Same pattern as
+// control.cpp's ActiveController/planning.cpp's kActive* function
+// pointers: one line picks the implementation, nothing downstream needs
+// to know or care which one is active. best.engine is NOT interchangeable
+// with best.onnx -- it's tied to the exact GPU + TensorRT version it was
+// built on (see cone_detector_trt.hpp), and has to be rebuilt via trtexec
+// any time best.onnx changes.
+#ifdef PERCEPTION_USE_TENSORRT
+using ActiveDetector = ConeDetectorTrt;
+constexpr const char *kModelPath = "ml/runs/detect/train/weights/best.engine";
+#else
+using ActiveDetector = ConeDetector;
 constexpr const char *kModelPath = "ml/runs/detect/train/weights/best.onnx";
+#endif
 constexpr float kConfThreshold = 0.25f;
 
 // A cone straddling the panorama's own left/right edge is only partially
@@ -254,19 +275,26 @@ int main()
     LidarProjector lidarProjector(kPanoWidth, kPanoHeight, fPano);
 
     // kModelPath is git-ignored (see .gitignore) and only exists on a
-    // machine that's actually run training -- fail with a clear, actionable
-    // message rather than letting ONNX Runtime's own (much less obvious)
-    // exception surface if it's missing on this checkout.
-    std::unique_ptr<ConeDetector> detector;
+    // machine that's actually run training (or, for the TensorRT .engine
+    // path, also run trtexec against that machine's own best.onnx) -- fail
+    // with a clear, actionable message rather than letting the underlying
+    // ONNX Runtime/TensorRT exception surface if it's missing.
+    std::unique_ptr<ActiveDetector> detector;
     try
     {
-        detector = std::make_unique<ConeDetector>(kModelPath, kConfThreshold);
+        detector = std::make_unique<ActiveDetector>(kModelPath, kConfThreshold);
     }
     catch (const std::exception &e)
     {
         std::cerr << "Failed to load cone detection model at '" << kModelPath << "': " << e.what()
+#ifdef PERCEPTION_USE_TENSORRT
+                   << "\nDid you build an engine for THIS model with trtexec? (see"
+                      " cone_detector_trt.hpp -- a .engine from a different best.onnx or a"
+                      " different TensorRT version won't load.)\n";
+#else
                    << "\nDid you run training (ml/train.py) on this machine, or copy the .onnx"
                       " file over from one that did?\n";
+#endif
         return 1;
     }
 
@@ -349,7 +377,11 @@ int main()
         // exists, and the box doesn't touch the panorama edge -- see
         // kPanoEdgeMarginPx) get packed into coneMsg and published -- an
         // unlocalized detection has no (x,y) to give downstream consumers.
-        const std::vector<ConeDetector::Detection> detections = detector->Detect(stitched);
+        // ActiveDetector::Detection, whichever backend is active -- ConeDetector
+        // and ConeDetectorTrt have structurally-identical but DISTINCT Detection
+        // types (no shared base), so this must deduce via auto rather than
+        // naming either one explicitly.
+        const auto detections = detector->Detect(stitched);
         gz::msgs::Pose_V coneMsg;
         cv::Mat annotated = stitched.clone();
         for (const auto &d : detections)
