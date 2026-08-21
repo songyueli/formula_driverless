@@ -167,6 +167,48 @@ void Ekf::Predict(double _dt)
     newP(4, 4) += kVelNoiseDensity * _dt;
     newP(5, 5) += kYawRateNoiseDensity * _dt;
 
+    // Small, unconditional process noise directly on position/yaw --
+    // verified directly as a real, observed failure mode, not a
+    // theoretical concern: with a full track's worth of landmarks
+    // tracked, /cone_detections can drive hundreds of
+    // CorrectMatchedLandmark() calls per second (many cones visible per
+    // frame, at camera rate), each one using a deliberately tight
+    // kLandmarkStddev (see localization.cpp) and each one shrinking P via
+    // the SAME vehicle-pose columns of H every time. Position/yaw's ONLY
+    // other source of uncertainty growth is inherited through F above
+    // (itself driven by velocity uncertainty, which is under the exact
+    // same pressure from ground-speed/IMU corrections) -- with nothing
+    // added here directly, that many tightly-trusted corrections per
+    // second can crush P's vehicle-pose block toward numerical zero
+    // faster than F*P*F^T can rebuild it. Once that happens, the Kalman
+    // gain for EVERY future correction -- including GNSS -- collapses
+    // toward zero too (gain is proportional to P), so the filter stops
+    // responding to new measurements at all and the estimate freezes in
+    // place. Confirmed directly: /estimated_pose moved by ~3mm over
+    // several seconds of active driving.
+    //
+    // This is an UNCONDITIONAL addition (matching kVelNoiseDensity/
+    // kYawRateNoiseDensity above), not a clamp -- clamping a diagonal
+    // entry directly (newP(0,0) = floor) would leave its off-diagonal
+    // correlations with every other state dimension (velocity, yaw, every
+    // tracked landmark) inconsistent with the new diagonal value, which
+    // can break P's positive-semi-definiteness and cause worse downstream
+    // numerical failures (e.g. in a later correction's S.inverse()) than
+    // the freeze this is fixing. Adding a small PSD (diagonal,
+    // non-negative) matrix to a PSD matrix is always safe.
+    //
+    // 0.01 (m^2/s, i.e. sqrt(0.01)=0.1m of stddev growth per second of
+    // Predict() calls, however finely divided) is sized to roughly match
+    // kLandmarkStddev's own scale (0.1m) -- enough to give even the most
+    // aggressive plausible correction rate something to work against, not
+    // so much that it becomes the dominant source of position uncertainty
+    // under normal (non-pathological) operation.
+    constexpr double kPosNoiseDensity = 0.01;   // meters^2 per second
+    constexpr double kYawNoiseDensity = 0.0001; // radians^2 per second
+    newP(0, 0) += kPosNoiseDensity * _dt;
+    newP(1, 1) += kPosNoiseDensity * _dt;
+    newP(2, 2) += kYawNoiseDensity * _dt;
+
     m_P = std::move(newP);
 }
 
