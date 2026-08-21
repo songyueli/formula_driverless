@@ -97,11 +97,12 @@ public:
     void CorrectHeading(double _measuredYaw, double _stddev);
 
     // A cone detection in the vehicle's own body frame, from
-    // /cone_detections. Internally: try to match it (Euclidean-gated, see
-    // kLandmarkGateDist in ekf.cpp) against an existing SAME-COLOR ACTIVE
-    // landmark; if found, apply a joint vehicle+landmark correction (both
-    // get updated, see the class comment above). If not, try the same
-    // gate against RETIRED landmarks -- a match there means the car is
+    // /cone_detections. Internally: try to match it (Mahalanobis-gated,
+    // see kLandmarkGateChiSq in ekf.cpp) against an existing SAME-COLOR
+    // ACTIVE landmark; if found, apply a joint vehicle+landmark correction
+    // (both get updated, see the class comment above). If not, try a
+    // (necessarily approximate, see the retired-matching code) gate
+    // against RETIRED landmarks -- a match there means the car is
     // revisiting a landmark it previously evicted from the active state,
     // so it's reactivated (added back into the joint state fresh, from
     // this detection). Only if neither matches is it truly new -- added
@@ -125,6 +126,17 @@ public:
     std::vector<LandmarkEstimate> Landmarks() const;
 
 private:
+    // The measurement Jacobian H, innovation y = z - h(x), and innovation
+    // covariance S = H*P*H^T + R for a given EXISTING landmark against a
+    // fresh detection -- shared by CorrectMatchedLandmark (which needs all
+    // three to actually apply the correction) and CorrectOrAddLandmark's
+    // active-landmark search loop (which only needs y/S to compute a
+    // Mahalanobis distance for gating). Factored out specifically because
+    // this Jacobian is fiddly enough that duplicating it in two places
+    // would be a real correctness risk if they ever drifted out of sync.
+    void LandmarkInnovation(int _landmarkIndex, double _measuredBodyX, double _measuredBodyY,
+                             double _stddev, Eigen::Vector2d &_y, Eigen::Matrix2d &_S,
+                             Eigen::MatrixXd &_H) const;
     void CorrectMatchedLandmark(int _landmarkIndex, double _measuredBodyX,
                                  double _measuredBodyY, double _stddev);
     void AddLandmark(double _measuredBodyX, double _measuredBodyY,

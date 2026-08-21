@@ -11,13 +11,25 @@ double NormalizeAngle(double _angle)
     return _angle;
 }
 
-// Euclidean data-association gate, in meters. A tighter Mahalanobis-
-// distance gate (using each landmark's own growing/shrinking uncertainty
-// rather than a fixed radius) would be the natural refinement, but track
-// cones are spaced >=5m apart (Formula Student rules) and this is well
-// under half that, so it isn't the limiting factor for a first
-// implementation.
-constexpr double kLandmarkGateDist = 1.0;
+// Mahalanobis-distance data-association gate (chi-squared threshold, 2
+// DOF), replacing an earlier fixed 1.0m Euclidean gate. The fixed-radius
+// version broke down once the vehicle pose could actively drift (verified
+// directly in practice): a real cone's PREDICTED body-frame position
+// moves as the pose estimate drifts, so a fixed radius eventually rejects
+// a legitimate re-observation, which then gets (wrongly) added as a brand
+// new landmark -- exactly what kept driving the landmark count to its
+// cap even after fixing the earlier, more acute bugs. Mahalanobis
+// distance divides the discrepancy by the innovation covariance S =
+// H*P*H^T + R -- the filter's own ACTUAL uncertainty about where this
+// landmark should appear right now -- so the effective gate automatically
+// widens when the filter is less sure of itself and tightens when it's
+// confident, rather than using one fixed number regardless of context.
+// This is standard EKF-SLAM data association (individual-compatibility
+// nearest neighbor); 5.99 is the standard 95%-confidence chi-squared
+// critical value for 2 degrees of freedom (closed form for chi-squared at
+// k=2: CDF(x) = 1 - e^(-x/2), solving 1-e^(-x/2)=0.95 gives
+// x = -2*ln(0.05) = 5.99).
+constexpr double kLandmarkGateChiSq = 5.99;
 
 // Sanity cap on total DISCOVERED landmarks (active + retired combined --
 // see the class comment's "Submap / local correlation" section). The
@@ -57,20 +69,20 @@ constexpr size_t kMaxActiveLandmarks = 80;
 // the real cone -- exactly the "cones far in the distance, in addition to
 // the correct ones" failure observed in practice. Worse, since the vehicle
 // pose is still drifting frame-to-frame during this same window, the SAME
-// physical cone keeps failing kLandmarkGateDist's tight 1.0m gate against
-// its own just-added (already-wrong) estimate, so this doesn't happen
-// once per cone -- it can repeat every frame for every currently-visible
-// cone until the filter converges, which is what actually produces a
-// landmark count multiples of the real cone count, not just a handful of
-// outliers.
+// physical cone keeps failing the data-association gate (see
+// kLandmarkGateChiSq above) against its own just-added (already-wrong)
+// estimate, so this doesn't happen once per cone -- it can repeat every
+// frame for every currently-visible cone until the filter converges,
+// which is what actually produces a landmark count multiples of the real
+// cone count, not just a handful of outliers.
 //
 // Gating new landmark CREATION (not matching -- an existing landmark can
 // still be corrected regardless of current vehicle uncertainty) on the
 // vehicle's own position variance being below this threshold means a
 // landmark is only ever seeded once the filter already has a reasonably
 // trustworthy fix on where the car is. 4.0 (m^2, i.e. ~2m stddev) is
-// comfortably tighter than the >=5m cone spacing this file already relies
-// on elsewhere (kLandmarkGateDist), and loose enough that any real
+// comfortably tighter than the >=5m cone spacing (Formula Student rules)
+// this file already relies on elsewhere, and loose enough that any real
 // correction (GNSS, heading) converges past it well before the car would
 // plausibly already be near its first cone.
 constexpr double kMaxVehiclePosVarianceForNewLandmark = 4.0; // meters^2
@@ -350,22 +362,29 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     const double worldX = m_x(0) + _measuredBodyX * cosYaw - _measuredBodyY * sinYaw;
     const double worldY = m_x(1) + _measuredBodyX * sinYaw + _measuredBodyY * cosYaw;
 
-    // 1. Try to match against an ACTIVE (in the joint state) landmark.
+    // 1. Try to match against an ACTIVE (in the joint state) landmark, by
+    // Mahalanobis distance -- see kLandmarkGateChiSq's comment for why a
+    // fixed Euclidean radius isn't enough once the pose can drift. Note
+    // this costs O(n) PER CANDIDATE now (LandmarkInnovation forms a 2xn H
+    // and multiplies it through P), not the O(1) a plain coordinate
+    // difference was -- acceptable because kMaxActiveLandmarks already
+    // bounds both n and the candidate count to something small.
     int bestIndex = -1;
-    double bestDistSq = kLandmarkGateDist * kLandmarkGateDist;
+    double bestMahalanobisSq = kLandmarkGateChiSq;
     for (size_t i = 0; i < m_landmarkColors.size(); ++i)
     {
         if (m_landmarkColors[i] != _color)
         {
             continue;
         }
-        const int li = kVehicleStateDim + 2 * static_cast<int>(i);
-        const double dx = m_x(li) - worldX;
-        const double dy = m_x(li + 1) - worldY;
-        const double distSq = dx * dx + dy * dy;
-        if (distSq < bestDistSq)
+        Eigen::Vector2d y;
+        Eigen::Matrix2d S;
+        Eigen::MatrixXd H;
+        LandmarkInnovation(static_cast<int>(i), _measuredBodyX, _measuredBodyY, _stddev, y, S, H);
+        const double mahalanobisSq = y.transpose() * S.inverse() * y;
+        if (mahalanobisSq < bestMahalanobisSq)
         {
-            bestDistSq = distSq;
+            bestMahalanobisSq = mahalanobisSq;
             bestIndex = static_cast<int>(i);
         }
     }
@@ -377,16 +396,27 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
         return;
     }
 
-    // 2. No active match -- check RETIRED landmarks (same gate). A match
-    // here means the car is revisiting a landmark it previously evicted
-    // from the active state (see the class comment). Reactivate it by
-    // dropping it from m_retiredLandmarks and falling through to the
-    // "add" path below, using THIS detection -- simpler and safer than
-    // inventing a second, seeded-from-the-retired-estimate covariance
-    // construction; AddLandmark's existing Jacobian-based augmentation
-    // already correctly handles "new landmark from a fresh detection",
-    // and reusing it here means there's only one place that math needs
-    // to be right.
+    // 2. No active match -- check RETIRED landmarks. A match here means
+    // the car is revisiting a landmark it previously evicted from the
+    // active state (see the class comment). Reactivate it by dropping it
+    // from m_retiredLandmarks and falling through to the "add" path
+    // below, using THIS detection -- simpler and safer than inventing a
+    // second, seeded-from-the-retired-estimate covariance construction;
+    // AddLandmark's existing Jacobian-based augmentation already
+    // correctly handles "new landmark from a fresh detection", and
+    // reusing it here means there's only one place that math needs to be
+    // right.
+    //
+    // A retired landmark has no tracked covariance to build a proper
+    // Mahalanobis distance from (see the class comment -- that's the
+    // whole point of retiring it). Approximated here using the vehicle's
+    // OWN current position variance as the dominant source of "how far
+    // off could this legitimately be" (a diagonal approximation: no
+    // cross-correlation term, since none is available post-retirement),
+    // plus the measurement variance as a floor so this doesn't become
+    // unreasonably tight right after a landmark has just converged the
+    // filter to a very small P. Compared against the same chi-squared
+    // threshold as the active gate for consistency.
     for (size_t i = 0; i < m_retiredLandmarks.size(); ++i)
     {
         if (m_retiredLandmarks[i].color != _color)
@@ -395,7 +425,10 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
         }
         const double dx = m_retiredLandmarks[i].x - worldX;
         const double dy = m_retiredLandmarks[i].y - worldY;
-        if (dx * dx + dy * dy < kLandmarkGateDist * kLandmarkGateDist)
+        const double approxMahalanobisSq =
+            (dx * dx) / (m_P(0, 0) + _stddev * _stddev) +
+            (dy * dy) / (m_P(1, 1) + _stddev * _stddev);
+        if (approxMahalanobisSq < kLandmarkGateChiSq)
         {
             m_retiredLandmarks.erase(m_retiredLandmarks.begin() + static_cast<long>(i));
             break;
@@ -426,8 +459,9 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     EvictStaleIfOverCapacity();
 }
 
-void Ekf::CorrectMatchedLandmark(int _landmarkIndex, double _measuredBodyX,
-                                  double _measuredBodyY, double _stddev)
+void Ekf::LandmarkInnovation(int _landmarkIndex, double _measuredBodyX, double _measuredBodyY,
+                              double _stddev, Eigen::Vector2d &_y, Eigen::Matrix2d &_S,
+                              Eigen::MatrixXd &_H) const
 {
     const int n = static_cast<int>(m_x.size());
     const int li = kVehicleStateDim + 2 * _landmarkIndex;
@@ -447,29 +481,38 @@ void Ekf::CorrectMatchedLandmark(int _landmarkIndex, double _measuredBodyX,
 
     const Eigen::Vector2d z(_measuredBodyX, _measuredBodyY);
     const Eigen::Vector2d h(bodyXPred, bodyYPred);
-    const Eigen::Vector2d y = z - h;
+    _y = z - h;
 
-    Eigen::MatrixXd H = Eigen::MatrixXd::Zero(2, n);
+    _H = Eigen::MatrixXd::Zero(2, n);
     // w.r.t. vehicle x, y, yaw (same form as the pre-SLAM landmark
     // correction, since h()'s dependence on the vehicle sub-state is
     // unchanged).
-    H(0, 0) = -cosYaw;
-    H(0, 1) = -sinYaw;
-    H(0, 2) = bodyYPred;
-    H(1, 0) = sinYaw;
-    H(1, 1) = -cosYaw;
-    H(1, 2) = -bodyXPred;
+    _H(0, 0) = -cosYaw;
+    _H(0, 1) = -sinYaw;
+    _H(0, 2) = bodyYPred;
+    _H(1, 0) = sinYaw;
+    _H(1, 1) = -cosYaw;
+    _H(1, 2) = -bodyXPred;
     // w.r.t. the matched landmark's own (x, y) state -- NEW vs. the
     // pre-SLAM version, since the landmark is now part of the state being
     // differentiated against, not a constant.
-    H(0, li) = cosYaw;
-    H(0, li + 1) = sinYaw;
-    H(1, li) = -sinYaw;
-    H(1, li + 1) = cosYaw;
+    _H(0, li) = cosYaw;
+    _H(0, li + 1) = sinYaw;
+    _H(1, li) = -sinYaw;
+    _H(1, li + 1) = cosYaw;
 
     const Eigen::Matrix2d R = Eigen::Matrix2d::Identity() * (_stddev * _stddev);
+    _S = _H * m_P * _H.transpose() + R;
+}
 
-    const Eigen::Matrix2d S = H * m_P * H.transpose() + R;
+void Ekf::CorrectMatchedLandmark(int _landmarkIndex, double _measuredBodyX,
+                                  double _measuredBodyY, double _stddev)
+{
+    Eigen::Vector2d y;
+    Eigen::Matrix2d S;
+    Eigen::MatrixXd H;
+    LandmarkInnovation(_landmarkIndex, _measuredBodyX, _measuredBodyY, _stddev, y, S, H);
+
     const Eigen::MatrixXd K = m_P * H.transpose() * S.inverse();
 
     m_x += K * y;
