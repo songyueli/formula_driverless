@@ -137,7 +137,12 @@ target_link_libraries(localization
     gz-transport::gz-transport
     gz-msgs::gz-msgs)
 
-add_executable(planning      planning/src/planning.cpp)
+add_executable(planning
+    planning/src/planning.cpp
+    planning/src/track_boundaries.cpp
+    planning/src/path_generator.cpp)
+target_include_directories(planning PRIVATE
+    planning/include)
 target_link_libraries(planning
     gz-transport::gz-transport
     gz-msgs::gz-msgs)

@@ -1,5 +1,3 @@
-#include <algorithm>
-#include <cmath>
 #include <functional>
 #include <iostream>
 #include <vector>
@@ -11,6 +9,9 @@
 
 #include <common/scoped_timer.hpp>
 #include <common/types.hpp>
+
+#include "path_generator.hpp"
+#include "track_boundaries.hpp"
 
 // Path planning process
 // ----------------------
@@ -37,30 +38,23 @@
 //                       orientation -- pure pursuit only needs a target
 //                       point, see control.cpp)
 //
-// Algorithm:
-//   1. Split detections into blue (left boundary) / yellow (right boundary)
-//      -- orange/large_orange are start/finish markers, not boundary cones,
-//      and aren't used here.
-//   2. For each blue cone, pair with its nearest yellow cone and take the
-//      midpoint as a candidate waypoint, skipping pairs farther apart than
-//      kMaxPairDistance -- real track width is >=3m (Formula Student
-//      rules), so a much larger nearest-neighbor gap means there's no real
-//      boundary cone visible on the other side, not a wide track.
-//   3. Sort by body-frame x (forward distance) so control gets an ordered,
-//      nearest-first path.
-//
-// TODO: spline-smooth the path (currently raw midpoints, which can zigzag
-// with cone-spacing irregularities) before handing it to control.
+// Pipeline: split into two independently swappable stages (see
+// track_boundaries.hpp / path_generator.hpp) --
+//   1. Boundary extraction: raw classified cones -> left/right track
+//      boundaries. Default: ColorSplitBoundaries (trusts perception's
+//      color classification directly).
+//   2. Path generation: boundaries -> ordered path. Default:
+//      NearestPairMidpointPath (nearest cross-boundary pairing +
+//      midpoint).
+// kActiveBoundaryExtractor/kActivePathGenerator below are the one line
+// each to change to try a different algorithm for either stage
+// independently -- e.g. a Delaunay-triangulation-based extractor or path
+// generator (see the FUTURE EXTENSION POINT comments in those headers).
 
 namespace
 {
-struct Cone
-{
-    double x;
-    double y;
-};
-
-constexpr double kMaxPairDistance = 8.0;  // meters -- see algorithm note above
+const fsd::BoundaryExtractorFn kActiveBoundaryExtractor = fsd::ColorSplitBoundaries;
+const fsd::PathGeneratorFn kActivePathGenerator = fsd::NearestPairMidpointPath;
 }  // namespace
 
 int main()
@@ -72,7 +66,7 @@ int main()
     // Per-cycle compute time (microseconds) -- currently trivial nearest-
     // neighbor pairing, but wrapping the whole callback body (rather than
     // hand-picking which lines to time) means this keeps working unchanged
-    // if this algorithm later grows into something heavier.
+    // if either pluggable stage later grows into something heavier.
     auto timingPub = node.Advertise<gz::msgs::UInt64>("/timing/planning");
 
     std::function<void(const gz::msgs::Pose_V &)> onConeDetections =
@@ -85,45 +79,15 @@ int main()
             timingPub.Publish(msg);
         });
 
-        std::vector<Cone> blue, yellow;
+        std::vector<fsd::ClassifiedCone> cones;
+        cones.reserve(static_cast<size_t>(_msg.pose_size()));
         for (const auto &pose : _msg.pose())
         {
-            const Cone cone{pose.position().x(), pose.position().y()};
-            if (pose.name() == "blue")
-            {
-                blue.push_back(cone);
-            }
-            else if (pose.name() == "yellow")
-            {
-                yellow.push_back(cone);
-            }
+            cones.push_back(fsd::ClassifiedCone{pose.position().x(), pose.position().y(), pose.name()});
         }
 
-        std::vector<Cone> waypoints;
-        waypoints.reserve(blue.size());
-        for (const auto &b : blue)
-        {
-            const Cone *nearest = nullptr;
-            double bestDistSq = kMaxPairDistance * kMaxPairDistance;
-            for (const auto &y : yellow)
-            {
-                const double dx = y.x - b.x;
-                const double dy = y.y - b.y;
-                const double distSq = dx * dx + dy * dy;
-                if (distSq < bestDistSq)
-                {
-                    bestDistSq = distSq;
-                    nearest = &y;
-                }
-            }
-            if (nearest)
-            {
-                waypoints.push_back(Cone{(b.x + nearest->x) / 2.0, (b.y + nearest->y) / 2.0});
-            }
-        }
-
-        std::sort(waypoints.begin(), waypoints.end(),
-                  [](const Cone &a, const Cone &c) { return a.x < c.x; });
+        const fsd::TrackBoundaries boundaries = kActiveBoundaryExtractor(cones);
+        const std::vector<fsd::PathPoint> waypoints = kActivePathGenerator(boundaries);
 
         gz::msgs::Pose_V pathMsg;
         for (const auto &wp : waypoints)
