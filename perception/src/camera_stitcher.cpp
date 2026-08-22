@@ -86,6 +86,13 @@ CameraStitcher::CameraStitcher(int camWidth, int camHeight, double camHFovRad,
     m_sources.resize(cameras.size());
 #endif
     std::vector<cv::Mat> weights(cameras.size()); // temporary -- only used to pick m_owner below
+    // Full-panorama-sized per-camera maps, kept around only long enough to
+    // (a) pick m_owner and (b) crop down to each camera's own bounding rect
+    // below -- see this class's header comment for why cropping matters
+    // (avoids 3x redundant remap/copy work). Not stored as class members:
+    // once cropped into m_vpiSources[i]/m_sources[i], the full-size version
+    // has no further use.
+    std::vector<cv::Mat> fullMapXs(cameras.size()), fullMapYs(cameras.size());
 
     for (size_t i = 0; i < cameras.size(); ++i)
     {
@@ -154,77 +161,8 @@ CameraStitcher::CameraStitcher(int camWidth, int camHeight, double camHFovRad,
             }
         }
 
-#ifdef PERCEPTION_USE_VPI
-        // Bake mapX/mapY into a dense VPIWarpMap -- one control point per
-        // OUTPUT pixel (horizInterval/vertInterval = 1), matching the CPU
-        // path's per-pixel accuracy exactly rather than trading it for a
-        // coarser, VPI-interpolated grid. (0,0) sentinel-free: mapX/mapY's
-        // own -1 default (see above, "outside this camera's frame") is
-        // passed straight through as the keypoint coordinate -- VPI_BORDER_
-        // ZERO (see Stitch() below) treats any keypoint outside the source
-        // image as zero, same as cv::remap's BORDER_CONSTANT does today,
-        // so this preserves the exact same "black where this camera has no
-        // coverage" behavior with no extra sentinel handling needed here.
-        VPIWarpMap warpMap = {};
-        warpMap.grid.numHorizRegions = 1;
-        warpMap.grid.numVertRegions = 1;
-        warpMap.grid.regionWidth[0] = static_cast<int16_t>(outWidth);
-        warpMap.grid.regionHeight[0] = static_cast<int16_t>(outHeight);
-        warpMap.grid.horizInterval[0] = 1;
-        warpMap.grid.vertInterval[0] = 1;
-        CheckVpiStatus(vpiWarpMapAllocData(&warpMap), "vpiWarpMapAllocData");
-
-        // BUG FIX: this used to loop v/u up to warpMap.numVertPoints/
-        // numHorizPoints -- confirmed via a live crash (SIGSEGV inside this
-        // loop, caught with gdb) that those are NOT equal to outHeight/
-        // outWidth: vpiWarpMapAllocData pads the control-point grid up to a
-        // multiple of 16 internally (confirmed directly in the crashing
-        // process: numHorizPoints=2432 vs the real outWidth=2427,
-        // numVertPoints=1136 vs outHeight=1130), so iterating to those
-        // padded bounds read mapX/mapY (sized exactly outHeight x outWidth)
-        // out of bounds. pitchBytes IS still respected exactly for the
-        // WRITE side (row stride into warpMap.keypoints, which VPI sized
-        // generously enough to cover the padded width) -- only the loop
-        // bounds themselves needed to be outHeight/outWidth, matching what
-        // mapX/mapY actually contain. Any padding rows/columns VPI
-        // allocated beyond outHeight/outWidth are simply left untouched --
-        // Remap's own output is defined by regionWidth[0]/regionHeight[0]
-        // (outWidth/outHeight, see the grid setup above), so that padding
-        // is purely an internal alignment detail, never mapped to a real
-        // output pixel.
-        for (int v = 0; v < outHeight; ++v)
-        {
-            VPIKeypointF32 *row = reinterpret_cast<VPIKeypointF32 *>(
-                reinterpret_cast<uint8_t *>(warpMap.keypoints) + v * warpMap.pitchBytes);
-            for (int u = 0; u < outWidth; ++u)
-            {
-                row[u] = VPIKeypointF32{mapX.at<float>(v, u), mapY.at<float>(v, u)};
-            }
-        }
-
-        CameraStitcher::VpiSourceCam &src = m_vpiSources[i];
-        CheckVpiStatus(vpiCreateRemap(VPI_BACKEND_CUDA, &warpMap, &src.remapPayload), "vpiCreateRemap");
-        vpiWarpMapFreeData(&warpMap); // payload has what it needs now -- see the fisheye sample's same pattern
-
-        // Input wrapper seeded with a throwaway same-size/type Mat just to
-        // establish format/dimensions -- Stitch() repoints it at the real
-        // per-frame image via vpiImageSetWrappedOpenCVMat every call.
-        cv::Mat placeholder(camHeight, camWidth, CV_8UC3, cv::Scalar(0, 0, 0));
-        CheckVpiStatus(
-            vpiImageCreateWrapperOpenCVMat(placeholder, VPI_IMAGE_FORMAT_RGB8, 0, &src.inputWrapper),
-            "vpiImageCreateWrapperOpenCVMat (input)");
-
-        // Output buffer is OWNED here (unlike the input) and wrapped once
-        // -- VPI writes directly into this cv::Mat's own backing memory on
-        // every vpiSubmitRemap, so Stitch() reads it back with no extra
-        // copy after vpiStreamSync.
-        src.outputMat = cv::Mat(outHeight, outWidth, CV_8UC3, cv::Scalar(0, 0, 0));
-        CheckVpiStatus(
-            vpiImageCreateWrapperOpenCVMat(src.outputMat, VPI_IMAGE_FORMAT_RGB8, 0, &src.outputWrapper),
-            "vpiImageCreateWrapperOpenCVMat (output)");
-#else
-        m_sources[i] = SourceCam{mapX, mapY};
-#endif
+        fullMapXs[i] = mapX;
+        fullMapYs[i] = mapY;
         weights[i] = weight;
     }
 
@@ -249,6 +187,102 @@ CameraStitcher::CameraStitcher(int camWidth, int camHeight, double camHFovRad,
                 }
             }
         }
+    }
+
+    // Pass 2: now that m_owner is final, compute each camera's own
+    // bounding rect (see m_owner's header comment -- ownership is
+    // column-only, so this is a tight fit, not a loose one) and build the
+    // per-camera remap/output resources scoped to JUST that rect instead
+    // of the full outWidth x outHeight panorama -- see this class's header
+    // comment for why (cuts ~3x redundant remap/copy work down to ~1x).
+    for (size_t i = 0; i < cameras.size(); ++i)
+    {
+        int minU = outWidth, maxU = -1, minV = outHeight, maxV = -1;
+        for (int v = 0; v < outHeight; ++v)
+        {
+            for (int u = 0; u < outWidth; ++u)
+            {
+                if (m_owner.at<uint8_t>(v, u) == static_cast<uint8_t>(i))
+                {
+                    minU = std::min(minU, u);
+                    maxU = std::max(maxU, u);
+                    minV = std::min(minV, v);
+                    maxV = std::max(maxV, v);
+                }
+            }
+        }
+        // maxU < minU would mean this camera owns NO pixels at all --
+        // can't happen with 3 cameras covering a shared 80 deg FOV each
+        // contributing its own share, so not handled as a real case (an
+        // empty rect below would just make this camera silently invisible
+        // in Stitch(), which is a real bug, not a graceful degradation).
+        const cv::Rect rect(minU, minV, maxU - minU + 1, maxV - minV + 1);
+        const cv::Mat croppedMapX = fullMapXs[i](rect);
+        const cv::Mat croppedMapY = fullMapYs[i](rect);
+
+#ifdef PERCEPTION_USE_VPI
+        // Bake the CROPPED mapX/mapY into a dense VPIWarpMap -- one control
+        // point per pixel of THIS camera's own rect (horizInterval/
+        // vertInterval = 1), matching the CPU path's per-pixel accuracy
+        // exactly rather than trading it for a coarser, VPI-interpolated
+        // grid. (0,0) sentinel-free: mapX/mapY's own -1 default (see the
+        // pass-1 loop above, "outside this camera's frame") is passed
+        // straight through as the keypoint coordinate -- VPI_BORDER_ZERO
+        // (see Stitch() below) treats any keypoint outside the source
+        // image as zero, same as cv::remap's BORDER_CONSTANT does today,
+        // so this preserves the exact same "black where this camera has no
+        // coverage" behavior with no extra sentinel handling needed here.
+        VPIWarpMap warpMap = {};
+        warpMap.grid.numHorizRegions = 1;
+        warpMap.grid.numVertRegions = 1;
+        warpMap.grid.regionWidth[0] = static_cast<int16_t>(rect.width);
+        warpMap.grid.regionHeight[0] = static_cast<int16_t>(rect.height);
+        warpMap.grid.horizInterval[0] = 1;
+        warpMap.grid.vertInterval[0] = 1;
+        CheckVpiStatus(vpiWarpMapAllocData(&warpMap), "vpiWarpMapAllocData");
+
+        // Same padding gotcha as before cropping was added (see git
+        // history / this class's own past fix): vpiWarpMapAllocData pads
+        // the control-point grid up to a multiple of 16 internally, so the
+        // fill loop below MUST stay bounded by rect.width/rect.height (what
+        // croppedMapX/Y actually contain), not warpMap's own possibly-
+        // larger numHorizPoints/numVertPoints.
+        for (int v = 0; v < rect.height; ++v)
+        {
+            VPIKeypointF32 *row = reinterpret_cast<VPIKeypointF32 *>(
+                reinterpret_cast<uint8_t *>(warpMap.keypoints) + v * warpMap.pitchBytes);
+            for (int u = 0; u < rect.width; ++u)
+            {
+                row[u] = VPIKeypointF32{croppedMapX.at<float>(v, u), croppedMapY.at<float>(v, u)};
+            }
+        }
+
+        CameraStitcher::VpiSourceCam &src = m_vpiSources[i];
+        CheckVpiStatus(vpiCreateRemap(VPI_BACKEND_CUDA, &warpMap, &src.remapPayload), "vpiCreateRemap");
+        vpiWarpMapFreeData(&warpMap); // payload has what it needs now -- see the fisheye sample's same pattern
+        src.roi = rect;
+
+        // Input wrapper seeded with a throwaway same-size/type Mat just to
+        // establish format/dimensions -- Stitch() repoints it at the real
+        // per-frame image via vpiImageSetWrappedOpenCVMat every call. Full
+        // camera size, NOT cropped -- the INPUT is always the whole source
+        // camera frame; only the OUTPUT is scoped to this camera's rect.
+        cv::Mat placeholder(camHeight, camWidth, CV_8UC3, cv::Scalar(0, 0, 0));
+        CheckVpiStatus(
+            vpiImageCreateWrapperOpenCVMat(placeholder, VPI_IMAGE_FORMAT_RGB8, 0, &src.inputWrapper),
+            "vpiImageCreateWrapperOpenCVMat (input)");
+
+        // Output buffer is OWNED here (unlike the input) and wrapped once
+        // -- VPI writes directly into this cv::Mat's own backing memory on
+        // every vpiSubmitRemap, so Stitch() reads it back with no extra
+        // copy after vpiStreamSync. Sized to rect, not the full panorama.
+        src.outputMat = cv::Mat(rect.height, rect.width, CV_8UC3, cv::Scalar(0, 0, 0));
+        CheckVpiStatus(
+            vpiImageCreateWrapperOpenCVMat(src.outputMat, VPI_IMAGE_FORMAT_RGB8, 0, &src.outputWrapper),
+            "vpiImageCreateWrapperOpenCVMat (output)");
+#else
+        m_sources[i] = SourceCam{croppedMapX.clone(), croppedMapY.clone(), rect};
+#endif
     }
 }
 
@@ -298,20 +332,25 @@ cv::Mat CameraStitcher::Stitch(const std::vector<cv::Mat> &images) const
     // this class's own header comment.)
     CheckVpiStatus(vpiStreamSync(m_stream), "vpiStreamSync");
 
+    // Masked copy scoped to each camera's own rect (see VpiSourceCam::roi's
+    // comment) -- ownerMask/result(roi) are both roi-sized now, not full
+    // panorama, cutting this from 3x panorama-sized work down to ~1x.
     for (size_t i = 0; i < images.size(); ++i)
     {
-        const cv::Mat ownerMask = (m_owner == static_cast<uint8_t>(i));
-        m_vpiSources[i].outputMat.copyTo(result, ownerMask);
+        const cv::Rect &roi = m_vpiSources[i].roi;
+        const cv::Mat ownerMask = (m_owner(roi) == static_cast<uint8_t>(i));
+        m_vpiSources[i].outputMat.copyTo(result(roi), ownerMask);
     }
 #else
     for (size_t i = 0; i < images.size(); ++i)
     {
+        const cv::Rect &roi = m_sources[i].roi;
         cv::Mat warped;
         cv::remap(images[i], warped, m_sources[i].mapX, m_sources[i].mapY,
                   cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
 
-        const cv::Mat ownerMask = (m_owner == static_cast<uint8_t>(i));
-        warped.copyTo(result, ownerMask);
+        const cv::Mat ownerMask = (m_owner(roi) == static_cast<uint8_t>(i));
+        warped.copyTo(result(roi), ownerMask);
     }
 #endif
 

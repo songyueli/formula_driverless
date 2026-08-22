@@ -188,6 +188,24 @@ constexpr float kConfThreshold = 0.25f;
 // that image's whole purpose is showing YOLO's raw, unfiltered output.
 constexpr float kPanoEdgeMarginPx = 5.0f;
 
+// Debug-visualization images (/camera/stitched/image, /camera/detections/
+// image) are only built/published every Nth cycle, not every cycle -- see
+// their own publish sites below for why: foxglove_bridge subscribes to
+// both UNCONDITIONALLY (so it's ready to forward them the moment a Foxglove
+// client connects), so gating on gz::transport::Publisher::HasConnections()
+// -- tried first -- never actually skips anything as long as dev_sim.sh's
+// normal 6-process pipeline is running; confirmed directly, not assumed
+// (timing stayed ~56ms after that change, no different from before it).
+// Throttling instead of gating is also just the right call regardless: a
+// human watching Foxglove doesn't need a 2427x1130 RGB overlay at full
+// camera rate to debug visually, and this is the actual, previously-
+// unmeasured ~16ms/cycle cost (confirmed via /timing/perception's own total
+// sitting that far above stitch+detect+postprocess+log's sum) -- 5 (a
+// ~6Hz overlay at this pipeline's ~30Hz cycle) recovers nearly all of that
+// on 5 of every 6 cycles while keeping the debug view comfortably watchable.
+// /cone_detections itself is NEVER throttled -- only these two debug images.
+constexpr int kDebugImageEveryN = 6;
+
 // Matches ml/prepare_data.py's CLASSES list exactly -- same order, since
 // that's the order the model was trained to output class indices in.
 constexpr const char *kClassNames[] = {"blue", "yellow", "orange", "large_orange"};
@@ -346,6 +364,7 @@ int main()
     cv::Mat latestFront, latestLeft, latestRight;
     StampKey stampFront{}, stampLeft{}, stampRight{};
     bool haveFront = false, haveLeft = false, haveRight = false;
+    int64_t debugImageFrameCounter = 0;
 
     // Stitches only when all 3 buffered frames carry CLOSE-ENOUGH simulation
     // timestamps (see StampsClose/kStampToleranceSec) -- not just "whatever's
@@ -399,7 +418,16 @@ int main()
         const cv::Mat stitched = stitcher.Stitch({latestFront, latestLeft, latestRight});
         publishTimingUs(stitchTimingPub, std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - stitchStart).count());
-        stitchedPub.Publish(ToImageMsg(stitched));
+        // Throttled -- see kDebugImageEveryN's comment for why (and why
+        // HasConnections() doesn't work here). Detection below always runs
+        // on the in-process `stitched` Mat directly, never by re-subscribing
+        // to this topic, so throttling its publish has zero effect on
+        // detection itself.
+        const bool publishDebugImagesThisFrame = (debugImageFrameCounter % kDebugImageEveryN) == 0;
+        if (publishDebugImagesThisFrame)
+        {
+            stitchedPub.Publish(ToImageMsg(stitched));
+        }
 
         // Still prints every detection either way (matching the same
         // "print to confirm it's actually working" pattern as TODO 1's
@@ -417,7 +445,13 @@ int main()
             std::chrono::steady_clock::now() - detectStart).count());
 
         gz::msgs::Pose_V coneMsg;
-        cv::Mat annotated = stitched.clone();
+        // Only cloned/drawn into on the same throttled cycles as
+        // stitchedPub above (see kDebugImageEveryN). Detection/localization
+        // (coneMsg) never depends on this Mat, so skipping it on the other
+        // 5-of-6 cycles doesn't touch the actual autonomy output, only the
+        // debug overlay.
+        const bool wantAnnotated = publishDebugImagesThisFrame;
+        cv::Mat annotated = wantAnnotated ? stitched.clone() : cv::Mat();
         int64_t logUs = 0;
         const auto postprocessStart = std::chrono::steady_clock::now();
         for (const auto &d : detections)
@@ -468,12 +502,15 @@ int main()
                 p->mutable_position()->set_z(pos->z);
             }
 
-            cv::rectangle(annotated, cv::Point(static_cast<int>(d.x1), static_cast<int>(d.y1)),
-                          cv::Point(static_cast<int>(d.x2), static_cast<int>(d.y2)), color, 2);
-            char label[64];
-            std::snprintf(label, sizeof(label), "%s %.2f", className, d.confidence);
-            cv::putText(annotated, label, cv::Point(static_cast<int>(d.x1), static_cast<int>(d.y1) - 4),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
+            if (wantAnnotated)
+            {
+                cv::rectangle(annotated, cv::Point(static_cast<int>(d.x1), static_cast<int>(d.y1)),
+                              cv::Point(static_cast<int>(d.x2), static_cast<int>(d.y2)), color, 2);
+                char label[64];
+                std::snprintf(label, sizeof(label), "%s %.2f", className, d.confidence);
+                cv::putText(annotated, label, cv::Point(static_cast<int>(d.x1), static_cast<int>(d.y1) - 4),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
+            }
         }
         const int64_t postprocessTotalUs = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - postprocessStart).count();
@@ -481,7 +518,11 @@ int main()
         publishTimingUs(logTimingPub, logUs);
 
         detectionsPub.Publish(coneMsg);
-        detectionsImgPub.Publish(ToImageMsg(annotated));
+        if (wantAnnotated)
+        {
+            detectionsImgPub.Publish(ToImageMsg(annotated));
+        }
+        ++debugImageFrameCounter;
     };
 
     std::function<void(const gz::msgs::Image &)> onCameraFront =

@@ -59,6 +59,21 @@
 // off the CPU entirely onto the otherwise-idle GPU, which also leaves the
 // GPU free to run YOLO/TensorRT concurrently rather than contending with
 // it, unlike a hypothetical CPU-thread-parallelization fix.
+//
+// Enabling VPI alone did NOT fix the ~36-38ms/frame cost, though --
+// confirmed directly via /timing/perception/stitch still reading ~40ms with
+// VPI active. The remaining cost was the masked copyTo step, done at FULL
+// panorama size for EACH of the 3 cameras regardless of remap backend --
+// 3x more pixel-copy work than actually needed, since each camera only
+// ever owns roughly a third of the panorama (see m_owner's comment:
+// ownership is column-only, so each camera's region is one contiguous
+// band, not scattered pixels). Both the VPI output buffers and the CPU
+// cv::remap destination are now sized to each camera's own bounding rect
+// (see VpiSourceCam::roi / SourceCam::roi) instead of the full panorama,
+// so the masked copy -- and, on the VPI side, the remap itself -- only
+// ever touches the pixels that camera can actually contribute, cutting
+// total work from ~3x panorama size down to ~1x (the 3 rects tile the
+// panorama with only a thin overlap at each seam).
 class CameraStitcher
 {
 public:
@@ -107,7 +122,15 @@ public:
 private:
     int m_outWidth;
     int m_outHeight;
-    cv::Mat m_owner; // CV_8UC1 -- winning camera index per output pixel (255 = none)
+    // CV_8UC1 -- winning camera index per output pixel (255 = none). The
+    // "winning" decision (see the .cpp constructor) depends only on output
+    // COLUMN, not row (theta -- and hence weight -- is a pure function of
+    // u), so each camera's owned region is a single contiguous band running
+    // the full output height, not scattered pixels -- that's what makes a
+    // per-camera bounding rect (see VpiSourceCam::roi / SourceCam::roi) a
+    // tight fit rather than a loose one that still covers most of the
+    // panorama.
+    cv::Mat m_owner;
 
 #ifdef PERCEPTION_USE_VPI
     struct VpiSourceCam
@@ -129,14 +152,20 @@ private:
         // so reading it back after vpiStreamSync is zero-copy.
         VPIImage outputWrapper = nullptr;
         cv::Mat outputMat;
+        // This camera's own bounding rect within the FULL panorama (see
+        // m_owner's own comment below) -- remap/output only ever covers
+        // this camera's OWN pixels, not the whole panorama, so outputMat is
+        // sized to roi, not outWidth x outHeight.
+        cv::Rect roi;
     };
     VPIStream m_stream = nullptr;
     std::vector<VpiSourceCam> m_vpiSources;
 #else
     struct SourceCam
     {
-        cv::Mat mapX; // CV_32FC1 -- cv::remap x-coordinates
-        cv::Mat mapY; // CV_32FC1 -- cv::remap y-coordinates
+        cv::Mat mapX; // CV_32FC1 -- cv::remap x-coordinates, cropped to roi
+        cv::Mat mapY; // CV_32FC1 -- cv::remap y-coordinates, cropped to roi
+        cv::Rect roi; // see VpiSourceCam::roi's comment above -- same idea, CPU path
     };
     std::vector<SourceCam> m_sources;
 #endif
