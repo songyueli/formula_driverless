@@ -52,5 +52,16 @@
 class PurePursuitController
 {
 public:
-    DriveCommand Compute(const ControlInputs &inputs) const;
+    // No longer const: tracks consecutive empty-path cycles across calls
+    // (see pure_pursuit_controller.cpp's kSweepYawRate comment) so a
+    // persistent gap can escalate from a straight creep to a sweeping turn
+    // instead of staring down the same wrong heading forever. Every other
+    // call still only reads inputs and this object's own constants -- no
+    // gz-transport/global state involved, so this stays trivially testable
+    // and control.cpp's single long-lived `controller` instance is exactly
+    // the right lifetime for this counter to persist across cycles in.
+    DriveCommand Compute(const ControlInputs &inputs);
+
+private:
+    int m_consecutiveEmptyCycles = 0;
 };

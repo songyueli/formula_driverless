@@ -102,7 +102,48 @@ constexpr double kGnssHeadingStddev = kGnssHeadingStddevDeg * M_PI / 180.0;
 // back to 0.1 now that the real bug (kDuplicatePruneRadius in ekf.cpp) is
 // fixed, to test that fix in isolation rather than have two changes
 // confound each other.
-constexpr double kLandmarkStddev = 0.1;  // meters
+//
+// That flat 0.1 stayed correct only for NEAR detections -- confirmed
+// directly as a real bug during a full-lap test: a long (~15-20m) gap in
+// track cone coverage forced the car through a stretch where every
+// currently-visible cone sat near lidar_projector.cpp's own kMaxValidRange
+// (20m) ceiling, and comparing live /estimated_landmarks against ground
+// truth afterward found a cluster of near-duplicate landmark entries
+// strung along the car's path through exactly that stretch (58 unmatched
+// estimates vs. 28 in an earlier, shorter run -- growing specifically in
+// this region), plus matched-pair errors up to 1.9m there vs. ~0.1-0.3m
+// typical elsewhere. Root cause: real cone-localization noise (bearing
+// error converted to cross-range position error, plus sparser lidar
+// returns and smaller/noisier YOLO boxes at distance) grows with range,
+// but every detection -- 2m or 20m -- was going into
+// Ekf::CorrectOrAddLandmark's Mahalanobis gate with the SAME tight 0.1m
+// stddev. At long range that gate was far tighter than the real noise on
+// each detection, so repeat sightings of the SAME distant cone kept
+// failing to match each other and got added as brand-new landmarks
+// instead -- textbook duplicate-spawning from an overconfident R, not a
+// data-association logic bug (ekf.cpp's gate itself is correct; it was
+// just being fed a wrong noise estimate for the range it applies to).
+//
+// LandmarkStddev(range) below replaces the flat constant: linear growth
+// with range is the standard model for a bearing-based sensor (constant
+// ANGULAR precision converts to position error proportional to range), and
+// is a small, targeted change -- CorrectOrAddLandmark/AddLandmark already
+// take stddev as a per-call parameter, so this only touches what value
+// gets passed in, not the EKF's own gating/fusion math. kBase=0.1 keeps
+// today's near-field behavior (already validated: ~0.1-0.3m matched-pair
+// error in the well-covered parts of the track) unchanged; kRangeCoeff
+// chosen so range=20m (the far edge of what lidar_projector.cpp will even
+// return, see kMaxValidRange there) gives stddev=0.7m -- loose enough that
+// the ~1.6-1.9m real discrepancies observed at that range now fall inside
+// a sane multi-sigma gate instead of being rejected outright.
+constexpr double kLandmarkBaseStddev = 0.1;        // meters, at range -> 0
+constexpr double kLandmarkRangeNoiseCoeff = 0.03;  // additional meters of stddev per meter of range
+
+double LandmarkStddev(double _measuredBodyX, double _measuredBodyY)
+{
+    const double range = std::hypot(_measuredBodyX, _measuredBodyY);
+    return kLandmarkBaseStddev + kLandmarkRangeNoiseCoeff * range;
+}
 
 const char *ConeColorName(fsd::ConeColor _color)
 {
@@ -332,8 +373,10 @@ int main()
             // Data association (match vs. new-landmark) happens INSIDE the
             // EKF now, against its own tracked landmark state -- not
             // against a ground-truth map, see Ekf::CorrectOrAddLandmark.
-            ekf.CorrectOrAddLandmark(pose.position().x(), pose.position().y(),
-                                      color, kLandmarkStddev);
+            // Stddev scales with range -- see LandmarkStddev's own comment
+            // for why a flat constant here was a confirmed, real bug.
+            ekf.CorrectOrAddLandmark(pose.position().x(), pose.position().y(), color,
+                                      LandmarkStddev(pose.position().x(), pose.position().y()));
         }
         publishLandmarks();
         publishEstimate();
