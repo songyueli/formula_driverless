@@ -40,12 +40,19 @@ public:
 
     void SetPointCloud(const gz::msgs::PointCloudPacked &msg);
 
-    // bbox in panorama pixel space. Returns the closest (by range) lidar
-    // point whose projection falls inside it, or nullopt if none do -- a
-    // detection can legitimately have no match (a thin/distant part of a
-    // cone with no lidar return there), and the lidar (10 Hz) isn't
-    // synchronized against detections the way the 3 cameras are
-    // synchronized against each other (30 Hz) -- see perception.cpp.
+    // bbox in panorama pixel space. Returns a confidence-gated CENTROID
+    // position built from every lidar point whose projection falls inside
+    // the box AND whose range is within kClusterRangeBand of the closest
+    // such point (isolates the cone's own near-facing surface from any
+    // farther background also captured by the same 2-D box), or nullopt if
+    // that cluster has fewer than kMinPointsForDetection points -- a
+    // detection can legitimately have too little lidar evidence (a thin/
+    // distant part of a cone with few or no returns), and the lidar
+    // (10 Hz) isn't synchronized against detections the way the 3 cameras
+    // are synchronized against each other (30 Hz) -- see perception.cpp.
+    // See lidar_projector.cpp's own comment on this method for why a
+    // single nearest-point pick (the previous version) is a confirmed,
+    // real systematic bias, not just noise.
     std::optional<ConePosition> Localize(float x1, float y1, float x2, float y2) const;
 
 private:

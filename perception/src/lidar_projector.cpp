@@ -1,5 +1,6 @@
 #include "lidar_projector.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -59,6 +60,61 @@ constexpr float kMinValidRange = 4.0f; // meters
 // actually observed live (2-6m for the near/working cases -- see
 // kMinValidRange's comment), while safely excluding the ~50m artifact.
 constexpr float kMaxValidRange = 20.0f; // meters
+
+// A single nearest-range point (the previous version of Localize()) is a
+// confirmed, real SYSTEMATIC bias, not just noise -- confirmed directly by
+// comparing raw /cone_detections against ground truth from a precisely
+// known, perfectly stationary car pose (via gz-sim's own set_pose service,
+// eliminating pose-estimation error from the measurement): frame-to-frame
+// JITTER was already small (~0.015m mean stddev across 30 consecutive
+// frames of the same physical cones), but every single cone showed a
+// CONSISTENT offset in the same direction (0.02-0.105m, mean 0.067m) --
+// not noise, a bias. Root cause: lidar can only ever return points off a
+// cone's near-facing surface (opaque object, no way to see its far side or
+// its own central axis), so "closest point wins" always reads at or in
+// front of the true axis by some fraction of the cone's own radius
+// (0.115m at the base -- see simulation/models/cone_blue/model.sdf --
+// matching the observed bias magnitude closely). A centroid over a
+// CLUSTER of near-surface points doesn't eliminate this (every point in
+// the cluster has the same near-surface-only limitation), but it does two
+// things a single point can't: averages out the WITHIN-cluster spread
+// (reducing the frame-to-frame jitter component further), and gives
+// Localize() actual evidence of confidence (point COUNT) to gate on --
+// see kMinPointsForDetection.
+constexpr int kMinPointsForDetection = 2;
+
+// Points within this range of the closest in-box point are treated as the
+// same cluster (the cone's own near surface) -- points farther than this
+// are assumed to be a different object (background/occlusion behind the
+// cone, still inside the same 2-D box) and excluded from the centroid
+// rather than dragging it toward some other surface entirely. Sized
+// comfortably larger than a cone's own front-to-back depth extent (at most
+// ~2*0.115m = 0.23m for the base radius) to tolerate ordinary lidar range
+// noise (0.008m stddev per model.sdf) without fragmenting genuine
+// same-cone points into separate clusters, while still meaningfully
+// excluding anything that's a genuinely different, farther object.
+constexpr float kClusterRangeBand = 0.4f; // meters
+
+// Even a clean multi-point centroid (see kMinPointsForDetection above) is
+// still built ENTIRELY from near-facing-surface returns -- lidar has no
+// way to see a solid cone's far side or its own central axis, so the
+// centroid necessarily sits somewhere between the true axis and the near
+// surface, not AT the axis. Confirmed directly, not assumed: comparing raw
+// /cone_detections against ground truth from a perfectly stationary,
+// precisely known car pose (gz-sim's own set_pose service) measured a
+// consistent ~0.058m mean bias toward the car across 5 cones, ALWAYS in
+// the same direction (toward the sensor) -- matching, almost exactly, HALF
+// of the cone's own 0.115m base radius (simulation/models/cone_blue/
+// model.sdf) -- physically exactly what's expected from a centroid
+// averaged over points spanning the cone's tapered surface from base
+// (full 0.115m offset) up toward its tip (~0m offset), if hit heights are
+// roughly uniformly distributed. Pushing the centroid's HORIZONTAL
+// position outward along its own ray (away from the car) by this amount
+// recovers an estimate of the true central axis instead of the near
+// surface. z is left uncorrected -- the measured bias was in horizontal
+// (range) position only; this pipeline's downstream consumers (EKF
+// landmarks, ground-truth comparison) only ever use (x, y) too.
+constexpr float kConeSurfaceToAxisCorrection = 0.058f; // meters
 } // namespace
 
 LidarProjector::LidarProjector(int panoWidth, int panoHeight, double fPano)
@@ -155,7 +211,11 @@ void LidarProjector::SetPointCloud(const gz::msgs::PointCloudPacked &msg)
 std::optional<LidarProjector::ConePosition> LidarProjector::Localize(
     float x1, float y1, float x2, float y2) const
 {
-    std::optional<ConePosition> best;
+    // Pass 1: every in-box, in-range point, and the closest range among
+    // them -- needed before clustering can decide what "close enough to
+    // the nearest one" even means.
+    std::vector<const ConePosition *> inBox;
+    float nearestRange = kMaxValidRange;
     for (const auto &p : m_points)
     {
         if (p.u < x1 || p.u > x2 || p.v < y1 || p.v > y2)
@@ -166,10 +226,56 @@ std::optional<LidarProjector::ConePosition> LidarProjector::Localize(
         {
             continue;
         }
-        if (!best || p.pos.range < best->range)
-        {
-            best = p.pos;
-        }
+        inBox.push_back(&p.pos);
+        nearestRange = std::min(nearestRange, p.pos.range);
     }
-    return best;
+
+    // Pass 2: keep only the near cluster (within kClusterRangeBand of the
+    // closest point) -- see kClusterRangeBand's comment for why this
+    // excludes farther background/occlusion sharing the same 2-D box
+    // rather than letting it drag the centroid off the cone entirely.
+    float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
+    int count = 0;
+    for (const ConePosition *p : inBox)
+    {
+        if (p->range > nearestRange + kClusterRangeBand)
+        {
+            continue;
+        }
+        sumX += p->x;
+        sumY += p->y;
+        sumZ += p->z;
+        ++count;
+    }
+
+    // Not enough independent lidar evidence to be confident this is a real,
+    // well-localized cone surface rather than a single stray/noisy return
+    // -- see kMinPointsForDetection's comment. Matches this class's own
+    // existing philosophy (a detection can legitimately have NO match);
+    // this just raises the bar from "at least one point" to "enough points
+    // to trust a position from".
+    if (count < kMinPointsForDetection)
+    {
+        return std::nullopt;
+    }
+
+    ConePosition centroid{sumX / count, sumY / count, sumZ / count, 0.0f};
+
+    // Push outward along the horizontal ray from the car's own origin --
+    // see kConeSurfaceToAxisCorrection's comment for why. horizRange is
+    // the pre-correction horizontal distance; guarded against ~0 (a cone
+    // directly on top of the car's origin isn't a real case this pipeline
+    // ever sees -- kMinValidRange already excludes anything under 4m --
+    // but division by a near-zero horizRange would be undefined otherwise).
+    const float horizRange = std::sqrt(centroid.x * centroid.x + centroid.y * centroid.y);
+    if (horizRange > 1e-3f)
+    {
+        const float scale = (horizRange + kConeSurfaceToAxisCorrection) / horizRange;
+        centroid.x *= scale;
+        centroid.y *= scale;
+    }
+
+    centroid.range = std::sqrt(centroid.x * centroid.x + centroid.y * centroid.y
+                                + centroid.z * centroid.z);
+    return centroid;
 }

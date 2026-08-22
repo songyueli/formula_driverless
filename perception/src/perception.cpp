@@ -359,6 +359,15 @@ int main()
     // to isolate that suspected cost rather than leave it folded in here).
     auto postprocessTimingPub = node.Advertise<gz::msgs::UInt64>("/timing/perception/postprocess");
     auto logTimingPub = node.Advertise<gz::msgs::UInt64>("/timing/perception/log");
+    // Covers every Publish() call this cycle makes (stitchedPub,
+    // detectionsPub, detectionsImgPub) plus their ToImageMsg() conversions
+    // -- previously the one genuinely UNMEASURED part of the cycle (see
+    // this topic's own header comment further down at its publish sites).
+    // Added specifically because stitch+detect+postprocess+log's own sum
+    // didn't fully account for /timing/perception's total, and a user
+    // directly asked why -- this closes that gap instead of leaving it
+    // inferred from before/after totals.
+    auto publishTimingPub = node.Advertise<gz::msgs::UInt64>("/timing/perception/publish");
 
     std::mutex mtx;
     cv::Mat latestFront, latestLeft, latestRight;
@@ -424,9 +433,13 @@ int main()
         // to this topic, so throttling its publish has zero effect on
         // detection itself.
         const bool publishDebugImagesThisFrame = (debugImageFrameCounter % kDebugImageEveryN) == 0;
+        int64_t publishUs = 0;
         if (publishDebugImagesThisFrame)
         {
+            const auto publishStart = std::chrono::steady_clock::now();
             stitchedPub.Publish(ToImageMsg(stitched));
+            publishUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - publishStart).count();
         }
 
         // Still prints every detection either way (matching the same
@@ -517,11 +530,16 @@ int main()
         publishTimingUs(postprocessTimingPub, postprocessTotalUs - logUs);
         publishTimingUs(logTimingPub, logUs);
 
+        const auto detectionsPublishStart = std::chrono::steady_clock::now();
         detectionsPub.Publish(coneMsg);
         if (wantAnnotated)
         {
             detectionsImgPub.Publish(ToImageMsg(annotated));
         }
+        publishUs += std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - detectionsPublishStart).count();
+        publishTimingUs(publishTimingPub, publishUs);
+
         ++debugImageFrameCounter;
     };
 
