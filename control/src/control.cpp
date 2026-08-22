@@ -1,7 +1,9 @@
 #include <functional>
 #include <iostream>
+#include <mutex>
 
 #include <gz/transport/Node.hh>
+#include <gz/msgs/pose.pb.h>
 #include <gz/msgs/pose_v.pb.h>
 #include <gz/msgs/twist.pb.h>
 #include <gz/msgs/uint64.pb.h>
@@ -14,23 +16,29 @@
 
 // Control process
 // ---------------
-// Pure pursuit, operating entirely in the car's own body frame (see
-// planning.cpp for why: /planned_path waypoints are already relative to
-// the car, so no absolute pose is needed to steer toward one -- this
-// process doesn't subscribe to /estimated_pose at all).
+// Pure pursuit, operating entirely in the car's own body frame for the
+// actual STEERING decision (see planning.cpp for why: /planned_path
+// waypoints are already relative to the car, so no absolute pose is needed
+// to steer toward one). /estimated_pose IS subscribed to now, but only for
+// PurePursuitController's stuck-detection/reverse-recovery path (see
+// control_types.hpp's ControlInputs::worldX/worldY comment) -- normal
+// driving never reads it.
 //
 // The actual control algorithm lives in PurePursuitController (see
 // pure_pursuit_controller.hpp), not here -- this file's job is just
-// gz-transport plumbing: converting /planned_path into a ControlInputs,
-// calling ActiveController::Compute(), and converting the resulting
-// DriveCommand into a /cmd_ackermann message. See
-// pure_pursuit_controller.hpp for the swappable-controller pattern this
-// project uses and exactly where/how an MPC-based controller would plug
-// in later.
+// gz-transport plumbing: converting /planned_path (plus the latest
+// /estimated_pose) into a ControlInputs, calling ActiveController::
+// Compute(), and converting the resulting DriveCommand into a
+// /cmd_ackermann message. See pure_pursuit_controller.hpp for the
+// swappable-controller pattern this project uses and exactly where/how an
+// MPC-based controller would plug in later.
 //
 // Inputs (subscribe):
 //   /planned_path    gz.msgs.Pose_V   (ordered body-frame waypoints from
 //                    planning, nearest-ahead first)
+//   /estimated_pose  gz.msgs.Pose     (localization's world-frame pose
+//                    estimate -- cached, read only by the stuck-detection
+//                    path, see above)
 //
 // Output (publish):
 //   /cmd_ackermann   gz.msgs.Twist    (NOT a dedicated AckermannSteering
@@ -62,8 +70,32 @@ int main()
     // this later grows into something heavier (e.g. MPC).
     auto timingPub = node.Advertise<gz::msgs::UInt64>("/timing/control");
 
+    // Latest /estimated_pose, cached for the stuck-detection path only --
+    // see control_types.hpp's ControlInputs::worldX/worldY comment. A
+    // plain mutex-guarded cache (not synchronized against onPlannedPath
+    // beyond that) is fine here: this only ever needs to be "recent
+    // enough", not exactly time-aligned with any specific /planned_path
+    // message, since it's used to detect being stuck over many cycles, not
+    // for a precise per-cycle geometric decision.
+    std::mutex poseMutex;
+    double lastWorldX = 0.0, lastWorldY = 0.0;
+    bool havePose = false;
+    std::function<void(const gz::msgs::Pose &)> onEstimatedPose =
+        [&](const gz::msgs::Pose &_msg)
+    {
+        std::lock_guard<std::mutex> lock(poseMutex);
+        lastWorldX = _msg.position().x();
+        lastWorldY = _msg.position().y();
+        havePose = true;
+    };
+    if (!node.Subscribe("/estimated_pose", onEstimatedPose))
+    {
+        std::cerr << "Failed to subscribe to /estimated_pose\n";
+        return 1;
+    }
+
     std::function<void(const gz::msgs::Pose_V &)> onPlannedPath =
-        [&cmdPub, &timingPub, &controller](const gz::msgs::Pose_V &_msg)
+        [&](const gz::msgs::Pose_V &_msg)
     {
         fsd::ScopedTimer timer([&timingPub](int64_t _us)
         {
@@ -77,6 +109,12 @@ int main()
         for (const auto &pose : _msg.pose())
         {
             inputs.path.push_back(ControlInputs::Waypoint{pose.position().x(), pose.position().y()});
+        }
+        {
+            std::lock_guard<std::mutex> lock(poseMutex);
+            inputs.worldX = lastWorldX;
+            inputs.worldY = lastWorldY;
+            inputs.poseValid = havePose;
         }
 
         const DriveCommand cmd = controller.Compute(inputs);
@@ -93,7 +131,7 @@ int main()
         return 1;
     }
 
-    std::cout << "control: /planned_path -> /cmd_ackermann (pure pursuit)\n";
+    std::cout << "control: /planned_path (+/estimated_pose) -> /cmd_ackermann (pure pursuit)\n";
 
     gz::transport::waitForShutdown();
     return 0;

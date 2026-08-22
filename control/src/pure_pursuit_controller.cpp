@@ -76,9 +76,12 @@ constexpr double kCreepSpeed = 0.5;  // m/s
 // speed/kSweepYawRate), sweeping the car's own forward-facing sensors
 // through a full 360 deg of heading (2*pi/kSweepYawRate =~ 21s at
 // kCreepSpeed) rather than staring down the same wrong direction forever.
-// Always the SAME turn direction (never re-decided each cycle) so
-// consecutive empty cycles compound into one continuous sweep instead of
-// jittering back and forth and covering no new heading at all.
+// Fixed direction (m_sweepDirection) for the DURATION of one sweep
+// attempt -- never re-decided mid-sweep -- so consecutive empty cycles
+// compound into one continuous search instead of jittering back and forth
+// and covering no new heading at all. It CAN flip between attempts, though
+// -- see m_sweepDirection's own header comment for why a direction that
+// never changes at all is its own confirmed failure mode.
 constexpr int kStraightCreepCycles = 60;
 constexpr double kSweepYawRate = 0.3;  // rad/s
 
@@ -106,6 +109,82 @@ constexpr double kSweepYawRate = 0.3;  // rad/s
 // before committing to a wide search.
 constexpr double kSweepSpeedGrowthPerCycle = 0.002;  // m/s added per swept cycle
 constexpr double kMaxSweepSpeed = 2.0;               // m/s
+
+// Even the widening spiral (kSweepSpeedGrowthPerCycle above) assumes the
+// car can actually MOVE along whatever it commands -- confirmed directly
+// as a real, un-covered failure mode: a live full-lap test found
+// /cmd_ackermann continuously commanding forward speed (up to
+// kMaxSweepSpeed, angular.z pinned at kSweepYawRate) while true
+// /estimated_pose sat frozen at the same position for 100+ seconds, and
+// the nearest ground-truth cone was 0.96m from the car -- physically
+// wedged against it. No forward-only command (creep, sweep, or an ever-
+// wider spiral) can ever produce real displacement from CONTACT.
+//
+// This is NOT scoped to the empty-path sweep alone, unlike an earlier
+// version of this fix -- confirmed directly as insufficient by a SECOND
+// live collision, at a different point in the same corner: /cmd_ackermann
+// showed a completely ordinary, continuously-varying NORMAL pure-pursuit
+// command (curvature-scaled yaw rate, speed up near kMaxSpeed) -- not the
+// sweep's fixed kSweepYawRate -- while true position again sat frozen.
+// planning's own boundary/path generation has no obstacle-awareness at
+// all (see track_boundaries.hpp/path_generator.hpp), so a geometrically
+// "reasonable" path can still walk the car directly into contact with a
+// real cone in a tight enough corner. Every prior escalation in this file
+// assumed "commanded speed didn't work" only ever meant "wrong direction"
+// or "no path" -- neither covers "confidently driving into an obstacle" --
+// so this stuck-check now runs FIRST, unconditionally, ahead of BOTH the
+// empty-path and normal-path branches, and overrides either one the same
+// way once triggered.
+//
+// kStuckCyclesBeforeReverse is deliberately short relative to the sweep's
+// own ~21s-per-loop timescale, and shorter still relative to how far even
+// kMinSpeed (1.0 m/s) should carry a normally-driving car: a WORKING
+// sweep or normal drive should show meaningful net displacement well
+// within one loop / one second, so little-to-no displacement this early
+// is already strong evidence of a physical block, not just "hasn't found
+// the way out yet". At this pipeline's ~30Hz planning cycle (camera-rate-
+// limited, see perception.cpp), 90 cycles =~ 3s.
+constexpr int kStuckCyclesBeforeReverse = 90;
+// Below this net displacement (from the anchor -- see m_anchorX/Y's
+// comment in the header for why it rolls forward on progress rather than
+// staying fixed) after kStuckCyclesBeforeReverse, treated as "not actually
+// moving" -- comfortably above ordinary EKF pose jitter, comfortably below
+// the meaningful distance even kMinSpeed's normal-driving floor (let alone
+// a working sweep) should cover in 3 seconds.
+constexpr double kStuckDistanceThreshold = 0.3;  // meters
+// Reverse maneuver: mostly straight back, same cautious magnitude as
+// kCreepSpeed but negative, PLUS a small turn (kReverseTurnRate) so
+// backing up also reorients the car rather than just retracing its own
+// approach in reverse. 45 base cycles at kReverseSpeed =~ 0.75m of
+// backward travel at ~30Hz.
+constexpr double kReverseSpeed = -0.5;  // m/s
+constexpr int kReverseCycles = 45;
+// Same direction as kSweepYawRate (consistent, not re-decided per
+// attempt) but noticeably gentler -- this is a controlled backup, not a
+// search sweep. Combined with kReverseCycles scaling on retry (see
+// kMaxReverseAttempt below), this means a LONGER reverse also turns the
+// car MORE, so escalating attempts naturally end up facing further and
+// further from the original (evidently blocked) approach angle without
+// needing separately-tuned per-attempt logic.
+constexpr double kReverseTurnRate = 0.15;  // rad/s
+
+// A single fixed-magnitude reverse is a real, confirmed-insufficient
+// mitigation on its own: a live full-lap test found the car repeatedly
+// backing up ~0.75m, immediately resuming the sweep, and getting stuck
+// again in essentially the same spot -- 0.75m plus the sweep's own
+// re-approach was consistently not enough clearance/reorientation to
+// actually escape a sufficiently tight corner, even though each
+// individual reverse executed correctly (confirmed directly: caught it
+// live, -0.5 m/s for the full 45 cycles, then the sweep resuming and
+// re-ramping exactly as designed -- the MECHANISM wasn't broken, its
+// single fixed magnitude just wasn't always enough). Escalating -- longer
+// reverse, and therefore (see kReverseTurnRate) more reorientation -- on
+// each attempt that doesn't lead to real progress mirrors the sweep's own
+// widening-spiral philosophy (kSweepSpeedGrowthPerCycle): try the cheap,
+// minimal recovery first, commit to a bigger one only once that's
+// confirmed insufficient. Capped at kMaxReverseAttempt so this still
+// terminates in a bounded worst-case backup rather than growing forever.
+constexpr int kMaxReverseAttempt = 4;
 }  // namespace
 
 // Algorithm (classic pure pursuit):
@@ -130,14 +209,88 @@ constexpr double kMaxSweepSpeed = 2.0;               // m/s
 //      reported yaw_rate stays consistent with the speed actually commanded.
 DriveCommand PurePursuitController::Compute(const ControlInputs &inputs)
 {
+    // Universal stuck-detection watchdog -- runs FIRST, unconditionally,
+    // ahead of both branches below, and overrides either one once
+    // triggered. See kStuckCyclesBeforeReverse's comment for why this has
+    // to cover BOTH normal path-following and the empty-path creep/sweep,
+    // not just one of them (a confirmed real collision happened during
+    // each).
+    if (m_reverseCyclesRemaining > 0)
+    {
+        --m_reverseCyclesRemaining;
+        if (m_reverseCyclesRemaining == 0)
+        {
+            // Reversing is done -- let the NEXT cycle re-anchor from
+            // wherever this backward travel actually left the car, rather
+            // than reusing the stale (stuck) anchor point.
+            m_haveAnchor = false;
+        }
+        return DriveCommand{kReverseSpeed, m_sweepDirection * kReverseTurnRate};
+    }
+
+    if (inputs.poseValid)
+    {
+        if (!m_haveAnchor)
+        {
+            m_anchorX = inputs.worldX;
+            m_anchorY = inputs.worldY;
+            m_haveAnchor = true;
+            m_cyclesSinceAnchor = 0;
+        }
+        else
+        {
+            ++m_cyclesSinceAnchor;
+            const double dx = inputs.worldX - m_anchorX;
+            const double dy = inputs.worldY - m_anchorY;
+            const double displacement = std::sqrt(dx * dx + dy * dy);
+            if (displacement >= kStuckDistanceThreshold)
+            {
+                // Real progress -- roll the measurement window forward
+                // rather than accumulating against an increasingly stale
+                // start point, and remember it happened (see
+                // m_madeProgressSinceLastReverse's header comment) so the
+                // NEXT reverse, if any, knows this was a fresh episode
+                // rather than an immediate retry.
+                m_anchorX = inputs.worldX;
+                m_anchorY = inputs.worldY;
+                m_cyclesSinceAnchor = 0;
+                m_madeProgressSinceLastReverse = true;
+            }
+            else if (m_cyclesSinceAnchor > kStuckCyclesBeforeReverse)
+            {
+                // Escalate only if the PREVIOUS reverse (if any) was
+                // immediately followed by getting stuck again with no real
+                // progress in between -- see kMaxReverseAttempt's comment.
+                m_reverseAttempt = m_madeProgressSinceLastReverse
+                                       ? 0
+                                       : std::min(m_reverseAttempt + 1, kMaxReverseAttempt);
+                m_madeProgressSinceLastReverse = false;
+                m_reverseCyclesRemaining = kReverseCycles * (1 + m_reverseAttempt);
+                // Flip search direction every time -- see m_sweepDirection's
+                // header comment for why a fixed direction can turn this
+                // into an endless "back up, re-approach the same obstacle"
+                // loop that no amount of extra reverse DISTANCE alone fixes.
+                m_sweepDirection = -m_sweepDirection;
+                return DriveCommand{kReverseSpeed, m_sweepDirection * kReverseTurnRate};
+            }
+        }
+    }
+    // else: no pose yet (startup) -- stuck-detection just doesn't run
+    // until a pose arrives, which happens well before this could matter in
+    // practice.
+
     if (inputs.path.empty())
     {
-        // No path this cycle -- creep (and, if this persists, sweep in a
-        // widening spiral) rather than stop dead. See kCreepSpeed's comment
-        // for why a hard stop here is a confirmed permanent-deadlock bug,
-        // not a safe default; kSweepYawRate's for why straight creep alone
-        // isn't always enough; and kSweepSpeedGrowthPerCycle's for why a
-        // FIXED-speed sweep isn't either.
+        // No path this cycle -- creep, and if this persists, sweep in a
+        // widening spiral, rather than stop dead. See kCreepSpeed's
+        // comment for why a hard stop here is a confirmed permanent-
+        // deadlock bug, not a safe default; kSweepYawRate's for why
+        // straight creep alone isn't always enough; and
+        // kSweepSpeedGrowthPerCycle's for why a fixed-speed sweep isn't
+        // either. (Recovering from a PHYSICAL block is the stuck-check
+        // above, not this escalation -- that's a different problem: "no
+        // detections at all", not "detections exist but something's in
+        // the way".)
         ++m_consecutiveEmptyCycles;
         if (m_consecutiveEmptyCycles <= kStraightCreepCycles)
         {
@@ -146,9 +299,10 @@ DriveCommand PurePursuitController::Compute(const ControlInputs &inputs)
         const int sweepCycles = m_consecutiveEmptyCycles - kStraightCreepCycles;
         const double sweepSpeed = std::min(kMaxSweepSpeed,
                                             kCreepSpeed + kSweepSpeedGrowthPerCycle * sweepCycles);
-        return DriveCommand{sweepSpeed, kSweepYawRate};
+        return DriveCommand{sweepSpeed, m_sweepDirection * kSweepYawRate};
     }
     m_consecutiveEmptyCycles = 0;
+    m_sweepDirection = 1.0;  // fresh baseline for whatever the NEXT stuck episode is
 
     // inputs.path is already sorted nearest-ahead-first (see planning.cpp).
     double targetX = 0.0, targetY = 0.0;

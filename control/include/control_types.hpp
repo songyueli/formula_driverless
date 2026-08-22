@@ -15,13 +15,12 @@
 // call site -- see pure_pursuit_controller.hpp's header comment for the
 // rest of that reasoning.
 //
-// Deliberately does NOT carry a currentSpeed/velocity field yet: nothing
-// reads one today (pure pursuit is a purely geometric controller -- see
-// pure_pursuit_controller.cpp), and control.cpp doesn't subscribe to any
-// vehicle-state topic at all right now. Adding an unused field here would
-// be speculative plumbing with nothing to populate it correctly; add it
-// (and the subscription that feeds it) together, when a controller that
-// actually needs it gets written.
+// Deliberately does NOT carry a currentSpeed/velocity field: nothing reads
+// one (pure pursuit is a purely geometric controller for the STEERING
+// decision -- see pure_pursuit_controller.cpp); worldX/worldY below is a
+// narrower addition for a different purpose (see its own comment), not the
+// vehicle-dynamics state a future MPC controller would still need to add
+// separately.
 struct ControlInputs
 {
     struct Waypoint
@@ -33,6 +32,23 @@ struct ControlInputs
     // planning.cpp's /planned_path, already ordered nearest-ahead-first.
     // Empty means "no path this cycle" (e.g. no cones currently detected).
     std::vector<Waypoint> path;
+
+    // World-frame position from /estimated_pose, added specifically so
+    // PurePursuitController's empty-path recovery (see its own kSweepYawRate/
+    // kReverse* comments) can detect PHYSICAL immobility -- commanding
+    // speed but not actually displacing, confirmed directly as a real
+    // failure mode: a live test found /cmd_ackermann continuously
+    // commanding forward speed (up to kMaxSweepSpeed) while true position
+    // sat frozen for 100+ seconds, because the car was physically wedged
+    // against a cone and this control stack had no reverse capability at
+    // all to back out of contact. NOT used for the normal steering
+    // decision (that stays purely geometric/body-frame, unaffected by
+    // localization quality) -- only for this one recovery check, so a
+    // temporarily-degraded pose estimate can only ever affect HOW FAST
+    // recovery kicks in, never normal driving.
+    double worldX = 0.0;
+    double worldY = 0.0;
+    bool poseValid = false;
 };
 
 // A controller's output, in the same body-velocity convention

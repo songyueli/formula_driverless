@@ -64,4 +64,45 @@ public:
 
 private:
     int m_consecutiveEmptyCycles = 0;
+
+    // Universal stuck-detection state -- see kStuckCyclesBeforeReverse's
+    // comment in the .cpp for why this exists (a confirmed real deadlock:
+    // physically wedged against a cone, so no forward/turning command --
+    // NORMAL path-following included, not just the empty-path creep/sweep
+    // -- could ever produce real displacement) and why it has to run
+    // regardless of which branch of Compute() is otherwise active.
+    // m_anchor{X,Y} is the world position the CURRENT displacement window
+    // is measured from; it rolls forward to the latest position every time
+    // real progress is confirmed (see Compute()), so "stuck" means "hasn't
+    // meaningfully moved in the last kStuckCyclesBeforeReverse cycles",
+    // not "hasn't moved since some arbitrary fixed point in the past".
+    // m_reverseCyclesRemaining counts down an in-progress backward
+    // maneuver, checked first in Compute() so it always runs to completion
+    // once triggered.
+    bool m_haveAnchor = false;
+    double m_anchorX = 0.0;
+    double m_anchorY = 0.0;
+    int m_cyclesSinceAnchor = 0;
+    int m_reverseCyclesRemaining = 0;
+    // Reverse ATTEMPT number in the current stuck episode -- 0 the first
+    // time reverse triggers; increments each time the car gets stuck AGAIN
+    // without any real (kStuckDistanceThreshold) progress happening since
+    // the previous reverse finished, reset to 0 once real progress DOES
+    // happen. Scales reverse duration on each retry -- see kMaxReverse
+    // Attempt's comment in the .cpp for why a single fixed-magnitude
+    // backup isn't always enough.
+    int m_reverseAttempt = 0;
+    // Set whenever the "real progress" branch fires in Compute() (see
+    // kStuckDistanceThreshold), cleared when a new reverse maneuver
+    // starts -- read at the START of the NEXT reverse to decide whether
+    // that one is a fresh episode (progress happened since the last
+    // reverse) or an escalating retry (it didn't).
+    bool m_madeProgressSinceLastReverse = false;
+    // +1 or -1, multiplies kSweepYawRate (and kReverseTurnRate) -- flips
+    // sign on every escalating reverse retry (see Compute()'s own comment
+    // at the reverse-trigger site for why): if the sweep's fixed turn
+    // direction happens to be exactly what re-drives the car back into
+    // the same obstacle every loop, no amount of extra reverse DISTANCE
+    // alone fixes that -- only trying the OTHER direction does.
+    double m_sweepDirection = 1.0;
 };
