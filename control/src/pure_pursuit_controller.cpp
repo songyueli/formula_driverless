@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 namespace
 {
@@ -215,17 +216,29 @@ DriveCommand PurePursuitController::Compute(const ControlInputs &inputs)
     // to cover BOTH normal path-following and the empty-path creep/sweep,
     // not just one of them (a confirmed real collision happened during
     // each).
+    //
+    // SAFETY OVERRIDE (2026-08-23): reverse driving is disallowed under FS
+    // driverless rules, no exceptions -- including recovering from a
+    // physical stall, which is what this watchdog was originally built for
+    // (see kReverseSpeed/kReverseCycles below, now unused by this branch).
+    // A stuck car must come to a full stop and be treated as a failure
+    // requiring external intervention (operator/sim reset), not attempt to
+    // self-recover by reversing. This branch used to command
+    // DriveCommand{kReverseSpeed, ...} here and in the stuck-trigger branch
+    // below; both now command a hard stop instead. m_reverseCyclesRemaining
+    // is consequently never set to a nonzero value anymore (see below) --
+    // this dead branch is left in place (rather than deleted) so a future,
+    // rules-compliant recovery strategy (e.g. requesting an operator
+    // takeover, or a rules-legal forward-only re-route) has an obvious slot
+    // to land in without re-threading the watchdog's own state machine.
     if (m_reverseCyclesRemaining > 0)
     {
         --m_reverseCyclesRemaining;
         if (m_reverseCyclesRemaining == 0)
         {
-            // Reversing is done -- let the NEXT cycle re-anchor from
-            // wherever this backward travel actually left the car, rather
-            // than reusing the stale (stuck) anchor point.
             m_haveAnchor = false;
         }
-        return DriveCommand{kReverseSpeed, m_sweepDirection * kReverseTurnRate};
+        return DriveCommand{0.0, 0.0};
     }
 
     if (inputs.poseValid)
@@ -258,20 +271,23 @@ DriveCommand PurePursuitController::Compute(const ControlInputs &inputs)
             }
             else if (m_cyclesSinceAnchor > kStuckCyclesBeforeReverse)
             {
-                // Escalate only if the PREVIOUS reverse (if any) was
-                // immediately followed by getting stuck again with no real
-                // progress in between -- see kMaxReverseAttempt's comment.
-                m_reverseAttempt = m_madeProgressSinceLastReverse
-                                       ? 0
-                                       : std::min(m_reverseAttempt + 1, kMaxReverseAttempt);
-                m_madeProgressSinceLastReverse = false;
-                m_reverseCyclesRemaining = kReverseCycles * (1 + m_reverseAttempt);
-                // Flip search direction every time -- see m_sweepDirection's
-                // header comment for why a fixed direction can turn this
-                // into an endless "back up, re-approach the same obstacle"
-                // loop that no amount of extra reverse DISTANCE alone fixes.
-                m_sweepDirection = -m_sweepDirection;
-                return DriveCommand{kReverseSpeed, m_sweepDirection * kReverseTurnRate};
+                // SAFETY OVERRIDE (2026-08-23): see this function's top
+                // comment -- reverse is disallowed, so this no longer
+                // starts a reverse maneuver (m_reverseCyclesRemaining stays
+                // 0, m_reverseAttempt/m_madeProgressSinceLastReverse are
+                // consequently dead state too, left alone for the same
+                // reason noted above). Loudly logged to stderr (unbuffered,
+                // unlike stdout here -- see perception.cpp's own per-
+                // detection prints for why an unflushed stdout buffer can
+                // sit unseen for minutes) specifically so an external
+                // watcher can detect this and reset the sim -- a stuck car
+                // that cannot reverse has no other way out.
+                std::fprintf(stderr,
+                    "[STUCK] no forward progress for %d cycles at approx (%.2f,%.2f) -- "
+                    "reverse recovery is DISABLED (FS rules); holding position, needs external reset\n",
+                    m_cyclesSinceAnchor, inputs.worldX, inputs.worldY);
+                m_cyclesSinceAnchor = 0;  // throttle: re-warn, not spam every cycle, if still stuck
+                return DriveCommand{0.0, 0.0};
             }
         }
     }
