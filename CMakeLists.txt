@@ -232,6 +232,14 @@ target_link_libraries(foxglove_bridge
     gz-msgs::gz-msgs
     foxglove_cpp)
 
+# Standalone ground-truth accuracy evaluator -- not part of the autonomy
+# pipeline (dev_sim.sh doesn't launch it), a diagnostic tool run alongside
+# it. See tools/eval/eval_localization.cpp's own header comment.
+add_executable(eval_localization  tools/eval/eval_localization.cpp)
+target_link_libraries(eval_localization
+    gz-transport::gz-transport
+    gz-msgs::gz-msgs)
+
 # ---------------------------------------------------------------------------
 # tegrastats -- Jetson-only system-monitoring tool (part of L4T/JetPack, not
 # a library to link against -- foxglove_bridge spawns it as a subprocess and
