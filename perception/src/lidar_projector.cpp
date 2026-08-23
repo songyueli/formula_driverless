@@ -246,18 +246,16 @@ std::optional<LidarProjector::ConePosition> LidarProjector::Localize(
     // closest point) -- see kClusterRangeBand's comment for why this
     // excludes farther background/occlusion sharing the same 2-D box
     // rather than letting it drag the centroid off the cone entirely.
-    float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
-    int count = 0;
+    // Points are RETAINED individually (not just summed) so Pass 3 below
+    // can check their actual spatial spread, not just their range band.
+    std::vector<const ConePosition *> cluster;
     for (const ConePosition *p : inBox)
     {
         if (p->range > nearestRange + kClusterRangeBand)
         {
             continue;
         }
-        sumX += p->x;
-        sumY += p->y;
-        sumZ += p->z;
-        ++count;
+        cluster.push_back(p);
     }
 
     // Not enough independent lidar evidence to be confident this is a real,
@@ -266,12 +264,52 @@ std::optional<LidarProjector::ConePosition> LidarProjector::Localize(
     // existing philosophy (a detection can legitimately have NO match);
     // this just raises the bar from "at least one point" to "enough points
     // to trust a position from".
-    if (count < kMinPointsForDetection)
+    if (cluster.size() < static_cast<size_t>(kMinPointsForDetection))
     {
         return std::nullopt;
     }
 
+    float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
+    for (const ConePosition *p : cluster)
+    {
+        sumX += p->x;
+        sumY += p->y;
+        sumZ += p->z;
+    }
+    const int count = static_cast<int>(cluster.size());
     ConePosition centroid{sumX / count, sumY / count, sumZ / count, 0.0f};
+
+    // Pass 3: reject the WHOLE cluster if any point sits farther from the
+    // centroid (horizontal only -- same reasoning as
+    // kConeSurfaceToAxisCorrection's z-uncorrected note) than a real cone
+    // physically could. kClusterRangeBand alone only bounds DEPTH spread
+    // (range), not LATERAL spread -- two points at the same range but from
+    // the opposite edges of a wide 2-D box (spanning two adjacent, distinct
+    // objects: a cone plus background, or two different cones, at similar
+    // depth) both pass that check and get silently averaged into a
+    // between-two-objects centroid, correct for neither. Confirmed directly
+    // as a real, live failure mode: ground-truth comparison during sharp
+    // cornering found detections landing 5-11m off with BOTH large radial
+    // AND large tangential error simultaneously (tools/eval/eval_localization
+    // .cpp's decomposition) -- the tangential component in particular has no
+    // other plausible source, since range-axis noise/bias alone (what this
+    // file's other corrections target) cannot move a centroid sideways.
+    // kMaxClusterRadius=0.25m comfortably covers the largest real cone's own
+    // 0.1425m base radius (large_orange, simulation/models/cone_orange/
+    // model.sdf) plus lidar noise margin, while rejecting anything spanning
+    // toward a genuinely separate object -- real cones are >=1.97m apart on
+    // this track (see ekf.cpp's kDuplicatePruneRadius comment), far larger
+    // than this bound could ever bridge.
+    constexpr float kMaxClusterRadius = 0.25f; // meters, horizontal only
+    for (const ConePosition *p : cluster)
+    {
+        const float dx = p->x - centroid.x;
+        const float dy = p->y - centroid.y;
+        if (dx * dx + dy * dy > kMaxClusterRadius * kMaxClusterRadius)
+        {
+            return std::nullopt;
+        }
+    }
 
     // Push outward along the horizontal ray from the car's own origin --
     // see kConeSurfaceToAxisCorrection's comment for why. horizRange is
