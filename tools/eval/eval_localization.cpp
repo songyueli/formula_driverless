@@ -154,7 +154,7 @@ int main(int argc, char **argv)
     std::unordered_map<uint64_t, std::string> landmarkColorByUid;
 
     std::ofstream csv(csvPath, std::ios::trunc);
-    csv << "t_wall,kind,error_m,range_m,color,uid\n";
+    csv << "t_wall,kind,error_m,range_m,color,uid,radial_err_m,tangential_err_m\n";
     const auto t0 = std::chrono::steady_clock::now();
     auto nowSec = [&]() {
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -175,6 +175,30 @@ int main(int argc, char **argv)
             if (best < 0.0 || d < best) best = d;
         }
         return best < 0.0 ? std::nullopt : std::optional<double>(best);
+    };
+
+    // Same match, but also returns the matched cone's own (x,y) -- used by
+    // onDetections to decompose error into radial (along the detection's
+    // own ray from the car) vs. tangential (cross-ray) components, so a
+    // range-axis calibration issue can be told apart from a bearing one.
+    auto nearestGroundTruthCone = [&](double _x, double _y, const std::string &_color)
+        -> std::optional<GroundTruthCone>
+    {
+        double best = -1.0;
+        std::optional<GroundTruthCone> bestCone;
+        for (const auto &entry : groundTruthCones)
+        {
+            if (entry.second.color != _color) continue;
+            const double dx = entry.second.x - _x;
+            const double dy = entry.second.y - _y;
+            const double d = std::hypot(dx, dy);
+            if (best < 0.0 || d < best)
+            {
+                best = d;
+                bestCone = entry.second;
+            }
+        }
+        return bestCone;
     };
 
     std::function<void(const gz::msgs::Pose_V &)> onGtPose =
@@ -220,10 +244,22 @@ int main(int argc, char **argv)
             const double range = std::hypot(bx, by);
             const double worldX = groundTruthVehicle.x + bx * cosYaw - by * sinYaw;
             const double worldY = groundTruthVehicle.y + bx * sinYaw + by * cosYaw;
-            const auto err = nearestGroundTruth(worldX, worldY, color);
-            if (!err) continue;
-            detectionErrors.Add(*err);
-            csv << nowSec() << ",detection," << *err << "," << range << "," << color << ",\n";
+            const auto matched = nearestGroundTruthCone(worldX, worldY, color);
+            if (!matched) continue;
+            const double err = std::hypot(matched->x - worldX, matched->y - worldY);
+            detectionErrors.Add(err);
+            // Decompose into radial (along the detection's own ray from the
+            // car) vs. tangential (perpendicular to it) -- lets a range-axis
+            // calibration/bias issue (radial) be told apart from a
+            // bearing/angular one (tangential) instead of only seeing the
+            // combined scalar magnitude.
+            const double rayAngle = std::atan2(worldY - groundTruthVehicle.y, worldX - groundTruthVehicle.x);
+            const double cosRay = std::cos(rayAngle), sinRay = std::sin(rayAngle);
+            const double errX = matched->x - worldX, errY = matched->y - worldY;
+            const double radialErr = errX * cosRay + errY * sinRay;
+            const double tangentialErr = -errX * sinRay + errY * cosRay;
+            csv << nowSec() << ",detection," << err << "," << range << "," << color << ","
+                << "," << radialErr << "," << tangentialErr << "\n";
         }
     };
     if (!node.Subscribe("/cone_detections", onDetections))
