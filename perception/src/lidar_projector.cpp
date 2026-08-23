@@ -99,22 +99,34 @@ constexpr float kClusterRangeBand = 0.4f; // meters
 // still built ENTIRELY from near-facing-surface returns -- lidar has no
 // way to see a solid cone's far side or its own central axis, so the
 // centroid necessarily sits somewhere between the true axis and the near
-// surface, not AT the axis. Confirmed directly, not assumed: comparing raw
-// /cone_detections against ground truth from a perfectly stationary,
-// precisely known car pose (gz-sim's own set_pose service) measured a
-// consistent ~0.058m mean bias toward the car across 5 cones, ALWAYS in
-// the same direction (toward the sensor) -- matching, almost exactly, HALF
-// of the cone's own 0.115m base radius (simulation/models/cone_blue/
-// model.sdf) -- physically exactly what's expected from a centroid
-// averaged over points spanning the cone's tapered surface from base
-// (full 0.115m offset) up toward its tip (~0m offset), if hit heights are
-// roughly uniformly distributed. Pushing the centroid's HORIZONTAL
-// position outward along its own ray (away from the car) by this amount
-// recovers an estimate of the true central axis instead of the near
-// surface. z is left uncorrected -- the measured bias was in horizontal
-// (range) position only; this pipeline's downstream consumers (EKF
-// landmarks, ground-truth comparison) only ever use (x, y) too.
-constexpr float kConeSurfaceToAxisCorrection = 0.058f; // meters
+// surface, not AT the axis. The ORIGINAL version of this constant (+0.058m,
+// pushing the centroid OUTWARD/away from the car) was calibrated against a
+// stationary 5-cone test under the lidar's PREVIOUS 32-vertical-channel
+// configuration (see simulation/models/fsd_car/model.sdf's lidar <vertical>
+// block) -- reasoned as half the cone's 0.115m base radius, assuming hit
+// heights roughly uniform from base to tip.
+//
+// RE-CALIBRATED (2026-08-23) after restoring the lidar to its real
+// 128-channel spec (model.sdf, same commit): re-measured directly via live
+// ground-truth comparison (tools/eval/eval_localization.cpp, radial-error
+// column -- n=1323 detections across a live drive) and found the bias had
+// REVERSED direction, not just changed magnitude -- with the OLD +0.058m
+// correction still applied, detections were landing ~0.146m median TOO FAR
+// from the car (radial error -- truth minus detected, projected along the
+// detection's own ray -- median -0.146m), meaning the RAW pre-correction
+// centroid was ALREADY ~0.088m too far outward on its own (0.146 - 0.058),
+// not too close. Plausible mechanism: 4x denser vertical sampling changes
+// which points populate the kClusterRangeBand=0.4m near-surface cluster
+// (see Localize() below) -- likely capturing more of the cone's curved
+// near-hemisphere spread rather than the sparse, base-concentrated hits 32
+// channels produced, shifting the raw centroid's own average depth. Rather
+// than re-derive the new geometry analytically, this value is set directly
+// from the measured bias (same as the original process): -0.088m (inward,
+// sign flipped from before) cancels the observed +0.088m raw bias. Tangential
+// (bearing) error was independently confirmed unbiased (median +0.01m,
+// same measurement) -- this stays a pure radial (horizontal-range-only, z
+// uncorrected) correction, not a 2-D one, for the same reason as before.
+constexpr float kConeSurfaceToAxisCorrection = -0.088f; // meters
 } // namespace
 
 LidarProjector::LidarProjector(int panoWidth, int panoHeight, double fPano)
