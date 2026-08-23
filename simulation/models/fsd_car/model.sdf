@@ -82,10 +82,21 @@
               <max_angle>3.14159</max_angle>
             </horizontal>
             <vertical>
-              <samples>32</samples>  <!-- reduced from 128 (real OS1-128 channel
-                                          count) for dev-time render cost on
-                                          software rendering; bump back up once
-                                          perception actually consumes this -->
+              <!-- Restored to 128 (real OS1-128 channel count) -- was reduced
+                   to 32 for dev-time render cost before perception consumed
+                   this data at all. Now that it does, the tradeoff is
+                   reversed: confirmed directly (2026-08-23 ground-truth
+                   comparison) that /cone_detections error jumps sharply past
+                   ~14m range (median ~0.16-0.26m under 14m vs ~0.9-3.7m
+                   beyond it) -- exactly the range where 32 channels' vertical
+                   spacing (45deg/32 =~1.4deg, ~0.37m between rings at 15m,
+                   comparable to a cone's own 0.325m height) starts leaving a
+                   cone's surface hit by only 0/1 rings, well under
+                   kMinPointsForDetection=2 (lidar_projector.cpp) or thin
+                   enough that a single stray background point can dominate
+                   the centroid. 128 channels (45deg/128=~0.35deg, ~0.09m
+                   spacing at 15m) puts several rings on even a far cone. -->
+              <samples>128</samples>
               <min_angle>-0.3927</min_angle>
               <max_angle>0.3927</max_angle>
             </vertical>
