@@ -195,6 +195,45 @@ constexpr double kCoarseGateRadius = 15.0; // meters
 // what makes RetiredGridQuery's fixed 3x3 neighborhood search provably
 // correct rather than just empirically adequate.
 constexpr double kRetiredGridCellSize = kCoarseGateRadius; // meters
+
+// Minimum P22 (yaw variance) StabilizeCovariance ever leaves the filter
+// with -- separate from, and much larger than, kMinVariance's own 1e-9
+// purely-numerical floor (StabilizeCovariance, above). Confirmed directly
+// as a real, severe pathology, not theoretical: diagnostic instrumentation
+// on CorrectHeading (localization.cpp's dual-antenna GNSS-compass
+// correction, R = (0.15deg)^2 = 6.854e-6 rad^2 -- see its own kGnssHeading
+// StddevDeg) showed P22 already sitting at the 1e-9 numerical floor by the
+// SECOND-EVER logged heading correction (P22 four orders of magnitude
+// BELOW the sensor's own R), producing a near-zero Kalman gain (K1 on the
+// order of 1e-5 to 1e-4) on every subsequent heading correction regardless
+// of the actual innovation -- i.e. the filter had made itself deaf to its
+// single most precise absolute yaw reference. Root cause: EVERY landmark
+// correction ALSO touches the yaw column (CorrectMatchedLandmark's H is
+// nonzero at index 2, see LandmarkInnovation), and at camera rate with
+// many cones visible per frame this fires far more often, with a far
+// tighter effective R at close range (kLandmarkBaseStddev=0.1m -- see
+// localization.cpp), than the ~0.0001 rad^2/s process-noise floor already
+// added in Predict() can keep pace with -- P22 gets driven down past what
+// the vehicle's ACTUAL yaw uncertainty (confirmed 0.2-1.3deg live, via
+// ground-truth comparison) ever justified, and once collapsed this far the
+// filter STOPS LEARNING from new measurements, letting that error persist
+// indefinitely instead of being corrected away -- which then propagates,
+// range-amplified, into every landmark/cone-detection world-frame position
+// (a small heading error becomes a LARGE cross-range position error at
+// real cone ranges of 10-20m). This floor is set to keep the GNSS-heading
+// correction's own Kalman gain meaningfully large (K1 ~0.8, i.e. GNSS
+// heading stays close to fully trusted every single correction) rather
+// than trying to out-tune the process-noise ADD rate against an unbounded,
+// landmark-count-dependent shrink rate -- (0.3deg)^2 in rad^2 is ~4x the
+// heading sensor's own R, comfortably tighter than the actual measured
+// error (so it doesn't add meaningful noise to an already-working
+// subsystem) while guaranteeing GNSS heading can never be effectively
+// ignored the way it was being ignored here. Deliberately scoped to ONLY
+// yaw (index 2, not position 0/1): pose position error was independently
+// confirmed accurate (~1cm, well within spec) throughout the same test, so
+// there's no confirmed problem there to fix, and floors are not a
+// zero-risk change to make speculatively.
+constexpr double kYawVarianceFloor = (0.3 * M_PI / 180.0) * (0.3 * M_PI / 180.0); // rad^2
 } // namespace
 
 namespace fsd
@@ -260,6 +299,20 @@ void Ekf::StabilizeCovariance(const std::vector<int> &_touchedIndices)
         {
             m_P(i, i) = kMinVariance;
         }
+    }
+
+    // Yaw-specific sane floor -- see kYawVarianceFloor's own comment for
+    // the confirmed collapse this fixes. Applied AFTER the generic
+    // numerical floor above (so it only ever raises P22 further, never
+    // conflicts with it) and unconditionally (every StabilizeCovariance
+    // call, not just ones whose _touchedIndices include yaw) -- P22 can be
+    // driven down by ANY correction that touches index 2 (GNSS position,
+    // heading, every single landmark), so checking it here once per call
+    // is simpler and no more expensive than duplicating this check at
+    // every one of those call sites individually.
+    if (m_P(2, 2) < kYawVarianceFloor)
+    {
+        m_P(2, 2) = kYawVarianceFloor;
     }
 
     // Clamp off-diagonal entries among _touchedIndices to the range a
