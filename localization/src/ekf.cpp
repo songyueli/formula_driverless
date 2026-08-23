@@ -597,11 +597,12 @@ void Ekf::CorrectHeading(double _measuredYaw, double _stddev)
 
     static int diagCalls = 0;
     const bool diag = diagCalls % kDiagLogEvery == 0;
-    double beforeX = 0, beforeY = 0;
+    double beforeX = 0, beforeY = 0, beforeP22 = 0;
     if (diag)
     {
         beforeX = m_x(0);
         beforeY = m_x(1);
+        beforeP22 = m_P(2, 2);
     }
 
     Eigen::MatrixXd Hsub(1, 1);
@@ -614,9 +615,16 @@ void Ekf::CorrectHeading(double _measuredYaw, double _stddev)
 
     if (diag)
     {
+        // TEMPORARY (covariance-collapse investigation): P22 (yaw variance)
+        // and R side by side -- if P22 << R, the Kalman gain K1 = P22/(P22+R)
+        // is necessarily near-zero regardless of how large/small the actual
+        // innovation y is, which is the direct, checkable signature of the
+        // filter having become overconfident (deaf) about yaw specifically.
         std::fprintf(stderr,
-            "[DIAG Heading] #%d z=%.4f h=%.4f y=%.4f K1=%.4f | before x=%.3f y=%.3f -> after x=%.3f y=%.3f\n",
-            diagCalls, _measuredYaw, h, y, K(1, 0), beforeX, beforeY, m_x(0), m_x(1));
+            "[DIAG Heading] #%d z=%.4f h=%.4f y=%.6f K1=%.6f R=%.3e P22_before=%.3e P22_after=%.3e | "
+            "before x=%.3f y=%.3f -> after x=%.3f y=%.3f\n",
+            diagCalls, _measuredYaw, h, y, K(1, 0), R(0, 0), beforeP22, m_P(2, 2),
+            beforeX, beforeY, m_x(0), m_x(1));
     }
     ++diagCalls;
 }
