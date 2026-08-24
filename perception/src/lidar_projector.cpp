@@ -24,31 +24,79 @@ constexpr double kCamPitchRad = 0.3;
 // Localize() picks whichever cached point has the smallest RANGE among
 // everything landing inside a detection's 2-D box -- it has no notion of
 // whether that point is actually a good depth match for what's IN the box,
-// just that its projection happens to overlap it. Near-ground and
-// self-referential returns close to the car (verified directly against a
-// real lidar scan: ~100+ such points, ALL measuring 2.94-3.0m range,
-// landing inside valid panorama pixel space near its lower edge, where
-// the ground close to the car is visible) will always win that comparison
-// against a real cone's actual, farther surface if their projections
-// happen to overlap the same box -- silently mislocalizing the detection
-// to wherever the car currently is instead of the cone. That produces
-// landmarks that trace the car's own path rather than real cone
-// positions, confirmed directly against a live capture.
+// just that its projection happens to overlap it. Near-ground/
+// self-referential returns close to the car (a one-time measurement found
+// ~100+ such points, ALL at 2.94-3.0m range) will win that comparison
+// against a real cone's actual surface if their projections happen to
+// overlap the same box -- CONFIRMED as a real, ongoing, non-hypothetical
+// failure mode (2026-08-23): with all range/height filtering removed,
+// every single remaining badly-off close-range detection landed at
+// 2.87-3.06m range, right in this exact measured band, with a suspiciously
+// consistent body-frame position across many different real cones -- the
+// artifact itself, not noise.
 //
-// 4.0m gives that measured 2.94-3.0m cluster comfortable margin, while
-// staying well under every real cone detection range actually observed
-// live (6m+ once the panorama-edge duplicate case is excluded separately
-// -- see perception.cpp's kPanoEdgeMarginPx). An earlier version of this
-// fix used 1.5m -- comfortably WRONG, since it sat entirely below the
-// measured 2.94-3.0m artifact range and excluded nothing; left here as a
-// reminder to verify a threshold against the actual measured data driving
-// it, not just what "sounds" plausible.
-constexpr float kMinValidRange = 4.0f; // meters
+// Getting a filter for this that doesn't ALSO exclude real cone data took
+// 6 attempts (see git history for the full trail of the first 5, kept here
+// as a map of the dead ends so they aren't re-tried the same ways): (1) a
+// blanket "exclude everything under 4.0m" floor -- excluded real cones
+// observed as close as ~3.5-5m right along with the artifact; (2) a
+// 1m-wide RANGE band (2.5-3.5m) -- still wide enough to slice a real
+// cone's own near-surface cluster (which has real depth) in half,
+// discarding its near portion; (3) a tight 0.26m range band (2.84-3.10m)
+// -- better but still clipped real clusters straddling even that narrow
+// window (72% -> 28% of close+high-azimuth detections badly off, not 0%);
+// (4) filtering on absolute HEIGHT (chassis-frame Z) instead of range, or
+// (5) requiring BOTH range and height together -- both WRONG for the same
+// underlying reason: these cones are short (0.325-0.505m) and the lidar
+// looks down at them from above, so a large share of a cone's own genuine
+// near-surface hits, not just the base rim, also land at low Z -- so
+// absolute height doesn't actually add discriminating power within the
+// artifact's own narrow range window, where real close-cone points are
+// ALSO predominantly low. All 5 either clipped real data or, at best
+// (removing every filter), left the 2.87-3.06m artifact as an accepted,
+// unfixed cost.
+//
+// (6), the one actually in place: reject a cluster by its Z-SPREAD (Pass 4
+// below), not its absolute height or range. Flat ground has near-zero
+// vertical extent regardless of where it sits in chassis-frame Z; a real
+// cone's curved/tapering surface, even sparsely sampled, shows a real
+// spread across whatever height its hit lidar rings land at. Confirmed
+// directly (temporary per-cluster diagnostic logging at the known artifact
+// range window, not assumed): the live data came back cleanly bimodal,
+// 0.000-0.023m z-spread for what's almost certainly the flat artifact vs.
+// 0.195-0.263m for what's almost certainly a real cone's base-to-partway
+// -up-the-cone spread, with a wide, completely unoccupied gap between the
+// two groups and zero overlap in the sampled data -- Pass 4's own
+// kMinConeZSpread sits in that gap. This is also why (4)/(5) above failed
+// where this succeeds: those checked WHERE a point sits (which conflates
+// a cone's own low base-rim hits with ground), this checks how much
+// vertical SPREAD the whole cluster has (which doesn't -- a flat surface
+// stays flat regardless of which absolute height it happens to sit at).
+//
+// Directly verified this doesn't reintroduce the ORIGINAL, worse
+// "landmarks trace the car's own path" failure the very first (range-only)
+// version of this filter was built for: a dedicated live check comparing
+// each new landmark's own position against the vehicle's ground-truth
+// position at that same moment, run with NO artifact filter of any kind
+// present, found only 1-3 of ~440 first-seen landmarks created within 2m
+// of the vehicle across several separate live runs, every one of them
+// matching a real ground-truth cone with modest (0.02-0.54m, not
+// catastrophic) error -- not the "landmark lands essentially AT the car,
+// with large error vs any real cone" signature the original bug had.
+// Plausible explanation: Pass 3 below (kMaxClusterRadius, rejecting a
+// cluster whose points span too wide an AREA) didn't exist yet when the
+// original artifact was found, and the azimuth-dependent pitch/yaw fix in
+// camera_stitcher.cpp (same date) also changes which lidar points a given
+// box's pixels actually correspond to -- one or both of those already-
+// independently-justified fixes appears to have resolved the WORST form
+// of the original problem as a side effect, with Pass 4 below now closing
+// the smaller remaining gap those left behind.
 
 // Localize() has no notion of whether the closest-range point inside a
 // box is actually a good depth match for what's in it (see this file's
 // class comment above) -- that's a real problem in BOTH directions, not
-// just the near-ground one kMinValidRange guards against. At long range a
+// just the near-ground artifact Pass 4 (below) guards against -- see this
+// file's class comment above. At long range a
 // detection's 2-D box is only a few pixels wide, so the angular resolution
 // covering it is coarse enough that unrelated background/terrain points
 // far behind the actual cone can easily land inside the same tiny box and
@@ -62,8 +110,8 @@ constexpr float kMinValidRange = 4.0f; // meters
 // distance is large relative to close-range detections, so seeding a
 // landmark from it starts that landmark's estimate from a much worse prior
 // than usual. 20m is comfortably beyond every real, reliable detection
-// actually observed live (2-6m for the near/working cases -- see
-// kMinValidRange's comment), while safely excluding the ~50m artifact.
+// actually observed live (2-6m for the near/working cases), while safely
+// excluding the ~50m artifact.
 constexpr float kMaxValidRange = 20.0f; // meters
 
 // A single nearest-range point (the previous version of Localize()) is a
@@ -239,7 +287,7 @@ std::optional<LidarProjector::ConePosition> LidarProjector::Localize(
         {
             continue;
         }
-        if (p.pos.range < kMinValidRange || p.pos.range > kMaxValidRange)
+        if (p.pos.range > kMaxValidRange)
         {
             continue;
         }
@@ -316,12 +364,50 @@ std::optional<LidarProjector::ConePosition> LidarProjector::Localize(
         }
     }
 
+    // Pass 4: reject a cluster whose points are all at nearly the same
+    // HEIGHT -- the actual, physically-motivated signature of flat ground
+    // (this file's class comment's near-ground artifact, and any other
+    // flat surface a box might catch), as opposed to a real cone's own
+    // curved/tapering surface, which -- even sparsely sampled -- shows a
+    // real spread across height wherever multiple lidar rings land on it.
+    // Confirmed directly (2026-08-23, temporary per-cluster diagnostic
+    // logging, not assumed): sampled live at the exact range window
+    // (2.80-3.15m) where this file's class comment's artifact was
+    // independently measured, cluster z-spread came back CLEANLY bimodal
+    // with a wide gap and zero overlap -- 0.000-0.023m for what's almost
+    // certainly the flat artifact, 0.195-0.263m for what's almost
+    // certainly a real cone's own base-to-partway-up-the-cone spread
+    // (consistent with these cones' actual 0.325-0.505m height). Notably
+    // NOT the same thing as filtering on absolute height (attempted and
+    // reverted earlier, see this file's class comment): that same data
+    // showed every cluster's own LOWEST point sitting close to the same
+    // ~-0.32m chassis-frame Z regardless of which group it belonged to --
+    // the chassis origin isn't at ground level the way that attempt
+    // assumed, but the *spread* within a cluster still cleanly separates
+    // flat ground from a real cone's height profile without needing to
+    // know where "ground" sits in chassis-frame Z at all.
+    // kMinConeZSpread sits in the (large, unambiguous in the sampled data)
+    // gap between the two groups, well clear of either.
+    constexpr float kMinConeZSpread = 0.08f; // meters
+    float zMin = cluster.front()->z, zMax = cluster.front()->z;
+    for (const ConePosition *p : cluster)
+    {
+        zMin = std::min(zMin, p->z);
+        zMax = std::max(zMax, p->z);
+    }
+    if (zMax - zMin < kMinConeZSpread)
+    {
+        return std::nullopt;
+    }
+
     // Push outward along the horizontal ray from the car's own origin --
     // see kConeSurfaceToAxisCorrection's comment for why. horizRange is
     // the pre-correction horizontal distance; guarded against ~0 (a cone
     // directly on top of the car's origin isn't a real case this pipeline
-    // ever sees -- kMinValidRange already excludes anything under 4m --
-    // but division by a near-zero horizRange would be undefined otherwise).
+    // ever sees -- the car's own physical footprint rules it out well
+    // before horizRange could actually reach 0, and there's no range/height
+    // filter left to bound this by at all -- but division by a near-zero
+    // horizRange would be undefined otherwise).
     const float horizRange = std::sqrt(centroid.x * centroid.x + centroid.y * centroid.y);
     if (horizRange > 1e-3f)
     {

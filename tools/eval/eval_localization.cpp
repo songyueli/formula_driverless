@@ -160,7 +160,7 @@ int main(int argc, char **argv)
     // user report that detections get much worse for cones near the
     // sides of the car, which error_m/radial_err_m/tangential_err_m alone
     // can't correlate against without this.
-    csv << "t_wall,kind,error_m,range_m,color,uid,radial_err_m,tangential_err_m,azimuth_deg\n";
+    csv << "t_wall,kind,error_m,range_m,color,uid,radial_err_m,tangential_err_m,azimuth_deg,second_nearest_m\n";
     const auto t0 = std::chrono::steady_clock::now();
     auto nowSec = [&]() {
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -205,6 +205,41 @@ int main(int argc, char **argv)
             }
         }
         return bestCone;
+    };
+
+    // Distance from (_x,_y) to the SECOND-nearest same-color ground-truth
+    // cone -- added specifically (2026-08-23) to check whether a large
+    // detection error is a genuine gross position miss (second-nearest
+    // stays far away, comparable to normal cone spacing) or actually a
+    // cone-IDENTITY mismatch (the detection's true intended cone WAS
+    // matched, but a neighboring same-color cone happens to sit almost as
+    // close, meaning nearestGroundTruthCone's own "closest wins" logic
+    // could easily be matching the WRONG cone for one detection and the
+    // RIGHT one for the next, without the error metric alone being able to
+    // tell those apart). A small gap between nearest and second-nearest for
+    // a badly-off detection is the signature of the latter, not the
+    // former.
+    auto secondNearestDist = [&](double _x, double _y, const std::string &_color)
+        -> std::optional<double>
+    {
+        double best = -1.0, second = -1.0;
+        for (const auto &entry : groundTruthCones)
+        {
+            if (entry.second.color != _color) continue;
+            const double dx = entry.second.x - _x;
+            const double dy = entry.second.y - _y;
+            const double d = std::hypot(dx, dy);
+            if (best < 0.0 || d < best)
+            {
+                second = best;
+                best = d;
+            }
+            else if (second < 0.0 || d < second)
+            {
+                second = d;
+            }
+        }
+        return second < 0.0 ? std::nullopt : std::optional<double>(second);
     };
 
     std::function<void(const gz::msgs::Pose_V &)> onGtPose =
@@ -265,8 +300,19 @@ int main(int argc, char **argv)
             const double radialErr = errX * cosRay + errY * sinRay;
             const double tangentialErr = -errX * sinRay + errY * cosRay;
             const double azimuthDeg = std::atan2(by, bx) * 180.0 / M_PI;
+            const auto secondDist = secondNearestDist(worldX, worldY, color);
+            // bx,by,worldX,worldY,truthX,truthY (raw coordinate pairs, not
+            // just the derived error/radial/tangential scalars) let a
+            // specific bad case be inspected directly rather than only
+            // reasoned about from aggregate stats -- added 2026-08-23
+            // diagnosing the close-range lidar-artifact-filter bug (see
+            // lidar_projector.cpp's class comment), kept since it's
+            // generally useful for any future case like it.
             csv << nowSec() << ",detection," << err << "," << range << "," << color << ","
-                << "," << radialErr << "," << tangentialErr << "," << azimuthDeg << "\n";
+                << "," << radialErr << "," << tangentialErr << "," << azimuthDeg << ","
+                << (secondDist ? *secondDist : -1.0) << ","
+                << bx << "," << by << "," << worldX << "," << worldY << ","
+                << matched->x << "," << matched->y << "\n";
         }
     };
     if (!node.Subscribe("/cone_detections", onDetections))
@@ -300,7 +346,21 @@ int main(int argc, char **argv)
                 landmarkFirstErrorByUid[uid] = *err;
                 landmarkColorByUid[uid] = color;
                 landmarkFirstErrors.Add(*err);
-                csv << nowSec() << ",landmark_first," << *err << ",," << color << "," << uid << "\n";
+                // distToVehicleAtCreation: distance from this landmark's own
+                // first-seen position to the vehicle's ground-truth position
+                // at that same moment -- added 2026-08-23 to directly check
+                // for the classic "landmarks trace the car's own path"
+                // near-ground-artifact signature (a landmark created
+                // essentially AT the car's own position, not at a real
+                // standoff distance) rather than inferring it indirectly;
+                // kept as a standing check against that signature
+                // reappearing in the future (see lidar_projector.cpp's
+                // class comment for the investigation this was built for).
+                const double distToVehicleAtCreation = haveGroundTruthVehicle
+                    ? std::hypot(x - groundTruthVehicle.x, y - groundTruthVehicle.y)
+                    : -1.0;
+                csv << nowSec() << ",landmark_first," << *err << ",," << color << "," << uid
+                    << ",,,,," << x << "," << y << "," << distToVehicleAtCreation << "\n";
             }
         }
     };
