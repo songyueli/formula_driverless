@@ -104,42 +104,61 @@
 
 namespace
 {
-constexpr int kCamWidth = 1440;
-constexpr int kCamHeight = 1080;
-constexpr double kCamHFovRad = 0.7854;   // 45 deg -- model.sdf <horizontal_fov>
-constexpr double kCamYawLeftRad = 0.6;   // model.sdf camera_left <pose> yaw
-constexpr double kCamYawRightRad = -0.6; // model.sdf camera_right <pose> yaw
+// Resolution halved to 720x540 (2026-08-23) to raise the pipeline's
+// real-time-factor -- see model.sdf's own comment on this same change for
+// the full story (root cause of the crash this first hit was a real VPI
+// bug in camera_stitcher.cpp, fixed there, unrelated to resolution or
+// pixel alignment per se). Yaw widened from 0.6 to 0.68 rad (2026-08-23,
+// direct user request/decision) is a separate, unrelated change that
+// stuck through all of this. Must stay in sync with model.sdf's camera
+// <image>/<pose> values by hand -- see that file's own comments on this
+// same change.
+constexpr int kCamWidth = 720;
+constexpr int kCamHeight = 540;
+constexpr double kCamHFovRad = 0.7854;    // 45 deg -- model.sdf <horizontal_fov>
+constexpr double kCamYawLeftRad = 0.68;   // model.sdf camera_left <pose> yaw
+constexpr double kCamYawRightRad = -0.68; // model.sdf camera_right <pose> yaw
 
-// Panorama size / FOV: 80 deg (a bit under double a single camera's own
-// 45 deg), prioritizing vertical lookahead over peripheral horizontal
-// coverage.
+// Panorama size / FOV: kept FOV widened from 80 deg to 108 deg (2026-08-23,
+// direct user request to see more / reduce wasted overlap) -- the raw
+// combined 3-camera coverage at the new 0.68 rad yaw is ~122.9 deg (see
+// kCamYawLeftRad's own comment); 108 deg keeps essentially all of that
+// except a ~7.5 deg margin at each outer edge (the least reliable part of
+// each side camera's own image -- most lens falloff/distortion, same
+// reasoning the original 80 deg deliberately left unused space for,
+// just less of it now that less margin is needed to still avoid the
+// distorted extremes).
 //
 // Cylindrical projection (see camera_stitcher.hpp for why, over planar):
 // width uses the LINEAR cylindrical width-from-FOV formula (f * HFovRad,
 // not 2*f*tan(HFovRad/2)) so panorama-center resolution matches the source
 // cameras' own focal length (fx = 720 / tan(22.5 deg) =~ 1738 px/rad):
-// 1738 * 1.3963 =~ 2427 -- notably narrower than the ~2917 a planar
-// projection needed for the same 80 deg, since cylindrical has no
-// tan(theta) blowup toward the edges.
+// 1738 * 1.8850 =~ 3277 -- notably narrower than a planar projection would
+// need for the same 108 deg, since cylindrical has no tan(theta) blowup
+// toward the edges.
 //
 // Height: srcV/srcU are computed relative to the OUTPUT's own reference
 // axis (front, theta=0). For FRONT (yaw=0), fwd/fwdI ratio = cos(theta),
 // same as any single rectilinear camera's own falloff toward its edges --
-// 1.0 at center, worst at FRONT's own edges (the seams, offset = 34.377/2
-// = 17.19 deg from center): cos(17.19 deg) =~ 0.9553. For LEFT/RIGHT the
-// same ratio is 1.0 at THEIR OWN optical center (yaw = +-34.377 deg, which
-// falls inside their owned range) and, examined via calculus, monotonic in
-// theta within their owned range -- so it's ALSO worst exactly at the
-// seams (0.9553, matching FRONT's value there by symmetry), improving in
-// both directions from there (back toward center, and back out toward the
-// wide edges). So the true worst case across the WHOLE panorama is at the
-// two seams, not the outer edges: needed height =
-// 2 * fx * (source's own half-height / fy) / 0.9553 =~ 1130 -- covers
-// every pixel with no gaps, no per-camera-region cropping tradeoff needed
-// (unlike the planar version this replaced).
-constexpr int kPanoWidth = 2427;
-constexpr int kPanoHeight = 1130;
-constexpr double kPanoHFovRad = 1.3963; // 80 deg
+// 1.0 at center, worst at FRONT's own edges (the seams, offset =
+// yawOffset/2 = 0.68/2 = 0.34 rad = 19.48 deg from center): cos(19.48 deg)
+// =~ 0.9428. For LEFT/RIGHT the same ratio is 1.0 at THEIR OWN optical
+// center (yaw = +-38.97 deg, which falls inside their owned range) and,
+// examined via calculus, monotonic in theta within their owned range --
+// so it's ALSO worst exactly at the seams (0.9428, matching FRONT's value
+// there by symmetry), improving in both directions from there (back
+// toward center, and back out toward the wide edges). So the true worst
+// case across the WHOLE panorama is at the two seams, not the outer
+// edges: needed height = source height / 0.9428 (the fx/fy terms of the
+// general 2*fx*(halfHeight/fy)/cosine formula cancel out to exactly this
+// under a square-pixel assumption, fx=fy -- verified directly against the
+// previous 0.6rad value: 1080/cos(17.19 deg) = 1080/0.9553 =~ 1130.6,
+// matching the previously-shipped 1130 exactly) =~ 1080/0.9428 =~ 1146 --
+// covers every pixel with no gaps, no per-camera-region cropping tradeoff
+// needed (unlike the planar version this replaced).
+constexpr int kPanoWidth = 1638;
+constexpr int kPanoHeight = 573;
+constexpr double kPanoHFovRad = 1.8850; // 108 deg
 
 // Run from the repo root (matches every other script/binary in this
 // project -- see dev_sim.sh), so this resolves relative to /workspace.

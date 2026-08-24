@@ -115,13 +115,42 @@
         <topic>/lidar/points</topic>
       </sensor>
 
+      <!-- Camera resolution halved to 720x540 (2026-08-23) to raise the
+           whole pipeline's real-time-factor -- update_rate is a SIM-TIME
+           rate, so wall-clock camera Hz = update_rate * RTF, and the ~4Hz
+           feed the halving was meant to fix was a symptom of RTF sitting
+           around 0.15-0.27 under the full pipeline's load, not a
+           camera-config problem on its own. A first attempt at this cut
+           crashed perception reliably (nv::cuda::RuntimeException --
+           cudaErrorIllegalAddress inside vpiCreateRemap()) at both 720x540
+           and 640x480, which first looked like a resolution/alignment
+           problem but was root-caused (via CUDA_LAUNCH_BLOCKING=1 + gdb
+           backtrace, then a diagnostic print of the exact failing rect) to
+           a real VPI bug: camera_stitcher.cpp was cropping each camera's
+           warp map to a REQUESTED rect whose width/height weren't
+           multiples of 16 (e.g. 591x539), which VPI's vpiCreateRemap()
+           doesn't handle safely -- fixed there by padding that rect up to
+           16-pixel alignment before use (see that file's comment). RTF
+           itself turned out to be dominated by something else entirely:
+           the Jetson's GPU was stuck at its minimum clock (306 of
+           1300 MHz) after a reboot until `jetson_clocks` was reapplied --
+           doing so alone raised RTF from ~0.12 to ~0.31, a far bigger
+           lever than resolution. Lidar (128-channel gpu_lidar, see below)
+           and a coarser 2ms physics step were both tested as further RTF
+           levers and ruled out/reverted: lidar wasn't a meaningful cost
+           (RTF unchanged with it fully disabled), and while 2ms physics
+           did push RTF to ~0.54, it broke this morning's localization
+           accuracy fix badly (landmark 1st-seen error median 0.618m
+           against the <=0.20m requirement, 84.7% over) -- reverted to the
+           original 1ms step. Net result: ~9.3-9.6Hz per camera at RTF
+           ~0.31-0.32, 1ms physics, accuracy intact. -->
       <sensor name="camera_front" type="camera">
         <pose>0.9 0 1.0 0 0.3 0</pose>  <!-- 1m up, pitched down ~17 deg -->
         <update_rate>30</update_rate>
         <camera>
           <image>
-            <width>1440</width>
-            <height>1080</height>
+            <width>720</width>
+            <height>540</height>
           </image>
           <horizontal_fov>0.7854</horizontal_fov>  <!-- 45 deg -->
         </camera>
@@ -130,13 +159,28 @@
         <topic>/camera/front/image</topic>
       </sensor>
 
+      <!-- Yaw widened from 0.6 to 0.68 rad (2026-08-23, direct user
+           request to reduce camera overlap and see more) -- reduces the
+           front/side overlap from ~10.6deg to ~6.0deg of each camera's own
+           45deg FOV, and widens the combined raw 3-camera coverage from
+           ~113.8deg to ~122.9deg. Must stay < the 45deg (0.7854 rad) HFOV
+           itself, or the cameras would have a genuine gap between them
+           with no coverage at all -- 0.68 rad (38.97 deg) leaves 6.04deg
+           of margin below that ceiling. Must stay in sync with
+           perception.cpp's kCamYawLeftRad/kCamYawRightRad, and with
+           kPanoWidth/kPanoHeight there (both derived from this angle --
+           see that file's own comment for the exact formulas). Confirmed
+           directly NOT implicated in the resolution-change crash
+           described above -- tested at both the original and this new
+           angle, crossed with both the original and reduced resolution,
+           and only the resolution ever correlated with the crash. -->
       <sensor name="camera_left" type="camera">
-        <pose>0.9 0 1.0 0 0.3 0.6</pose>  <!-- 1m up, pitched down ~17 deg, yawed ~34 deg left -->
+        <pose>0.9 0 1.0 0 0.3 0.68</pose>  <!-- 1m up, pitched down ~17 deg, yawed ~39 deg left -->
         <update_rate>30</update_rate>
         <camera>
           <image>
-            <width>1440</width>
-            <height>1080</height>
+            <width>720</width>
+            <height>540</height>
           </image>
           <horizontal_fov>0.7854</horizontal_fov>  <!-- 45 deg -->
         </camera>
@@ -146,12 +190,12 @@
       </sensor>
 
       <sensor name="camera_right" type="camera">
-        <pose>0.9 0 1.0 0 0.3 -0.6</pose>  <!-- 1m up, pitched down ~17 deg, yawed ~34 deg right -->
+        <pose>0.9 0 1.0 0 0.3 -0.68</pose>  <!-- 1m up, pitched down ~17 deg, yawed ~39 deg right -->
         <update_rate>30</update_rate>
         <camera>
           <image>
-            <width>1440</width>
-            <height>1080</height>
+            <width>720</width>
+            <height>540</height>
           </image>
           <horizontal_fov>0.7854</horizontal_fov>  <!-- 45 deg -->
         </camera>

@@ -57,6 +57,20 @@ if [ ! -x "$BRIDGE" ] || [ ! -x "$PERCEPTION" ] || [ ! -x "$LOCALIZATION" ] \
   exit 1
 fi
 
+# jetson_clocks locks CPU/GPU/EMC to their max frequencies -- only present
+# on Jetson hardware (a no-op check on a laptop/CI, where the command
+# doesn't exist). Not a nice-to-have: confirmed directly (2026-08-23) that
+# a Jetson boots with its GPU at minimum clock (306 of 1300 MHz) until this
+# runs, which alone was a 2.5x real-time-factor difference (0.12 -> 0.31)
+# for this exact pipeline -- bigger than any camera-resolution change.
+# `-n` (non-interactive) so a sudoers misconfiguration fails fast here
+# instead of hanging this script on a password prompt; failure is logged
+# but not fatal, since the sim is still usable (just slower) without it.
+if command -v jetson_clocks >/dev/null 2>&1; then
+  echo "Jetson detected -- locking clocks to max via jetson_clocks..."
+  sudo -n jetson_clocks || echo "warning: jetson_clocks failed (needs passwordless sudo) -- continuing without it" >&2
+fi
+
 echo "World: ${WORLD_NAME} (${WORLD})"
 
 # Track child PIDs so all six get cleaned up together (Ctrl+C, error, normal exit).

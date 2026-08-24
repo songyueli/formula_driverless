@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 
 #ifdef PERCEPTION_USE_VPI
 #include <vpi/OpenCVInterop.hpp>
@@ -216,7 +217,37 @@ CameraStitcher::CameraStitcher(int camWidth, int camHeight, double camHFovRad,
         // contributing its own share, so not handled as a real case (an
         // empty rect below would just make this camera silently invisible
         // in Stitch(), which is a real bug, not a graceful degradation).
-        const cv::Rect rect(minU, minV, maxU - minU + 1, maxV - minV + 1);
+        //
+        // Width/height padded up to a multiple of 16 (confirmed directly,
+        // not assumed, as the fix for a real crash: at some camera
+        // resolutions -- reproduced deterministically, including on a
+        // freshly rebooted Jetson with zero prior GPU/driver state, so
+        // this isn't leftover corruption from other testing -- an
+        // unpadded rect made vpiCreateRemap() throw
+        // cudaErrorIllegalAddress inside libnvvpi.so itself, every time,
+        // for a rect whose width/height were NOT multiples of 16; the
+        // vpiWarpMapAllocData call directly below already documents that
+        // VPI pads its own internal control-point storage to a multiple
+        // of 16 -- padding the REQUESTED region to match here means VPI
+        // is never asked to build a remap payload for a non-16-aligned
+        // logical size in the first place, sidestepping whatever its own
+        // internal padding does wrong in that case, rather than trying to
+        // fix a closed-source library from outside it). Grown
+        // symmetrically where possible, clamped to stay within the full
+        // panorama -- correctness is unaffected either way: Stitch()'s
+        // ownerMask (see below) already masks the composited output down
+        // to just this camera's OWN pixels regardless of how much extra
+        // margin the rect itself carries, so a few extra border pixels
+        // being remapped-but-unused costs a little wasted work, not
+        // correctness.
+        const auto roundUp16 = [](int v) { return ((v + 15) / 16) * 16; };
+        const int rawWidth = maxU - minU + 1;
+        const int rawHeight = maxV - minV + 1;
+        const int padWidth = std::min(outWidth, roundUp16(rawWidth));
+        const int padHeight = std::min(outHeight, roundUp16(rawHeight));
+        int rectX = std::clamp(minU - (padWidth - rawWidth) / 2, 0, outWidth - padWidth);
+        int rectY = std::clamp(minV - (padHeight - rawHeight) / 2, 0, outHeight - padHeight);
+        const cv::Rect rect(rectX, rectY, padWidth, padHeight);
         const cv::Mat croppedMapX = fullMapXs[i](rect);
         const cv::Mat croppedMapY = fullMapYs[i](rect);
 
