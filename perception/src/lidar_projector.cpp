@@ -14,6 +14,11 @@ namespace
 // model.sdf (see that file's comment for why the mount height changed).
 constexpr double kLidarX = 0.3, kLidarY = 0.0, kLidarZ = 0.6;
 constexpr double kCamX = 0.9, kCamY = 0.0, kCamZ = 1.0;
+// Same value as perception.cpp's own kCamPitchRad (which feeds
+// CameraStitcher's per-side-camera pitch+yaw composition, added
+// 2026-08-23) -- kept as a separate constant here rather than shared,
+// same reasoning as this file's other extrinsics, but MUST stay in sync
+// with that constant (and model.sdf's actual camera pitch) by hand.
 constexpr double kCamPitchRad = 0.3;
 
 // Localize() picks whichever cached point has the smallest RANGE among

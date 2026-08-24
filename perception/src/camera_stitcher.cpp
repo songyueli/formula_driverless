@@ -59,10 +59,13 @@ Intrinsics MakeIntrinsics(int width, int height, double hfovRad)
 
 CameraStitcher::CameraStitcher(int camWidth, int camHeight, double camHFovRad,
                                 const std::vector<CameraConfig> &cameras,
-                                int outWidth, int outHeight, double outHFovRad)
+                                int outWidth, int outHeight, double outHFovRad,
+                                double sharedPitchRad)
     : m_outWidth(outWidth), m_outHeight(outHeight)
 {
     const Intrinsics K = MakeIntrinsics(camWidth, camHeight, camHFovRad);
+    const double cosPitch = std::cos(sharedPitchRad);
+    const double sinPitch = std::sin(sharedPitchRad);
 
     // Cylindrical panorama: azimuth maps LINEARLY to output column (fPano is
     // pixels/radian, not pixels/tan(radian)), so angular resolution is
@@ -124,13 +127,33 @@ CameraStitcher::CameraStitcher(int camWidth, int camHeight, double camHFovRad,
                 const double left = std::sin(theta);
                 const double up   = h;
 
-                // Un-rotate into this camera's own frame: this camera IS the
-                // reference frame rotated by +yaw about the vertical axis, so
-                // a reference-frame ray is expressed in its frame by rotating
-                // by -yaw.
-                const double fwdI  =  fwd * cosYaw + left * sinYaw;
-                const double leftI = -fwd * sinYaw + left * cosYaw;
-                const double upI   =  up;
+                // Un-rotate into this camera's own frame. NOT a bare -yaw
+                // rotation about the reference (front) camera's own local
+                // "up" axis -- that was this class's original approach, and
+                // a confirmed real bug (see this class's header comment):
+                // model.sdf specifies yaw about the CHASSIS's vertical axis,
+                // not each already-pitched camera's own tilted one, and
+                // those two axes only coincide when pitch is 0. Applied here
+                // as 3 explicit rotations (matching model.sdf's own
+                // roll-pitch-yaw convention step for step, R = Rz(yaw) *
+                // Ry(pitch) * Rx(roll) with roll=0) rather than one
+                // hand-multiplied matrix, so each step can be checked
+                // against a named rotation directly: undo the shared pitch
+                // to reach the chassis frame, apply -yaw THERE (the chassis'
+                // own vertical axis, where model.sdf's yaw is actually
+                // specified), then re-apply pitch to land in camera i's own
+                // (also pitched) frame.
+                const double aFwd  = fwd * cosPitch + up * sinPitch;
+                const double aLeft = left;
+                const double aUp   = -fwd * sinPitch + up * cosPitch;
+
+                const double bFwd  = aFwd * cosYaw + aLeft * sinYaw;
+                const double bLeft = -aFwd * sinYaw + aLeft * cosYaw;
+                const double bUp   = aUp;
+
+                const double fwdI  = bFwd * cosPitch - bUp * sinPitch;
+                const double leftI = bLeft;
+                const double upI   = bFwd * sinPitch + bUp * cosPitch;
 
                 if (fwdI <= 1e-6)
                 {

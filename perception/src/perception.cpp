@@ -118,6 +118,15 @@ constexpr int kCamHeight = 540;
 constexpr double kCamHFovRad = 0.7854;    // 45 deg -- model.sdf <horizontal_fov>
 constexpr double kCamYawLeftRad = 0.68;   // model.sdf camera_left <pose> yaw
 constexpr double kCamYawRightRad = -0.68; // model.sdf camera_right <pose> yaw
+// Shared by all 3 cameras (model.sdf's own front/left/right <pose> pitch
+// component) -- passed to CameraStitcher so it can correctly compose
+// pitch+yaw when un-rotating into each side camera's own frame, rather
+// than the bare-yaw approximation it used to make (see that class's own
+// header comment for why sharing this value across cameras does NOT mean
+// a single yaw fully describes their relative rotation). Also used
+// directly by lidar_projector.cpp's own kCamPitchRad -- MUST stay in sync
+// with both that and model.sdf's actual pitch by hand.
+constexpr double kCamPitchRad = 0.3;
 
 // Panorama size / FOV: kept FOV widened from 80 deg to 108 deg (2026-08-23,
 // direct user request to see more / reduce wasted overlap) -- the raw
@@ -310,7 +319,7 @@ int main()
     CameraStitcher stitcher(
         kCamWidth, kCamHeight, kCamHFovRad,
         {{0.0}, {kCamYawLeftRad}, {kCamYawRightRad}}, // front, left, right
-        kPanoWidth, kPanoHeight, kPanoHFovRad);
+        kPanoWidth, kPanoHeight, kPanoHFovRad, kCamPitchRad);
 
     // Must exactly match CameraStitcher's own internal focal length (its
     // K.fx, computed from the same kCamWidth/kCamHFovRad) -- not exposed as

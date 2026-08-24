@@ -80,10 +80,13 @@ public:
     struct CameraConfig
     {
         // Yaw of this camera relative to the reference camera (index 0),
-        // radians, positive = rotated toward the reference camera's left.
-        // Pitch/roll are assumed identical across all cameras (true for this
-        // rig -- see model.sdf) so a single yaw angle fully describes the
-        // relative rotation.
+        // radians, positive = rotated toward the reference camera's left,
+        // measured about the CHASSIS's own vertical axis (model.sdf's own
+        // yaw convention) -- NOT about the reference camera's own (already
+        // pitched) local "up" axis. Those two are only the same rotation
+        // when sharedPitchRad is 0; see the constructor's own comment for
+        // why conflating them was a real, confirmed bug for this rig, which
+        // does pitch every camera.
         double yawRad = 0.0;
     };
 
@@ -95,9 +98,27 @@ public:
     // view. outHFovRad should be a little less than the cameras' true
     // combined coverage so every panorama pixel has at least one valid
     // source (no black slivers at the extreme edges).
+    // sharedPitchRad: the pitch every camera shares (true for this rig --
+    // model.sdf gives camera_front/left/right the identical 0.3 rad pitch,
+    // only yaw differs). Pitch/roll being identical across cameras does NOT
+    // mean a single yaw angle fully describes their relative rotation, as
+    // this class used to assume (see git history) -- when sharedPitchRad is
+    // nonzero, the pitch and yaw rotations don't commute, so the true
+    // relative rotation between two cameras that share a pitch but differ
+    // in yaw is Ry(-pitch)*Rz(-yaw)*Ry(pitch), not a bare Rz(-yaw) about the
+    // reference camera's own local "up". Confirmed as a real, non-
+    // hypothetical bug (2026-08-23): a live ground-truth comparison found
+    // cone-detection error growing sharply with azimuth (0.09m median near
+    // dead-ahead vs 1.0m+ past ~30deg, almost entirely in the TANGENTIAL/
+    // bearing component, not radial/range) -- exactly the signature of an
+    // angular error that's zero on-axis and grows off-axis, not sensor
+    // noise. The bare-Rz(-yaw) approximation this replaced was off by
+    // ~4deg at 0.68 rad yaw / 0.3 rad pitch (verified numerically), which
+    // alone accounts for the observed magnitude at typical cone range.
     CameraStitcher(int camWidth, int camHeight, double camHFovRad,
                     const std::vector<CameraConfig> &cameras,
-                    int outWidth, int outHeight, double outHFovRad);
+                    int outWidth, int outHeight, double outHFovRad,
+                    double sharedPitchRad);
 
 #ifdef PERCEPTION_USE_VPI
     // Owns live VPI handles (payloads/images/stream) on this build --

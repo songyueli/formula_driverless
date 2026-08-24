@@ -154,7 +154,13 @@ int main(int argc, char **argv)
     std::unordered_map<uint64_t, std::string> landmarkColorByUid;
 
     std::ofstream csv(csvPath, std::ios::trunc);
-    csv << "t_wall,kind,error_m,range_m,color,uid,radial_err_m,tangential_err_m\n";
+    // azimuth_deg (detection rows only, blank elsewhere): the detection's
+    // own bearing in the car frame (atan2(by, bx), 0=straight ahead,
+    // +90=left, -90=right) -- added specifically to check a 2026-08-23
+    // user report that detections get much worse for cones near the
+    // sides of the car, which error_m/radial_err_m/tangential_err_m alone
+    // can't correlate against without this.
+    csv << "t_wall,kind,error_m,range_m,color,uid,radial_err_m,tangential_err_m,azimuth_deg\n";
     const auto t0 = std::chrono::steady_clock::now();
     auto nowSec = [&]() {
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -258,8 +264,9 @@ int main(int argc, char **argv)
             const double errX = matched->x - worldX, errY = matched->y - worldY;
             const double radialErr = errX * cosRay + errY * sinRay;
             const double tangentialErr = -errX * sinRay + errY * cosRay;
+            const double azimuthDeg = std::atan2(by, bx) * 180.0 / M_PI;
             csv << nowSec() << ",detection," << err << "," << range << "," << color << ","
-                << "," << radialErr << "," << tangentialErr << "\n";
+                << "," << radialErr << "," << tangentialErr << "," << azimuthDeg << "\n";
         }
     };
     if (!node.Subscribe("/cone_detections", onDetections))
