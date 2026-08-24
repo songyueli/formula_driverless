@@ -1,6 +1,8 @@
 #include "path_generator.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <utility>
 
 namespace fsd
 {
@@ -15,6 +17,79 @@ constexpr double kMaxPairDistance = 8.0;  // meters -- see algorithm note below
 // pairing algorithm below cites: this specific track's width is a
 // perfectly consistent 3.00m across all 122 sampled pairs.
 constexpr double kAssumedHalfTrackWidth = 1.5;  // meters
+
+// Neither generator below has any obstacle-awareness at all -- confirmed
+// directly (2026-08-23) as the root cause of a real, reproducible stuck-
+// forever failure: a live full-lap test's own /cmd_ackermann showed
+// ordinary, unremarkable pure-pursuit output (not the empty-path creep/
+// sweep) while the car's TRUE world position sat frozen, and the nearest
+// ground-truth cone was under 1m from the car -- physically wedged
+// against it. Root cause traced to THIS function: nearest-pair midpoint
+// pairing has no way to tell "the two nearest boundary cones straddle the
+// true local track direction" apart from "cross-paired across a sharp
+// corner, where the inside boundary's tighter cone spacing beats the
+// outside boundary's wider one and pairs a near cone with a far one" --
+// the midpoint of a bad cross-pair can land close enough to a THIRD,
+// uninvolved cone (not even the pair's own two) to put the car in contact
+// with it. Since reverse recovery is disallowed under FS rules (see
+// control/src/pure_pursuit_controller.cpp's own SAFETY OVERRIDE comment),
+// a stuck-from-contact car has no way back -- so the right fix is
+// upstream, in the path itself never coming this close to a cone in the
+// first place, not a recovery maneuver after the fact.
+//
+// kMinCarClearance uses the car's HALF-LENGTH (1.8m chassis length per
+// simulation/models/fsd_car/model.sdf's collision box, so 0.9m half), not
+// half-width (0.42m) -- confirmed directly as the right dimension to use,
+// not assumed: an initial 0.7m value (half-width + cone radius + margin)
+// still produced a live stuck-forever case, traced via the car's own
+// ground-truth pose to a near-dead-ahead approach (car yawed almost
+// exactly toward the blocking cone) where the front bumper -- 0.9m ahead
+// of the car's own origin, not 0.42m to the side -- came out to ~0.19m
+// from the cone's center, essentially touching. A pure-pursuit-following
+// car generally approaches a given waypoint roughly nose-on (that's what
+// steering TOWARD a target point means), so the car's LONGER dimension is
+// the one that actually matters for clearance, not the shorter one.
+// 0.9m (half-length) + 0.1425m (largest real cone's own base radius,
+// large_orange -- simulation/models/cone_orange/model.sdf) + margin,
+// rounded up: still comfortably under kAssumedHalfTrackWidth (1.5m) so it
+// can't by itself force a path out of a legally-narrow (>=3m) track.
+constexpr double kMinCarClearance = 1.2;  // meters
+
+// Pushes any waypoint that ends up too close to ANY known cone (not just
+// whichever pair produced it -- see this namespace's own comment above for
+// why a bad cross-pair can put a waypoint close to an uninvolved THIRD
+// cone) directly away from that cone until it clears kMinCarClearance.
+// Applied uniformly as a final pass after path generation, regardless of
+// which of the 3 return paths below produced the waypoints, rather than
+// duplicated into each -- obstacle clearance is a property every path this
+// module could ever produce needs, not something specific to one
+// algorithm.
+std::vector<PathPoint> EnforceMinClearance(std::vector<PathPoint> waypoints,
+                                            const std::vector<ClassifiedCone> &allCones)
+{
+    for (auto &wp : waypoints)
+    {
+        for (const auto &cone : allCones)
+        {
+            const double dx = wp.x - cone.x;
+            const double dy = wp.y - cone.y;
+            const double distSq = dx * dx + dy * dy;
+            // distSq > ~0 guards the same near-zero-distance division-by-
+            // zero case as lidar_projector.cpp's own horizRange guard --
+            // a waypoint landing exactly ON a cone's own center isn't a
+            // real case this pipeline produces, but the push direction
+            // would be undefined if it somehow did.
+            if (distSq < kMinCarClearance * kMinCarClearance && distSq > 1e-9)
+            {
+                const double dist = std::sqrt(distSq);
+                const double push = kMinCarClearance - dist;
+                wp.x += (dx / dist) * push;
+                wp.y += (dy / dist) * push;
+            }
+        }
+    }
+    return waypoints;
+}
 }  // namespace
 
 namespace
@@ -56,6 +131,13 @@ std::vector<PathPoint> SingleSideOffsetPath(const std::vector<ClassifiedCone> &_
 
 std::vector<PathPoint> NearestPairMidpointPath(const TrackBoundaries &boundaries)
 {
+    // Every cone this cycle actually knows about, regardless of which side
+    // -- see EnforceMinClearance's own comment for why clearance has to be
+    // checked against ALL of these, not just whichever pair/side produced
+    // a given waypoint.
+    std::vector<ClassifiedCone> allCones = boundaries.left;
+    allCones.insert(allCones.end(), boundaries.right.begin(), boundaries.right.end());
+
     // Single-boundary fallback -- see SingleSideOffsetPath's comment above.
     // Only kicks in when one side is COMPLETELY empty; whenever both sides
     // have at least one cone, the pairing algorithm below stays in use --
@@ -64,12 +146,12 @@ std::vector<PathPoint> NearestPairMidpointPath(const TrackBoundaries &boundaries
     if (boundaries.left.empty() && !boundaries.right.empty())
     {
         // Right (yellow) cones only -> offset toward center = leftward = +Y.
-        return SingleSideOffsetPath(boundaries.right, +1.0);
+        return EnforceMinClearance(SingleSideOffsetPath(boundaries.right, +1.0), allCones);
     }
     if (boundaries.right.empty() && !boundaries.left.empty())
     {
         // Left (blue) cones only -> offset toward center = rightward = -Y.
-        return SingleSideOffsetPath(boundaries.left, -1.0);
+        return EnforceMinClearance(SingleSideOffsetPath(boundaries.left, -1.0), allCones);
     }
 
     // For each left-boundary cone, pair with its nearest right-boundary
@@ -109,6 +191,6 @@ std::vector<PathPoint> NearestPairMidpointPath(const TrackBoundaries &boundaries
     // TODO: spline-smooth the path (currently raw midpoints, which can
     // zigzag with cone-spacing irregularities) before handing it to
     // control.
-    return waypoints;
+    return EnforceMinClearance(std::move(waypoints), allCones);
 }
 }  // namespace fsd
