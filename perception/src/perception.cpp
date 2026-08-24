@@ -215,15 +215,22 @@ constexpr float kPanoEdgeMarginPx = 5.0f;
 // -- tried first -- never actually skips anything as long as dev_sim.sh's
 // normal 6-process pipeline is running; confirmed directly, not assumed
 // (timing stayed ~56ms after that change, no different from before it).
-// Throttling instead of gating is also just the right call regardless: a
-// human watching Foxglove doesn't need a 2427x1130 RGB overlay at full
-// camera rate to debug visually, and this is the actual, previously-
-// unmeasured ~16ms/cycle cost (confirmed via /timing/perception's own total
-// sitting that far above stitch+detect+postprocess+log's sum) -- 5 (a
-// ~6Hz overlay at this pipeline's ~30Hz cycle) recovers nearly all of that
-// on 5 of every 6 cycles while keeping the debug view comfortably watchable.
 // /cone_detections itself is NEVER throttled -- only these two debug images.
-constexpr int kDebugImageEveryN = 6;
+//
+// Was 6 (a ~6Hz overlay at the pipeline's THEN ~30Hz cycle, back when the
+// panorama was still 2427x1130 and image-publish cost ~16ms/cycle). Both
+// assumptions this was tuned against no longer hold: the 2026-08-23
+// real-time-factor fix (see model.sdf's own comment) capped the actual
+// per-camera/cycle rate at ~9.3-9.6Hz, well under 30Hz, so dividing that by
+// 6 produced a ~1.5Hz stitched feed -- confirmed directly as a real user-
+// facing regression, not a hypothetical, and far below the ~10Hz downstream
+// consumers need. The same change also halved the panorama to 1638x573
+// (~2.9x fewer pixels), so today's actual publish cost is well under that
+// old ~16ms figure too. 1 (no skipping) keeps the stitched/detections
+// feeds at the same rate as the underlying cycle -- comfortably watchable
+// on its own now that the cycle itself is already only ~9-10Hz, not 30.
+// Revisit if the cycle rate is ever restored closer to 30Hz.
+constexpr int kDebugImageEveryN = 1;
 
 // Matches ml/prepare_data.py's CLASSES list exactly -- same order, since
 // that's the order the model was trained to output class indices in.
