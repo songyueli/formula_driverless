@@ -295,7 +295,8 @@ bool ConeSpecForName(const std::string &_name, ConeSpec *_spec)
     }
     if (_name.rfind("cone_orange", 0) == 0)
     {
-        *_spec = ConeSpec{0.1425, 0.505, foxglove::messages::Color{0.9, 0.35, 0, 1}};
+        // #CC6600, matching simulation/models/cone_orange/model.sdf.
+        *_spec = ConeSpec{0.1425, 0.505, foxglove::messages::Color{0.8, 0.4, 0, 1}};
         return true;
     }
     return false;
@@ -322,7 +323,8 @@ bool DetectionConeSpec(const std::string &_className, ConeSpec *_spec)
     }
     if (_className == "orange" || _className == "large_orange")
     {
-        *_spec = ConeSpec{0.1425, 0.505, foxglove::messages::Color{0.9, 0.35, 0, 1}};
+        // #CC6600, matching simulation/models/cone_orange/model.sdf.
+        *_spec = ConeSpec{0.1425, 0.505, foxglove::messages::Color{0.8, 0.4, 0, 1}};
         return true;
     }
     return false;

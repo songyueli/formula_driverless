@@ -1,7 +1,8 @@
 <?xml version="1.0" ?>
 <!--
-  Blue boundary cone. FS-standard small cone dimensions (placeholder —
-  no real cone specs yet): 0.115m base radius, 0.325m tall.
+  Blue boundary cone. Dimensions confirmed against FS Driverless
+  Specification 2026, Table 1 "Cone specs": small cone base 228mm,
+  height 325mm -- 0.115m base radius (228/2), 0.325m tall.
   <cone> geometry requires SDF 1.11+.
 -->
 <sdf version="1.11">
@@ -15,6 +16,45 @@
         <material>
           <ambient>0 0 0.8 1</ambient>
           <diffuse>0 0 0.8 1</diffuse>
+        </material>
+      </visual>
+      <!--
+        Single white stripe -- FS Driverless Specification 2026, Table 1
+        "Cone specs" (small blue cone: single white stripe) -- centered
+        at 50% of total height from the base (moved down from an earlier
+        68%, per direct user feedback that it should sit closer to the
+        middle), spanning 22% of the total height.
+
+        A real frustum mesh (meshes/stripe.obj, see gen_stripe_mesh.py),
+        not a primitive -- three cylinder-based approximations were tried
+        first and rejected (confirmed directly via rendered camera
+        captures from the actual sim): several stacked thin cylinders
+        read as a visible stack of rings; a single cylinder sized to the
+        band's widest edge flared out past the cone's silhouette like a
+        collar; a single cylinder sized to the band's center radius
+        stayed flush-ish but only at a thinness the user directly flagged
+        as visually too thin, and even then wasn't truly flush -- a
+        cylinder's constant radius can only ever match the parent cone's
+        continuously-tapering radius at ONE height. The mesh's own
+        radius at any height is computed directly from the SAME formula
+        the parent <cone> primitive itself follows (radius(h) =
+        base_radius * (1 - h/length)), so it shares the parent's exact
+        taper at every point along the band, not just one -- genuinely
+        flush regardless of how thick the band is, plus a uniform 0.25%
+        outward scale (baked into the mesh, not visible at this scale)
+        so the two surfaces don't z-fight. <pose> z is this band's
+        BOTTOM edge (the mesh's own local z=0), in the link's frame
+        (same base-at-world-z=0 convention as the parent cone -- see
+        this model's own dimensions comment).
+      -->
+      <visual name="stripe">
+        <pose>0 0 -0.03575 0 0 0</pose>
+        <geometry>
+          <mesh><uri>meshes/stripe.obj</uri></mesh>
+        </geometry>
+        <material>
+          <ambient>1 1 1 1</ambient>
+          <diffuse>1 1 1 1</diffuse>
         </material>
       </visual>
       <collision name="collision">

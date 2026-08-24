@@ -1,6 +1,8 @@
 <?xml version="1.0" ?>
 <!--
-  Yellow boundary cone. Same dimensions as cone_blue, different color.
+  Yellow boundary cone. Same dimensions as cone_blue (confirmed against
+  FS Driverless Specification 2026, Table 1 "Cone specs" -- small cone
+  base 228mm, height 325mm), different color and stripe color.
 -->
 <sdf version="1.11">
   <model name="cone_yellow">
@@ -13,6 +15,33 @@
         <material>
           <ambient>0.9 0.9 0 1</ambient>
           <diffuse>0.9 0.9 0 1</diffuse>
+        </material>
+      </visual>
+      <!--
+        Single BLACK stripe -- FS Driverless Specification 2026, Table 1
+        (small yellow cone: single black stripe, the one color exception
+        among the small cones -- blue and small orange both get a white
+        stripe). Centered at 50% of total height from the base (moved
+        down from an earlier 70%, per direct user feedback that it
+        should sit closer to the middle), spanning 30% of the total
+        height (a notably wider/more dominant band than cone_blue's
+        white stripe, matching the reference photo). Real frustum mesh
+        (meshes/stripe.obj), not a cylinder -- see cone_blue's own
+        stripe comment for why: a cylinder approximation can only match
+        the parent cone's taper at one height, which the user flagged
+        directly as both visually too thin AND not actually flush. This
+        mesh's radius follows the same formula as the parent cone at
+        every height along the band, so it stays genuinely flush at any
+        thickness.
+      -->
+      <visual name="stripe">
+        <pose>0 0 -0.04875 0 0 0</pose>
+        <geometry>
+          <mesh><uri>meshes/stripe.obj</uri></mesh>
+        </geometry>
+        <material>
+          <ambient>0 0 0 1</ambient>
+          <diffuse>0 0 0 1</diffuse>
         </material>
       </visual>
       <collision name="collision">
