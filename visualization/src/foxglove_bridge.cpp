@@ -19,6 +19,10 @@
 #include <gz/msgs/scene.pb.h>
 #include <gz/msgs/uint64.pb.h>
 
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+
 #include <foxglove/channel.hpp>
 #include <foxglove/error.hpp>
 #include <foxglove/messages.hpp>
@@ -91,17 +95,21 @@
 //        steering would need parsing live joint_state, which nothing here
 //        needs yet.
 //   /camera/{front,left,right}/image (gz.msgs.Image)
-//     -> /camera/{front,left,right} (Foxglove RawImage), frame_id matching
-//        the sensor's own name (camera_front/camera_left/camera_right)
+//     -> /camera/{front,left,right} (Foxglove CompressedImage, JPEG q80 --
+//        see makeImageSubscriber's own comment for why compressed, not
+//        RawImage), frame_id matching the sensor's own name
+//        (camera_front/camera_left/camera_right)
 //   /camera/stitched/image (gz.msgs.Image, published by perception --
 //     the 3 raw cameras merged into one cylindrical panorama)
-//     -> /camera/stitched (Foxglove RawImage), frame_id "camera_front"
+//     -> /camera/stitched (Foxglove CompressedImage, JPEG q80), frame_id
+//        "camera_front"
 //   /camera/detections/image (gz.msgs.Image, published by perception --
 //     the same panorama with every YOLO detection's bbox + class + confidence
 //     drawn directly into the pixels, for visually comparing detection
 //     accuracy in Foxglove; includes detections with no lidar match too,
 //     unlike /cone_detections, which only carries localized ones)
-//     -> /camera/detections (Foxglove RawImage), frame_id "camera_front"
+//     -> /camera/detections (Foxglove CompressedImage, JPEG q80), frame_id
+//        "camera_front"
 //   /lidar/points/points (gz.msgs.PointCloudPacked -- gpu_lidar's derived
 //   point-cloud topic; /lidar/points itself is a raw LaserScan, not this)
 //     -> /lidar (Foxglove PointCloud), frame_id "os1_128"
@@ -195,18 +203,20 @@ foxglove::messages::Pose ToFoxglovePose(const gz::msgs::Pose &_pose)
             _pose.orientation().z(), _pose.orientation().w()}};
 }
 
-std::string ToFoxgloveEncoding(gz::msgs::PixelFormatType _fmt)
+// Only RGB_INT8 is handled -- the only format any publisher in this
+// pipeline actually emits (see perception.cpp's ToImageMsg and every
+// <camera> sensor's default in model.sdf, both RGB_INT8), same "unsupported
+// -- caller should skip the frame" policy the RawImage path this replaced
+// used for every other gz::msgs::PixelFormatType. Unlike that RawImage
+// path, JPEG-encoding actually depends on getting the channel order right
+// (cv::imencode always expects BGR, matching its own imshow/imwrite
+// convention), not just a label Foxglove reads back -- so this can't stay
+// a format-name lookup once compression is involved; a wrong-order guess
+// here would silently swap red and blue in every frame instead of just
+// mislabeling metadata.
+bool IsSupportedImageFormat(gz::msgs::PixelFormatType _fmt)
 {
-    switch (_fmt)
-    {
-        case gz::msgs::PixelFormatType::RGB_INT8:  return "rgb8";
-        case gz::msgs::PixelFormatType::RGBA_INT8: return "rgba8";
-        case gz::msgs::PixelFormatType::BGR_INT8:  return "bgr8";
-        case gz::msgs::PixelFormatType::BGRA_INT8: return "bgra8";
-        case gz::msgs::PixelFormatType::L_INT8:    return "mono8";
-        case gz::msgs::PixelFormatType::L_INT16:   return "mono16";
-        default: return "";  // unsupported -- caller should skip the frame
-    }
+    return _fmt == gz::msgs::PixelFormatType::RGB_INT8;
 }
 
 foxglove::messages::PackedElementField::NumericType ToFoxgloveFieldType(
@@ -712,35 +722,55 @@ int main(int argc, char **argv)
     std::cout << "Fetched " << wheelStaticPoses.size()
               << " static wheel pose(s) from " << sceneService << '\n';
 
-    auto camFrontChannel      = foxglove::messages::RawImageChannel::create("/camera/front").value();
-    auto camLeftChannel       = foxglove::messages::RawImageChannel::create("/camera/left").value();
-    auto camRightChannel      = foxglove::messages::RawImageChannel::create("/camera/right").value();
-    auto camStitchedChannel   = foxglove::messages::RawImageChannel::create("/camera/stitched").value();
-    auto camDetectionsChannel = foxglove::messages::RawImageChannel::create("/camera/detections").value();
+    auto camFrontChannel      = foxglove::messages::CompressedImageChannel::create("/camera/front").value();
+    auto camLeftChannel       = foxglove::messages::CompressedImageChannel::create("/camera/left").value();
+    auto camRightChannel      = foxglove::messages::CompressedImageChannel::create("/camera/right").value();
+    auto camStitchedChannel   = foxglove::messages::CompressedImageChannel::create("/camera/stitched").value();
+    auto camDetectionsChannel = foxglove::messages::CompressedImageChannel::create("/camera/detections").value();
     auto lidarChannel         = foxglove::messages::PointCloudChannel::create("/lidar").value();
 
-    auto makeImageSubscriber = [](foxglove::messages::RawImageChannel &_channel,
+    // JPEG-encoded (was RawImage, i.e. raw RGB bytes with no compression)
+    // -- confirmed directly as the cause of a real user-reported slowdown
+    // (2026-08-23): watching Foxglove felt slow even though the underlying
+    // gz-transport topics measured at the expected ~9Hz on the Jetson
+    // itself, no network involved. 5 raw 720x540x3 RGB channels at ~9Hz
+    // each is ~52 MB/s of uncompressed image data pushed over the
+    // websocket to whatever's actually viewing Foxglove (typically a
+    // laptop over WiFi to the car) -- comfortably beyond what that link
+    // can sustain, so frames queue up and playback lags even though
+    // nothing in the pipeline itself is behind. JPEG quality 80 cuts each
+    // frame by roughly 15-20x for a natural/camera image, bringing total
+    // throughput down to single-digit MB/s. This is a viewer-bandwidth
+    // fix only -- doesn't touch /camera/*/image or /camera/stitched/image
+    // themselves (still full-resolution, uncompressed, at whatever rate
+    // perception publishes -- see perception.cpp's kDebugImageEveryN),
+    // since those still need pixel-exact data for actual detection input,
+    // not just human viewing.
+    auto makeImageSubscriber = [](foxglove::messages::CompressedImageChannel &_channel,
                                    std::string _frameId)
     {
         return std::function<void(const gz::msgs::Image &)>(
             [&_channel, _frameId](const gz::msgs::Image &_msg)
             {
-                const std::string encoding = ToFoxgloveEncoding(_msg.pixel_format_type());
-                if (encoding.empty())
+                if (!IsSupportedImageFormat(_msg.pixel_format_type()))
                 {
                     return;  // unsupported format, skip rather than send garbage
                 }
 
-                foxglove::messages::RawImage img;
+                const cv::Mat rgb(static_cast<int>(_msg.height()), static_cast<int>(_msg.width()),
+                                   CV_8UC3, const_cast<char *>(_msg.data().data()),
+                                   static_cast<size_t>(_msg.step()));
+                cv::Mat bgr;
+                cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+                std::vector<uchar> jpegBuf;
+                cv::imencode(".jpg", bgr, jpegBuf, {cv::IMWRITE_JPEG_QUALITY, 80});
+
+                foxglove::messages::CompressedImage img;
                 img.timestamp = Now();
                 img.frame_id = _frameId;
-                img.width = _msg.width();
-                img.height = _msg.height();
-                img.encoding = encoding;
-                img.step = _msg.step();
-
-                const auto *bytes = reinterpret_cast<const std::byte *>(_msg.data().data());
-                img.data.assign(bytes, bytes + _msg.data().size());
+                img.format = "jpeg";
+                const auto *bytes = reinterpret_cast<const std::byte *>(jpegBuf.data());
+                img.data.assign(bytes, bytes + jpegBuf.size());
 
                 _channel.log(img);
             });

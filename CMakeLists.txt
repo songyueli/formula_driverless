@@ -227,10 +227,12 @@ target_link_libraries(control
     gz-msgs::gz-msgs)
 
 add_executable(foxglove_bridge  visualization/src/foxglove_bridge.cpp)
+target_include_directories(foxglove_bridge PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(foxglove_bridge
     gz-transport::gz-transport
     gz-msgs::gz-msgs
-    foxglove_cpp)
+    foxglove_cpp
+    ${OpenCV_LIBS})
 
 # Standalone ground-truth accuracy evaluator -- not part of the autonomy
 # pipeline (dev_sim.sh doesn't launch it), a diagnostic tool run alongside
