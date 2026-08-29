@@ -33,8 +33,7 @@ ml/models/
 # Training run outputs (metrics, plots, weights) -- the .onnx/.engine model
 # formats perception.cpp actually loads are already covered by the *.onnx/
 # *.engine rules above; the PyTorch .pt checkpoint is deliberately never
-# needed (nothing in this pipeline loads a .pt file at runtime), so nothing
-# under here needs a tracked exception anymore.
+# needed (nothing in this pipeline loads a .pt file at runtime).
 ml/runs/
 
 # Defensive only -- train.py's project default used to be a bare relative
@@ -45,6 +44,28 @@ ml/runs/
 # location, so nothing should land here anymore -- kept as a safety net in
 # case some other invocation still passes a bare relative project path.
 runs/
+
+# Exception: the one canonical trained model, tracked via Git LFS (see
+# .gitattributes) so a fresh clone can run the sim out of the box instead of
+# requiring training first. Must come after BOTH ml/runs/ and the bare
+# runs/ rule above (the latter matches "runs" at any depth, including
+# ml/runs) -- git won't apply a file negation inside a directory that's
+# itself still ignored by a later-evaluated pattern.
+#
+# Negating a directory only un-blocks git from looking INSIDE it -- it does
+# NOT un-ignore that directory's other contents, so each level re-excludes
+# its own loose files (dir/*) before the next level negates just the one
+# subpath actually needed, keeping every other training-run artifact
+# (plots, metrics, sample images) ignored exactly as before.
+!ml/runs/
+ml/runs/*
+!ml/runs/detect/
+ml/runs/detect/*
+!ml/runs/detect/train/
+ml/runs/detect/train/*
+!ml/runs/detect/train/weights/
+ml/runs/detect/train/weights/*
+!ml/runs/detect/train/weights/best.onnx
 
 # Gazebo logs and caches
 .gz/
