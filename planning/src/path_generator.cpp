@@ -64,15 +64,35 @@ constexpr double kMinCarClearance = 1.2;  // meters
 // duplicated into each -- obstacle clearance is a property every path this
 // module could ever produce needs, not something specific to one
 // algorithm.
+//
+// Every violating cone's push is computed against the waypoint's ORIGINAL
+// position and summed, then applied once at the end -- NOT applied
+// in-place per cone as each one is found. Mutating wp in place while
+// iterating cones was tried first and confirmed directly as the cause of a
+// live "car isn't going through the track" regression: in a corner, where
+// several boundary cones legitimately sit within kMinCarClearance of a
+// single midpoint waypoint, each push shifted wp using the ALREADY-shifted
+// position from the previous cone, so the cones' iteration order (not
+// which push actually mattered) decided where the waypoint ended up --
+// cascading drift that could shove a corner waypoint well off the real
+// track centerline. Summing against the fixed original position instead
+// makes the result order-independent: multiple simultaneous violations
+// blend into one net direction away from all of them, rather than
+// chaining through intermediate positions none of which were ever the
+// intended target.
 std::vector<PathPoint> EnforceMinClearance(std::vector<PathPoint> waypoints,
                                             const std::vector<ClassifiedCone> &allCones)
 {
     for (auto &wp : waypoints)
     {
+        const double origX = wp.x;
+        const double origY = wp.y;
+        double pushX = 0.0;
+        double pushY = 0.0;
         for (const auto &cone : allCones)
         {
-            const double dx = wp.x - cone.x;
-            const double dy = wp.y - cone.y;
+            const double dx = origX - cone.x;
+            const double dy = origY - cone.y;
             const double distSq = dx * dx + dy * dy;
             // distSq > ~0 guards the same near-zero-distance division-by-
             // zero case as lidar_projector.cpp's own horizRange guard --
@@ -83,10 +103,12 @@ std::vector<PathPoint> EnforceMinClearance(std::vector<PathPoint> waypoints,
             {
                 const double dist = std::sqrt(distSq);
                 const double push = kMinCarClearance - dist;
-                wp.x += (dx / dist) * push;
-                wp.y += (dy / dist) * push;
+                pushX += (dx / dist) * push;
+                pushY += (dy / dist) * push;
             }
         }
+        wp.x = origX + pushX;
+        wp.y = origY + pushY;
     }
     return waypoints;
 }
