@@ -1,3 +1,4 @@
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -78,11 +79,16 @@
 //     -> /vehicle_pose (Foxglove PoseInFrame)   — the "fsd_car" entry
 //     -> /scene        (Foxglove SceneUpdate)   — every cone_{blue,yellow,
 //                       orange}_* entry as a cone (a CylinderPrimitive with
-//                       top_scale=0), so the track is viewable in
-//                       Foxglove's 3D panel without needing Gazebo's own
-//                       GUI. Deliberately just the (static) track -- the
-//                       car has its own /vehicle topic below, so either can
-//                       be shown/hidden independently in Foxglove.
+//                       top_scale=0) plus its stripe band(s) as additional
+//                       tapered CylinderPrimitives (AppendStripeCylinders,
+//                       spec table shared with ConeSpecForName -- see
+//                       simulation/models/cone_*/model.sdf for the
+//                       center/span numbers this mirrors), so the track is
+//                       viewable in Foxglove's 3D panel without needing
+//                       Gazebo's own GUI. Deliberately just the (static)
+//                       track -- the car has its own /vehicle topic below,
+//                       so either can be shown/hidden independently in
+//                       Foxglove.
 //     -> /tf (Foxglove FrameTransforms)         — world->fsd_car
 //   fsd_car's wheel link poses (fetched once from the same scene service
 //   used for sensor frames below, not hand-duplicated from model.sdf)
@@ -283,33 +289,93 @@ foxglove::messages::Pose ComposePose(
     return result;
 }
 
+// One stripe band, as a fraction of the cone's total height from its base --
+// same center_frac/span_frac numbers as the comments in each
+// simulation/models/cone_*/model.sdf (e.g. blue: center 0.5, span 0.22).
+struct StripeSpec
+{
+    double center_frac;
+    double span_frac;
+    foxglove::messages::Color color;
+};
+
 struct ConeSpec
 {
     double radius;
     double length;
     foxglove::messages::Color color;
+    std::array<StripeSpec, 2> stripes{};
+    int stripe_count = 0;
 };
 
-// Dimensions/colors must match simulation/models/cone_{blue,yellow,orange}/model.sdf.
+// Dimensions/colors/stripes must match simulation/models/cone_{blue,yellow,orange}/model.sdf.
 bool ConeSpecForName(const std::string &_name, ConeSpec *_spec)
 {
     if (_name.rfind("cone_blue", 0) == 0)
     {
         *_spec = ConeSpec{0.115, 0.325, foxglove::messages::Color{0, 0, 0.8, 1}};
+        _spec->stripes[0] = StripeSpec{0.5, 0.22, foxglove::messages::Color{1, 1, 1, 1}};
+        _spec->stripe_count = 1;
         return true;
     }
     if (_name.rfind("cone_yellow", 0) == 0)
     {
         *_spec = ConeSpec{0.115, 0.325, foxglove::messages::Color{0.9, 0.9, 0, 1}};
+        _spec->stripes[0] = StripeSpec{0.5, 0.30, foxglove::messages::Color{0, 0, 0, 1}};
+        _spec->stripe_count = 1;
         return true;
     }
     if (_name.rfind("cone_orange", 0) == 0)
     {
         // #CC6600, matching simulation/models/cone_orange/model.sdf.
         *_spec = ConeSpec{0.1425, 0.505, foxglove::messages::Color{0.8, 0.4, 0, 1}};
+        _spec->stripes[0] = StripeSpec{0.34, 0.16, foxglove::messages::Color{1, 1, 1, 1}};
+        _spec->stripes[1] = StripeSpec{0.64, 0.16, foxglove::messages::Color{1, 1, 1, 1}};
+        _spec->stripe_count = 2;
         return true;
     }
     return false;
+}
+
+// Appends _spec's stripe band(s) as additional CylinderPrimitives around
+// _conePose, so rendered cones match the banding in
+// simulation/models/cone_{blue,yellow,orange}/model.sdf instead of coming
+// out as a flat, unbanded solid color. Each band reuses the parent cone's
+// own linear taper -- radius(h) = base_radius * (1 - h/length), the same
+// formula model.sdf's own stripe meshes are built from -- via
+// bottom_scale/top_scale, rather than a constant-radius cylinder, so it
+// stays flush with the parent cone's silhouette instead of flaring past it
+// (see cone_blue/model.sdf's stripe comment for why that was rejected).
+void AppendStripeCylinders(
+    const ConeSpec &_spec, const foxglove::messages::Pose &_conePose,
+    std::vector<foxglove::messages::CylinderPrimitive> *_cylinders)
+{
+    for (int i = 0; i < _spec.stripe_count; ++i)
+    {
+        const auto &stripe = _spec.stripes[i];
+        const double hBottom = (stripe.center_frac - stripe.span_frac / 2.0) * _spec.length;
+        const double hTop = (stripe.center_frac + stripe.span_frac / 2.0) * _spec.length;
+        const double radiusBottom = _spec.radius * (1.0 - hBottom / _spec.length);
+        const double radiusTop = _spec.radius * (1.0 - hTop / _spec.length);
+
+        // Offset from the cone's own center (its Pose's origin, per the
+        // standard SDF primitive convention -- base at -length/2, apex at
+        // +length/2), composed through the cone's actual world pose rather
+        // than added directly, so this still lands correctly if the cone
+        // isn't perfectly upright.
+        foxglove::messages::Pose localOffset;
+        localOffset.position = foxglove::messages::Vector3{
+            0, 0, (hBottom + hTop) / 2.0 - _spec.length / 2.0};
+        localOffset.orientation = foxglove::messages::Quaternion{0, 0, 0, 1};
+
+        foxglove::messages::CylinderPrimitive band;
+        band.pose = ComposePose(_conePose, localOffset);
+        band.size = foxglove::messages::Vector3{radiusBottom * 2, radiusBottom * 2, hTop - hBottom};
+        band.bottom_scale = 1.0;
+        band.top_scale = radiusTop / radiusBottom;
+        band.color = stripe.color;
+        _cylinders->push_back(band);
+    }
 }
 
 // Same visual spec table as ConeSpecForName above, but keyed on perception's
@@ -1339,6 +1405,8 @@ int main(int argc, char **argv)
             cone.top_scale = 0.0;     // point at the top -- makes it a cone, not a cylinder
             cone.color = spec.color;
             trackEntity.cylinders.push_back(cone);
+
+            AppendStripeCylinders(spec, entry.second, &trackEntity.cylinders);
         }
         update.entities.push_back(std::move(trackEntity));
 
