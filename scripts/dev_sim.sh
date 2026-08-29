@@ -71,6 +71,18 @@ if command -v jetson_clocks >/dev/null 2>&1; then
   sudo -n jetson_clocks || echo "warning: jetson_clocks failed (needs passwordless sudo) -- continuing without it" >&2
 fi
 
+# nvpmodel controls the power BUDGET (which CPU/GPU/EMC ceilings are even
+# available to hit) -- a separate axis from jetson_clocks above, which just
+# pins whatever's currently allowed to its max. MAXN (mode 0) removes the
+# power cap entirely for the duration of the sim; restored to MODE_30W
+# (mode 2, this Jetson's normal baseline -- see cleanup() below) on exit so
+# the board doesn't sit at an uncapped power draw/thermal envelope between
+# runs. Same `-n`/non-fatal pattern as jetson_clocks above.
+if command -v nvpmodel >/dev/null 2>&1; then
+  echo "Jetson detected -- setting power mode to MAXN via nvpmodel..."
+  sudo -n nvpmodel -m 0 || echo "warning: nvpmodel failed (needs passwordless sudo) -- continuing without it" >&2
+fi
+
 echo "World: ${WORLD_NAME} (${WORLD})"
 
 # Track child PIDs so all six get cleaned up together (Ctrl+C, error, normal exit).
@@ -91,6 +103,17 @@ cleanup() {
   [ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null
   [ -n "$SIM_PID" ] && kill "$SIM_PID" 2>/dev/null
   wait 2>/dev/null
+
+  # Restoring to MODE_30W is NOT done automatically here -- confirmed
+  # directly that on this board, switching MAXN -> MODE_30W needs a reboot
+  # (nvpmodel itself refuses live, prompting an interactive
+  # "reboot now? yes/no" that hangs/errors non-interactively; its own
+  # --force flag would reboot the Jetson unattended to push it through,
+  # which is a far bigger, more disruptive action than a Ctrl+C should ever
+  # trigger silently). Left at MAXN until you explicitly choose to reboot.
+  if command -v nvpmodel >/dev/null 2>&1; then
+    echo "Note: power mode is still MAXN -- reboot and run 'sudo nvpmodel -m 2' to return to MODE_30W."
+  fi
 }
 trap cleanup EXIT INT TERM
 
