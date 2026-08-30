@@ -43,7 +43,15 @@ ml/runs/
 # Fixed by anchoring train.py's DEFAULT_PROJECT to the script's own file
 # location, so nothing should land here anymore -- kept as a safety net in
 # case some other invocation still passes a bare relative project path.
-runs/
+# Anchored to the repo root (leading slash) rather than left bare: a bare
+# "runs/" matches a directory named "runs" at ANY depth, including
+# ml/runs itself -- which collided with the ml/runs/ rule above and broke
+# the negation chain below (git can't re-include a path once two separate
+# patterns both exclude one of its parent directories), silently keeping
+# the LFS-tracked best.onnx out of every commit. Confirmed directly via
+# `git check-ignore -v`, which showed this bare rule (not the intended
+# ml/runs/ one) as the actual match on ml/runs/detect/train/weights/best.onnx.
+/runs/
 
 # Exception: the one canonical trained model, tracked via Git LFS (see
 # .gitattributes) so a fresh clone can run the sim out of the box instead of
