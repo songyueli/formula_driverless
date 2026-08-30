@@ -105,4 +105,13 @@ private:
     // the same obstacle every loop, no amount of extra reverse DISTANCE
     // alone fixes that -- only trying the OTHER direction does.
     double m_sweepDirection = 1.0;
+
+    // Exponential moving average of |curvature| across recent normal
+    // (non-empty-path) cycles -- see kCurvatureEmaAlpha's comment in the
+    // .cpp for why instantaneous curvature alone isn't enough through a
+    // SUSTAINED tight corner. Persists across calls the same way
+    // m_consecutiveEmptyCycles/the stuck-detection state above do, for the
+    // same reason: this needs memory of recent cycles, not just the
+    // current one.
+    double m_curvatureEma = 0.0;
 };

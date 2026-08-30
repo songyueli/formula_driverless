@@ -18,15 +18,69 @@ constexpr double kMinSpeed = 1.0;  // m/s
 constexpr double kLookaheadDistance = 3.0;  // meters
 // Linear falloff from kMaxSpeed as |curvature| grows: speed = kMaxSpeed -
 // kCurvatureSpeedGain * |curvature|, clamped to [kMinSpeed, kMaxSpeed].
-// curvature = 2*y / (x^2+y^2) (see step 2 below) tops out around
-// 2*kLookaheadDistance / kLookaheadDistance^2 = 2/kLookaheadDistance when
-// the lookahead target sits directly to the side -- the tightest turn this
-// geometry can express at the current lookahead distance. Sized so that
-// worst case maps to exactly kMinSpeed rather than clamping well short of
-// it (which would make speed indifferent to curvature over most of the
-// real range) or overshooting past kMinSpeed before curvature maxes out.
-constexpr double kMaxExpectedCurvature = 2.0 / kLookaheadDistance;
+//
+// kMaxExpectedCurvature is the vehicle's own real physical curvature
+// limit (1/kMinTurnRadius), NOT the raw geometric max this lookahead
+// distance could otherwise express (2/kLookaheadDistance =~ 0.667 rad/m,
+// corresponding to an unrealistic ~1.5m turn radius that path_generator.cpp
+// never actually hands this controller anymore). MUST stay in sync with
+// path_generator.cpp's own kMinTurnRadius (4.5m, from
+// simulation/models/fsd_car/model.sdf's AckermannSteering steering_limit +
+// wheel_base) -- confirmed directly as a real, live mismatch between the
+// two: with the OLD, unclamped-geometry-derived value here, the tightest
+// turn EnforceMinTurnRadius can ever produce (curvature = 1/4.5 =~ 0.222
+// rad/m, a third of the old 0.667 assumption) only pulled speed down to
+// ~2.33 m/s, nowhere near kMinSpeed -- meaning the car drove through a
+// corner already AT its own physical steering limit no slower than a
+// fairly gentle turn, leaving little margin for pure pursuit's own
+// tracking error to stay clear of the boundary cones. Live ground-truth
+// tracing through this track's recurring stuck corner found the realized
+// turn radius tightening steadily toward 4.5m over a sustained ~9m arc,
+// right before the car lost contact with a cone -- consistent with
+// entering that sustained near-limit turn too fast to track precisely,
+// not with a single bad instant. Recalibrating so speed reaches exactly
+// kMinSpeed as curvature approaches the vehicle's ACTUAL ceiling (rather
+// than a 3x-larger one the path can no longer even ask for) gives pure
+// pursuit its intended full margin exactly where it's needed most.
+constexpr double kMinTurnRadius = 4.5;  // meters -- see comment above
+constexpr double kMaxExpectedCurvature = 1.0 / kMinTurnRadius;
 constexpr double kCurvatureSpeedGain = (kMaxSpeed - kMinSpeed) / kMaxExpectedCurvature;
+
+// The instantaneous curvature-speed scaling above reacts only to THIS
+// cycle's single lookahead target -- confirmed directly as still
+// insufficient on its own, even after the recalibration above: live
+// ground-truth tracing through this track's one sustained tight corner
+// (radius holding close to kMinTurnRadius over a ~9-15m arc, several
+// consecutive near-limit waypoints, not one) found the car repeatedly
+// coming to rest under kMinCarClearance of a boundary cone -- a DIFFERENT
+// cone each attempt (three separate cones across three separate live
+// runs) -- even with per-cycle speed already reduced toward kMinSpeed at
+// the tightest individual waypoints. A single frame's instantaneous
+// curvature says nothing about whether the CYCLES BEFORE it were also
+// tight; a corner entered at a moderate curvature that ramps up smoothly
+// gets exactly the same per-cycle speed as an isolated one-frame wiggle in
+// otherwise straight running, even though the former needs to have
+// already bled off speed well before its own worst waypoint to leave pure
+// pursuit's tracking any real margin. An EMA of recent |curvature|
+// tracks "how tight has cornering been LATELY", not just "how tight is
+// this exact frame" -- taking the min of the instantaneous- and
+// EMA-based speeds (below) means a sustained run of tight waypoints keeps
+// speed capped down even on an individual cycle whose own target happens
+// to look momentarily easier, so the car can't prematurely speed back up
+// mid-corner just because one frame's path looked slightly gentler than
+// its neighbors.
+//
+// kCurvatureEmaAlpha sized for a ~20-cycle (~0.67s at this pipeline's
+// ~30Hz planning rate, camera-rate-limited -- see perception.cpp) time
+// constant: long enough to genuinely capture "sustained", short enough to
+// still respond within the first couple seconds of entering a real
+// corner rather than lagging behind it. Not (yet) tuned against a second
+// independent live measurement the way the other constants in this file
+// are -- this is a first, reasoned attempt at the confirmed "instantaneous
+// alone isn't enough" failure; if live testing shows this constant itself
+// needs adjustment, that's a reason to retune it with fresh measurements,
+// not to have guessed harder up front.
+constexpr double kCurvatureEmaAlpha = 0.05;
 
 // Creep speed for an EMPTY path (see the early-return below) -- well under
 // kMinSpeed, cautious but nonzero. Confirmed directly as a real, fatal
@@ -205,9 +259,16 @@ constexpr int kMaxReverseAttempt = 4;
 //      margin to stay controllable at a given lookahead distance, and
 //      constant full speed through a corner was the last part of this
 //      controller still a flat stub (see the original TODO this replaces).
+//   3b. Also scale speed off an EMA of RECENT curvature (see
+//      kCurvatureEmaAlpha's comment), and take the min of the two --
+//      instantaneous curvature alone doesn't distinguish a single-frame
+//      wiggle from a SUSTAINED tight corner, and only the latter needs
+//      speed bled off well before its own worst waypoint to leave any
+//      real tracking margin.
 //   4. yaw_rate = speed * curvature (curvature = yaw_rate / speed by
-//      definition) -- using the SCALED speed, not kMaxSpeed, so the
-//      reported yaw_rate stays consistent with the speed actually commanded.
+//      definition) -- using the SCALED speed (step 3b's min, not just
+//      step 3's instantaneous value), so the reported yaw_rate stays
+//      consistent with the speed actually commanded.
 DriveCommand PurePursuitController::Compute(const ControlInputs &inputs)
 {
     // Universal stuck-detection watchdog -- runs FIRST, unconditionally,
@@ -343,8 +404,17 @@ DriveCommand PurePursuitController::Compute(const ControlInputs &inputs)
     const double lookaheadSq = targetX * targetX + targetY * targetY;
     const double curvature = lookaheadSq > 1e-6 ? (2.0 * targetY / lookaheadSq) : 0.0;
 
-    const double speed = std::clamp(kMaxSpeed - kCurvatureSpeedGain * std::abs(curvature),
-                                     kMinSpeed, kMaxSpeed);
+    // See kCurvatureEmaAlpha's comment for why a SUSTAINED tight run needs
+    // its own, longer-memory speed cap on top of the instantaneous one --
+    // updated every normal cycle (not the empty-path/stuck branches above,
+    // which return before reaching here) so it tracks recent REAL
+    // steering demand, not stale history from before a gap.
+    m_curvatureEma += kCurvatureEmaAlpha * (std::abs(curvature) - m_curvatureEma);
+    const double emaSpeed = std::clamp(kMaxSpeed - kCurvatureSpeedGain * m_curvatureEma,
+                                        kMinSpeed, kMaxSpeed);
+    const double instantSpeed = std::clamp(kMaxSpeed - kCurvatureSpeedGain * std::abs(curvature),
+                                            kMinSpeed, kMaxSpeed);
+    const double speed = std::min(instantSpeed, emaSpeed);
     const double yawRate = speed * curvature;
 
     return DriveCommand{speed, yawRate};
