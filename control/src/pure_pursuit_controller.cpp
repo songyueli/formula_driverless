@@ -9,7 +9,19 @@ namespace
 // Straight-line target speed -- confirmed to hold up at full active-landmark
 // capacity (kMaxActiveLandmarks=80) once the EKF-side scaling fixes (sparse
 // corrections, spatial-grid retired-landmark search) were in place.
-constexpr double kMaxSpeed = 3.0;  // m/s
+//
+// Tried raising this (2026-08-30): 7.0 got stuck at a DIFFERENT corner
+// (~31,27) early in the lap that was never a problem at 5.0; backing off
+// to 6.0 then got stuck back at the hairpin itself (~-21,-14) instead --
+// both confirmed live via ground-truth pose (car frozen 3+ consecutive
+// samples). The traversal-ordering fix removed the hairpin's zigzag
+// SHAPE, but the curvature-based slowdown still needs the current ceiling
+// to bring the car down in time entering a sharp corner; a higher
+// straightaway speed outruns that margin at more than one corner on this
+// track, not just the hairpin. Reverted to the confirmed-reliable value
+// (5/5 clean hairpin passes, full-lap soak) rather than kept at a value
+// that only looked fine in a shorter test window.
+constexpr double kMaxSpeed = 5.0;  // m/s
 // Floor speed for the tightest corners a live path ever produces -- a
 // nonempty path never commands slower than this (an EMPTY path is handled
 // separately, at kCreepSpeed below -- see its own comment for why that's
