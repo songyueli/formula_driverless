@@ -314,6 +314,70 @@ std::vector<PathPoint> SingleSideOffsetPath(const std::vector<ClassifiedCone> &_
               [](const PathPoint &a, const PathPoint &b) { return a.x < b.x; });
     return waypoints;
 }
+
+// Orders an unordered set of midpoint waypoints into travel order via
+// greedy nearest-neighbor walking, starting from the origin (the vehicle's
+// own position, since this is body-frame data) and repeatedly appending
+// whichever remaining point is nearest to the current chain end.
+//
+// Replaces a plain sort-by-x, which silently assumed the track never
+// curves back on itself within the visible window -- true for gentle
+// curves, but false at a hairpin: far-side waypoints can have a SMALLER
+// body-frame x than near-side ones once the track folds back past
+// perpendicular, so an x-sort interleaves the two sides into a zigzag
+// instead of a curve. Confirmed directly as the cause of the zigzag seen
+// live at this track's hairpin, not just a suspected mechanism. This walk
+// instead follows the actual point-to-point geometry, the standard way to
+// reconstruct an ordered path from an unordered point cloud that folds
+// back on one axis.
+//
+// kMaxPairDistance also bounds each hop here, same as it bounds cone
+// pairing above and for the same reason: without a cap, the chain could
+// jump across a hairpin's own gap to a spatially-close point that's
+// actually on the opposite, not-yet-reached leg of the track -- a wrong
+// hop would reintroduce the exact zigzag this function exists to remove.
+// Points the walk can't reach within that cap are left out rather than
+// forced in with a bad hop, matching this pipeline's existing "no match is
+// better than a bad match" philosophy (e.g. the mutual-nearest-neighbor
+// check below, lidar_projector.cpp's Localize()).
+std::vector<PathPoint> OrderWaypointsByTraversal(std::vector<PathPoint> _waypoints)
+{
+    std::vector<PathPoint> ordered;
+    ordered.reserve(_waypoints.size());
+    std::vector<bool> used(_waypoints.size(), false);
+
+    double cursorX = 0.0;
+    double cursorY = 0.0;
+    for (size_t step = 0; step < _waypoints.size(); ++step)
+    {
+        int bestIdx = -1;
+        double bestDistSq = kMaxPairDistance * kMaxPairDistance;
+        for (size_t i = 0; i < _waypoints.size(); ++i)
+        {
+            if (used[i])
+            {
+                continue;
+            }
+            const double dx = _waypoints[i].x - cursorX;
+            const double dy = _waypoints[i].y - cursorY;
+            const double distSq = dx * dx + dy * dy;
+            if (distSq < bestDistSq)
+            {
+                bestDistSq = distSq;
+                bestIdx = static_cast<int>(i);
+            }
+        }
+        if (bestIdx < 0)
+        {
+            break;  // nothing left within reach of the chain -- stop rather than force a bad hop
+        }
+        used[static_cast<size_t>(bestIdx)] = true;
+        cursorX = _waypoints[static_cast<size_t>(bestIdx)].x;
+        cursorY = _waypoints[static_cast<size_t>(bestIdx)].y;
+        ordered.push_back(_waypoints[static_cast<size_t>(bestIdx)]);
+    }
+    return ordered;
+}
 }  // namespace
 
 std::vector<PathPoint> NearestPairMidpointPath(const TrackBoundaries &boundaries)
@@ -413,14 +477,14 @@ std::vector<PathPoint> NearestPairMidpointPath(const TrackBoundaries &boundaries
         waypoints.push_back(PathPoint{(l.x + nearest->x) / 2.0, (l.y + nearest->y) / 2.0});
     }
 
-    // Sort by body-frame x (forward distance) so control gets an ordered,
-    // nearest-first path.
-    std::sort(waypoints.begin(), waypoints.end(),
-              [](const PathPoint &a, const PathPoint &b) { return a.x < b.x; });
+    // Order into a travel-order chain (not a plain x-sort -- see
+    // OrderWaypointsByTraversal's own comment for why that breaks at a
+    // hairpin) so control gets an ordered, nearest-first path.
+    waypoints = OrderWaypointsByTraversal(std::move(waypoints));
 
-    // TODO: spline-smooth the path (currently raw midpoints, which can
-    // zigzag with cone-spacing irregularities) before handing it to
-    // control.
+    // TODO: spline-smooth the path (currently raw midpoints, which can be
+    // jagged with cone-spacing irregularities even once correctly ordered)
+    // before handing it to control.
     return EnforceMinClearance(EnforceMinTurnRadius(std::move(waypoints)), allCones);
 }
 }  // namespace fsd
