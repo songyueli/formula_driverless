@@ -47,20 +47,29 @@ constexpr double kLandmarkGateChiSq = 5.99;
 // just froze while the car kept moving.
 constexpr size_t kMaxLandmarks = 600;
 
-// Restored to 80 (the real, performance-validated value -- bounds every
-// correction's O(n^2) cost via n = kVehicleStateDim + 2*kMaxActiveLandmarks).
-// Was dropped to 10, then 25, while debugging landmark jitter: 10 was FAR
-// below how many distinct cones are visible at once, causing near-constant
-// evict/reactivate churn that kept interrupting convergence before Pll
-// could tighten through several consecutive Kalman updates the way it's
-// supposed to (landmarks are static, so Predict() adds zero process noise
-// to their dimensions -- every real observation should only ever tighten
-// Pll, never re-widen it). That debugging is done (the reactivation
-// blending and duplicate-pruning fixes address the actual root causes),
-// and with the sparse-aware ApplyCorrection/StabilizeCovariance rewrite
-// from earlier this session, 80 active landmarks (n=166) already measured
-// well within real-time budget (sub-millisecond corrections).
-constexpr size_t kMaxActiveLandmarks = 80;
+// Reduced from 80 to 50 (2026-08-30) -- 80's own "sub-millisecond
+// corrections" measurement (see below) was real but incomplete: it timed
+// ONE correction in isolation, not the AGGREGATE throughput actually
+// demanded. cone_detections is deliberately never throttled (see
+// localization.cpp's kBodyVelocityCorrectionThrottle/
+// kYawRateCorrectionThrottle/kGnssCorrectionThrottle comments for why --
+// it's the landmark-relevant stream this file's whole SLAM map depends
+// on), so a single camera frame with many simultaneously-visible cones
+// (confirmed live: 8 blue + 6 yellow = 14 in one ordinary frame, and
+// straightaways with a longer sight line see more) pays its own O(n^2)
+// ApplyCorrection cost ONCE PER CONE, all within that frame's ~33ms
+// budget at the ~30Hz camera rate. After throttling the other 4 sensor
+// streams down (localization.cpp, same date), live `top -H` still showed
+// this process creeping back to 99.9% CPU over a long enough run as the
+// active landmark count grew toward 80 (n=166) -- confirmed as the
+// throttling fix reducing correction FREQUENCY but not this per-call
+// O(n^2) COST, which scales with active count regardless of how often
+// any single source fires. 50 (n=106) keeps comfortable margin above the
+// ~14-20 simultaneously-visible-cone counts actually observed live --
+// nowhere near the 10 that was confirmed too small (constant evict/
+// reactivate churn interrupting convergence) -- while cutting per-
+// correction cost to (106/166)^2 =~ 41% of the 80 setting.
+constexpr size_t kMaxActiveLandmarks = 50;
 
 // A brand-new landmark's initial world position is computed directly from
 // the CURRENT vehicle pose estimate (see AddLandmark) -- if that estimate
