@@ -133,6 +133,82 @@ constexpr double kMaxAntennaPairingAgeS = 0.1;
 // order of magnitude below what was measured saturating the core.
 constexpr int kGnssCorrectionThrottle = 20;
 
+// Same throttling pattern as kGnssCorrectionThrottle above, applied to
+// /ground_speed and /imu -- confirmed as the actual DOMINANT remaining CPU
+// cost via a live per-source timing breakdown (2026-08-30), added
+// specifically because the GNSS throttle above, while a real and correct
+// fix for what it targeted, only ever addressed part of the total load:
+// over a live run, cumulative time-in-callback broke down as
+// ground_speed=54.5%, cone_detections=21.4%, imu=18.6%, gnss (both
+// antennas combined)=5.5% -- /ground_speed alone cost MORE than
+// cone_detections and imu combined, and had never been examined before
+// because the antenna-staleness investigation that produced the GNSS fix
+// was chasing a specific symptom (bad heading pairing), not auditing all
+// 5 sensor callbacks' own cost. /ground_speed's own odometry-publisher
+// plugin runs at 1000Hz and /imu at 400Hz (both in fsd_car/model.sdf) --
+// neither throttled at all until now, each paying the same O(n^2)
+// ApplyCorrection cost per call as GNSS/heading do (see
+// kGnssCorrectionThrottle's own comment for why measurement dimension
+// doesn't change that cost). This is also the confirmed mechanism behind
+// a SEPARATE symptom: live ground-truth tracing found /estimated_pose's
+// yaw error staying under ~1 degree for the first ~54s of a run then
+// exploding to >9 degrees by t=65s (the classic CPU-saturation ->
+// message-drop -> dt clamp signature, same as the original GNSS finding),
+// and every landmark created or corrected during that window inheriting
+// the bad yaw -- directly corrupting the SLAM map, not just the pose
+// estimate. cone_detections is deliberately NOT throttled here -- it's
+// the landmark-relevant stream this whole investigation is trying to keep
+// accurate, and per-call cost data shows it was never the dominant cost
+// in the first place.
+//
+// 20 -> ground_speed 1000Hz -> 50Hz, imu 400Hz -> 20Hz. Matches
+// kGnssCorrectionThrottle's own reasoning: both land comfortably inside
+// what real hardware of this class would actually report at (a body
+// velocity or gyro sensor doesn't need 1000Hz/400Hz fusion into an EKF
+// whose own position anchor, GNSS, is already throttled to ~20-40Hz),
+// while predictTo() still runs on every single message either way, so
+// dead-reckoning between corrections stays exactly as current as before --
+// only the expensive correction itself is throttled.
+//
+// kYawRateCorrectionThrottle tested at 5 (down from 20) and reverted:
+// after fixing the catastrophic yaw explosion (>9 degrees within the
+// first minute), a smaller, BOUNDED ~0.5-0.6 degree residual yaw error
+// persisted throughout an otherwise stable 300s run. Hypothesis was that
+// m_x(5) (the EKF's own yaw-RATE state) only getting corrected every 20th
+// IMU sample left Predict() integrating a stale rate between corrections --
+// confirmed directly as WRONG, not just unconfirmed: throttling imu 4x
+// less aggressively (20 -> 5) left the residual completely unchanged
+// (0.616/0.548/0.560 degree medians at t=2/60/240s vs. 0.625/0.548/0.552
+// at throttle=20 -- no measurable difference), ruling out IMU's own
+// correction rate as the limiting factor. See kHeadingCorrectionThrottle
+// below for the more promising lever this pointed to instead.
+constexpr int kBodyVelocityCorrectionThrottle = 20;
+constexpr int kYawRateCorrectionThrottle = 20;
+
+// Heading's own throttle, decoupled from kGnssCorrectionThrottle (which
+// still governs POSITION) -- kept structurally separate for future
+// flexibility even though tuning it turned out NOT to be the lever this
+// investigation was looking for. Tested at 5 (a 4x higher correction rate
+// than position's 20) against the same ~0.5-0.6 degree residual yaw error
+// kYawRateCorrectionThrottle's own comment describes -- confirmed directly
+// as ALSO having no measurable effect (yaw error medians of 0.40/0.46/0.49
+// degrees at t=2/30/60s, statistically indistinguishable from the
+// throttle=20 baseline's 0.62/0.48/0.55), with no measurable CPU cost
+// difference either (83.3% vs. 84.6% final). Between this and
+// kYawRateCorrectionThrottle's own negative result, the residual looks
+// like a genuine GEOMETRIC noise floor, not a correction-rate one: the
+// front/rear antennas sit only 1m apart (kFrontAntennaX/kRearAntennaX),
+// and propagating each antenna's own ~0.01-0.012m GNSS position noise
+// (fsd_car/model.sdf's navsat <horizontal> stddev, matching
+// kGnssPositionStddev) through atan2 over that short a baseline gives a
+// back-of-envelope heading noise of sqrt(2)*0.012/1.0 =~ 0.017rad =~ 1
+// degree -- the same order of magnitude as what's actually observed,
+// regardless of how often that noisy measurement gets fused. Left at 20
+// (matching kGnssCorrectionThrottle) rather than the untuned 5 this was
+// tested at, since 5 bought nothing measurable over 20 for either yaw
+// accuracy or CPU.
+constexpr int kHeadingCorrectionThrottle = 20;
+
 // Cone-landmark correction tuning. Unlike the sensor noise figures above,
 // there's no datasheet for "how accurate is our own lidar+YOLO pipeline's
 // cone localization" -- this is an engineering estimate, not a spec. The
@@ -326,6 +402,23 @@ int main()
         {
             return;
         }
+        // Own throttle, DECOUPLED from GNSS position's -- confirmed
+        // directly (2026-08-30) as needed: reducing the IMU yaw-RATE
+        // correction throttle (kYawRateCorrectionThrottle) left the
+        // ~0.5-0.6 degree residual yaw error completely unchanged,
+        // ruling that out as the limiting factor. Heading is a much more
+        // authoritative, DIRECT yaw fix (kGnssHeadingStddevDeg=0.15
+        // degrees vs. IMU's noisy rate-integration path) than position
+        // needs to be for THIS purpose, so it gets its own, less
+        // aggressive throttle rather than inheriting position's -- shared
+        // across front/rear (a single counter here, not one per antenna)
+        // since either one can trigger a heading correction once both
+        // sides are fresh enough.
+        static int throttleCalls = 0;
+        if (++throttleCalls % kHeadingCorrectionThrottle != 0)
+        {
+            return;
+        }
         // front - rear points along the vehicle's forward (+X body) axis;
         // atan2(north, east) matches this filter's yaw convention (0 = +X
         // axis, CCW positive) since world X/Y map directly to East/North.
@@ -340,8 +433,12 @@ int main()
     {
         fsd::ScopedTimer timer(publishTiming);
         predictTo(StampToSeconds(_msg.header().stamp()));
-        ekf.CorrectBodyVelocity(_msg.twist().linear().x(), _msg.twist().linear().y(),
-                                 kGroundSpeedStddev, kGroundSpeedStddev);
+        static int throttleCalls = 0;
+        if (++throttleCalls % kBodyVelocityCorrectionThrottle == 0)
+        {
+            ekf.CorrectBodyVelocity(_msg.twist().linear().x(), _msg.twist().linear().y(),
+                                     kGroundSpeedStddev, kGroundSpeedStddev);
+        }
         publishEstimate();
     };
     if (!node.Subscribe("/ground_speed", onGroundSpeed))
@@ -355,7 +452,11 @@ int main()
     {
         fsd::ScopedTimer timer(publishTiming);
         predictTo(StampToSeconds(_msg.header().stamp()));
-        ekf.CorrectYawRate(_msg.angular_velocity().z(), kGyroZStddev);
+        static int throttleCalls = 0;
+        if (++throttleCalls % kYawRateCorrectionThrottle == 0)
+        {
+            ekf.CorrectYawRate(_msg.angular_velocity().z(), kGyroZStddev);
+        }
         publishEstimate();
     };
     if (!node.Subscribe("/imu", onImu))
@@ -377,8 +478,8 @@ int main()
         {
             ekf.CorrectGnssPosition(enu.east, enu.north, kFrontAntennaX, kFrontAntennaY,
                                      kGnssPositionStddev);
-            correctHeadingIfPossible();
         }
+        correctHeadingIfPossible();  // own, decoupled throttle -- see its own comment
         publishEstimate();
     };
     if (!node.Subscribe("/gnss/front", onGnssFront))
@@ -400,8 +501,8 @@ int main()
         {
             ekf.CorrectGnssPosition(enu.east, enu.north, kRearAntennaX, kRearAntennaY,
                                      kGnssPositionStddev);
-            correctHeadingIfPossible();
         }
+        correctHeadingIfPossible();  // own, decoupled throttle -- see its own comment
         publishEstimate();
     };
     if (!node.Subscribe("/gnss/rear", onGnssRear))

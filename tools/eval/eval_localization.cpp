@@ -386,7 +386,12 @@ int main(int argc, char **argv)
         while (yawErr < -M_PI) yawErr += 2 * M_PI;
         poseErrorPos.Add(posErr);
         poseErrorYawDeg.Add(std::abs(yawErr) * 180.0 / M_PI);
-        csv << nowSec() << ",pose," << posErr << ",,,\n";
+        // yawErrDeg riding in the range_m column (unused for "pose" rows) --
+        // added 2026-08-30 to check whether yaw error spikes specifically
+        // during sustained turning (the Report()-level aggregate is a
+        // running mean/median since t=0, which can't show a LOCALIZED
+        // spike -- only a per-sample series can).
+        csv << nowSec() << ",pose," << posErr << "," << (yawErr * 180.0 / M_PI) << ",,\n";
     };
     if (!node.Subscribe("/estimated_pose", onPose))
     {
