@@ -2,29 +2,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
-
-// TEMPORARY diagnostic instrumentation -- prints every kDiagLogEvery-th call
-// to each correction/predict function in full detail, indefinitely. Meant to
-// be stripped back out once the current early-divergence investigation is
-// resolved; NOT meant to stay in the codebase long-term (unthrottled verbose
-// logging like this is exactly the kind of stdout cost perception's own
-// per-detection printing was just flagged as contributing to real
-// per-cycle latency).
-//
-// Deliberately throttled-but-indefinite, NOT a first-N-calls cutoff -- a
-// first-N-calls cutoff was tried first and was a real bug in its own right:
-// GNSS/ground_speed fire at ~500-1000Hz, so even a generous few-thousand-call
-// budget is exhausted within seconds of process start, going permanently
-// silent well before a divergence event that only shows up later in a
-// longer test (confirmed directly: a manual-drive test's actual divergence
-// was invisible in the log because logging had already stopped by the time
-// it happened, even though live /estimated_pose vs. ground-truth comparison
-// showed the error growing in real time).
-namespace
-{
-constexpr int kDiagLogEvery = 50;
-} // namespace
 
 namespace
 {
@@ -196,6 +173,17 @@ constexpr double kCoarseGateRadius = 15.0; // meters
 // correct rather than just empirically adequate.
 constexpr double kRetiredGridCellSize = kCoarseGateRadius; // meters
 
+// EvictStaleIfOverCapacity's distance threshold for "safe to evict" -- see
+// that function's own comment for the full story. Deliberately the SAME
+// value as kCoarseGateRadius above (not a coincidence: both are really
+// asking the same physical question, "could this landmark plausibly still
+// be relevant to what the car can currently sense"), kept as its own named
+// constant rather than reused directly because the two uses aren't
+// actually coupled -- one bounds a matching-search pre-filter, the other
+// bounds an eviction safety margin, and there's no reason a future retune
+// of one should silently retune the other.
+constexpr double kEvictionMinDistance = 15.0; // meters
+
 // Minimum P22 (yaw variance) StabilizeCovariance ever leaves the filter
 // with -- separate from, and much larger than, kMinVariance's own 1e-9
 // purely-numerical floor (StabilizeCovariance, above). Confirmed directly
@@ -234,6 +222,44 @@ constexpr double kRetiredGridCellSize = kCoarseGateRadius; // meters
 // there's no confirmed problem there to fix, and floors are not a
 // zero-risk change to make speculatively.
 constexpr double kYawVarianceFloor = (0.3 * M_PI / 180.0) * (0.3 * M_PI / 180.0); // rad^2
+
+// Same pathology as kYawVarianceFloor above, same fix, different state
+// dimension: a landmark is static, so Predict() adds it zero process
+// noise -- nothing ever widens Pll back out once repeated
+// CorrectMatchedLandmark() calls shrink it. Confirmed directly as a real,
+// live failure (not theoretical): temporary instrumentation on
+// PruneStaleActiveDuplicates showed it firing constantly -- every single
+// throttled call found real removals, starting as early as active=35
+// (retired=0, nowhere near kMaxActiveLandmarks) -- so this has nothing to
+// do with the eviction/capacity mechanism elsewhere in this file. Logging
+// each merge's distance and the two landmarks' uids showed why: the same
+// long-lived uid ("uidA") recurs across many merges, paired against a
+// constantly-fresh uid each time ("uidB") -- one specific, well-tracked
+// landmark repeatedly failing to match its OWN genuine re-detections,
+// spawning a spurious duplicate next to itself every time, which the
+// coarser 1.5m Euclidean dedup (kDuplicatePruneRadius) then catches and
+// deletes. Root cause: that landmark's own Pll had converged tight enough
+// that its Mahalanobis gate became narrower than realistic re-detection
+// noise, making the filter deaf to further true observations of it --
+// exactly CorrectHeading's P22 story, just for a landmark instead of the
+// vehicle's yaw. Every one of those failed matches is also a stolen
+// vehicle-pose correction: AddLandmark (what a "new" detection goes
+// through) never touches vehicle state, only CorrectMatchedLandmark does,
+// so this was silently converting a real, useful stream of re-observations
+// into ones that could no longer help pin down pose.
+//
+// Value grounded in the SAME live measurement, not guessed: 1131 logged
+// merge distances (this exact failure, live) came back median=1.15m,
+// p75=1.34m, p90=1.447m, max=1.500m (the kDuplicatePruneRadius ceiling
+// itself) -- essentially NONE under 0.5m, ruling out ordinary same-cone
+// detection jitter as the cause. Set so the Mahalanobis gate's own accept
+// radius (sqrt(kLandmarkGateChiSq * floor) for an ~isotropic 2-DOF gate)
+// comfortably covers the median/p75 of that observed range (sqrt(5.99 *
+// 0.3) =~ 1.34m) while staying safely under the real minimum cone spacing
+// on this track (~1.97m, see kDuplicatePruneRadius's own comment) -- wide
+// enough to stop the filter going deaf to itself, not so wide it risks
+// conflating two genuinely distinct adjacent cones.
+constexpr double kLandmarkVarianceFloor = 0.3; // meters^2 (per axis, Pll's diagonal)
 } // namespace
 
 namespace fsd
@@ -313,6 +339,22 @@ void Ekf::StabilizeCovariance(const std::vector<int> &_touchedIndices)
     if (m_P(2, 2) < kYawVarianceFloor)
     {
         m_P(2, 2) = kYawVarianceFloor;
+    }
+
+    // Landmark-specific floor -- see kLandmarkVarianceFloor's own comment
+    // for the confirmed failure this fixes. Scoped to _touchedIndices
+    // (unlike the unconditional yaw floor above, which checks a single
+    // always-present index) since landmark dims aren't a fixed, small set
+    // -- but any index >= kVehicleStateDim IS necessarily a landmark's own
+    // x or y, and _touchedIndices already tells us exactly which ones this
+    // correction could have just shrunk, at the same O(k) cost the
+    // off-diagonal clamp below already pays for the same set.
+    for (int i : _touchedIndices)
+    {
+        if (i >= kVehicleStateDim && m_P(i, i) < kLandmarkVarianceFloor)
+        {
+            m_P(i, i) = kLandmarkVarianceFloor;
+        }
     }
 
     // Clamp off-diagonal entries among _touchedIndices to the range a
@@ -427,16 +469,6 @@ void Ekf::Predict(double _dt)
 
     const double dx = (vx * cosYaw - vy * sinYaw) * _dt;
     const double dy = (vx * sinYaw + vy * cosYaw) * _dt;
-    {
-        static int calls = 0;
-        if (calls % kDiagLogEvery == 0)
-        {
-            std::fprintf(stderr,
-                "[DIAG Predict] #%d dt=%.6f yaw=%.4f vx=%.4f vy=%.4f yawRate=%.4f -> dx=%.6f dy=%.6f | x=%.3f y=%.3f\n",
-                calls, _dt, yaw, vx, vy, yawRate, dx, dy, m_x(0), m_x(1));
-        }
-        ++calls;
-    }
 
     m_x(0) += dx;
     m_x(1) += dy;
@@ -552,16 +584,7 @@ void Ekf::CorrectBodyVelocity(double _vx, double _vy, double _stddevVx, double _
     R(1, 1) = _stddevVy * _stddevVy;
 
     const Eigen::Matrix2d Hsub = Eigen::Matrix2d::Identity(); // touches {3,4}
-    const Eigen::MatrixXd K = ApplyCorrection({3, 4}, Hsub, y, R);
-
-    static int diagCalls = 0;
-    if (diagCalls % kDiagLogEvery == 0)
-    {
-        std::fprintf(stderr,
-            "[DIAG BodyVel] #%d z=(%.4f,%.4f) h=(%.4f,%.4f) y=(%.4f,%.4f) K30=%.4f K41=%.4f\n",
-            diagCalls, z(0), z(1), h(0), h(1), y(0), y(1), K(3, 0), K(4, 1));
-    }
-    ++diagCalls;
+    ApplyCorrection({3, 4}, Hsub, y, R);
 }
 
 void Ekf::CorrectYawRate(double _yawRate, double _stddev)
@@ -569,30 +592,13 @@ void Ekf::CorrectYawRate(double _yawRate, double _stddev)
     const double h = m_x(5);
     const double y = _yawRate - h;
 
-    static int diagCalls = 0;
-    const bool diag = diagCalls % kDiagLogEvery == 0;
-    double beforeX = 0, beforeY = 0;
-    if (diag)
-    {
-        beforeX = m_x(0);
-        beforeY = m_x(1);
-    }
-
     Eigen::MatrixXd Hsub(1, 1);
     Hsub(0, 0) = 1.0; // touches {5}
     Eigen::MatrixXd R(1, 1);
     R(0, 0) = _stddev * _stddev;
     Eigen::VectorXd yv(1);
     yv(0) = y;
-    const Eigen::MatrixXd K = ApplyCorrection({5}, Hsub, yv, R);
-
-    if (diag)
-    {
-        std::fprintf(stderr,
-            "[DIAG YawRate] #%d z=%.4f h=%.4f y=%.4f K1=%.4f | before x=%.3f y=%.3f -> after x=%.3f y=%.3f\n",
-            diagCalls, _yawRate, h, y, K(1, 0), beforeX, beforeY, m_x(0), m_x(1));
-    }
-    ++diagCalls;
+    ApplyCorrection({5}, Hsub, yv, R);
 }
 
 void Ekf::CorrectGnssPosition(double _measuredEast, double _measuredNorth,
@@ -619,28 +625,7 @@ void Ekf::CorrectGnssPosition(double _measuredEast, double _measuredNorth,
 
     const Eigen::Matrix2d R = Eigen::Matrix2d::Identity() * (_stddev * _stddev);
 
-    static int diagCalls = 0;
-    const bool diag = diagCalls % kDiagLogEvery == 0;
-    double beforeX = 0, beforeY = 0, beforeP00 = 0, beforeP11 = 0;
-    if (diag)
-    {
-        beforeX = m_x(0);
-        beforeY = m_x(1);
-        beforeP00 = m_P(0, 0);
-        beforeP11 = m_P(1, 1);
-    }
-
-    const Eigen::MatrixXd K = ApplyCorrection({0, 1, 2}, Hsub, y, R);
-
-    if (diag)
-    {
-        std::fprintf(stderr,
-            "[DIAG GNSS] #%d z=(%.3f,%.3f) h=(%.3f,%.3f) y=(%.3f,%.3f) K00=%.4f K11=%.4f | "
-            "before x=%.3f y=%.3f P00=%.3e P11=%.3e -> after x=%.3f y=%.3f P00=%.3e P11=%.3e\n",
-            diagCalls, z(0), z(1), h(0), h(1), y(0), y(1), K(0, 0), K(1, 1),
-            beforeX, beforeY, beforeP00, beforeP11, m_x(0), m_x(1), m_P(0, 0), m_P(1, 1));
-    }
-    ++diagCalls;
+    ApplyCorrection({0, 1, 2}, Hsub, y, R);
 }
 
 void Ekf::CorrectHeading(double _measuredYaw, double _stddev)
@@ -648,38 +633,13 @@ void Ekf::CorrectHeading(double _measuredYaw, double _stddev)
     const double h = m_x(2);
     const double y = NormalizeAngle(_measuredYaw - h);
 
-    static int diagCalls = 0;
-    const bool diag = diagCalls % kDiagLogEvery == 0;
-    double beforeX = 0, beforeY = 0, beforeP22 = 0;
-    if (diag)
-    {
-        beforeX = m_x(0);
-        beforeY = m_x(1);
-        beforeP22 = m_P(2, 2);
-    }
-
     Eigen::MatrixXd Hsub(1, 1);
     Hsub(0, 0) = 1.0; // touches {2}
     Eigen::MatrixXd R(1, 1);
     R(0, 0) = _stddev * _stddev;
     Eigen::VectorXd yv(1);
     yv(0) = y;
-    const Eigen::MatrixXd K = ApplyCorrection({2}, Hsub, yv, R);
-
-    if (diag)
-    {
-        // TEMPORARY (covariance-collapse investigation): P22 (yaw variance)
-        // and R side by side -- if P22 << R, the Kalman gain K1 = P22/(P22+R)
-        // is necessarily near-zero regardless of how large/small the actual
-        // innovation y is, which is the direct, checkable signature of the
-        // filter having become overconfident (deaf) about yaw specifically.
-        std::fprintf(stderr,
-            "[DIAG Heading] #%d z=%.4f h=%.4f y=%.6f K1=%.6f R=%.3e P22_before=%.3e P22_after=%.3e | "
-            "before x=%.3f y=%.3f -> after x=%.3f y=%.3f\n",
-            diagCalls, _measuredYaw, h, y, K(1, 0), R(0, 0), beforeP22, m_P(2, 2),
-            beforeX, beforeY, m_x(0), m_x(1));
-    }
-    ++diagCalls;
+    ApplyCorrection({2}, Hsub, yv, R);
 }
 
 void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
@@ -700,14 +660,6 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     // bounds both n and the candidate count to something small.
     int bestIndex = -1;
     double bestMahalanobisSq = kLandmarkGateChiSq;
-    // TEMPORARY (landmark-duplication debugging): track the closest
-    // same-color active candidate's Mahalanobis value REGARDLESS of
-    // whether it passed the gate, and its Euclidean distance, so the
-    // AddLandmark diagnostic below can show WHY a real match was missed
-    // (nothing nearby at all, vs. something nearby that failed the gate
-    // and by how much) instead of just "no match found".
-    double closestActiveDistSq = -1.0;
-    double closestActiveMahalanobisSq = -1.0;
     for (size_t i = 0; i < m_landmarkColors.size(); ++i)
     {
         if (m_landmarkColors[i] != _color)
@@ -728,10 +680,6 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
         const double dxCoarse = m_x(li) - worldX;
         const double dyCoarse = m_x(li + 1) - worldY;
         const double distSq = dxCoarse * dxCoarse + dyCoarse * dyCoarse;
-        if (closestActiveDistSq < 0.0 || distSq < closestActiveDistSq)
-        {
-            closestActiveDistSq = distSq;
-        }
         // kCoarseGateRadius: see its declaration in this file's anonymous
         // namespace above (shared with the retired-landmark grid's cell
         // size).
@@ -744,10 +692,6 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
         Eigen::MatrixXd Hcols; // unused here besides the out-param -- only y/S are needed for gating
         LandmarkInnovation(static_cast<int>(i), _measuredBodyX, _measuredBodyY, _stddev, y, S, Hcols);
         const double mahalanobisSq = y.transpose() * S.inverse() * y;
-        if (closestActiveMahalanobisSq < 0.0 || mahalanobisSq < closestActiveMahalanobisSq)
-        {
-            closestActiveMahalanobisSq = mahalanobisSq;
-        }
         if (mahalanobisSq < bestMahalanobisSq)
         {
             bestMahalanobisSq = mahalanobisSq;
@@ -757,15 +701,6 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
 
     if (bestIndex >= 0)
     {
-        static int matchDiagCalls = 0;
-        if (matchDiagCalls % kDiagLogEvery == 0)
-        {
-            std::fprintf(stderr,
-                "[DIAG LandmarkMatch] #%d color=%d world=(%.2f,%.2f) matchedIndex=%d mahalanobisSq=%.3f active=%zu retired=%zu\n",
-                matchDiagCalls, static_cast<int>(_color), worldX, worldY, bestIndex,
-                bestMahalanobisSq, m_landmarkColors.size(), m_retiredLandmarks.size());
-        }
-        ++matchDiagCalls;
         CorrectMatchedLandmark(bestIndex, _measuredBodyX, _measuredBodyY, _stddev);
         EvictStaleIfOverCapacity();
         // An active match means the retired list was never even consulted
@@ -808,9 +743,6 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     // cross-correlation term, since none is available post-retirement) --
     // the vehicle's own pose can still have drifted since the landmark was
     // retired -- along with the measurement variance as a floor.
-    // TEMPORARY (landmark-duplication debugging): same closest-candidate
-    // tracking as the active search above, for the AddLandmark diagnostic
-    // below.
     //
     // BUG FIX: this used to erase and reactivate the FIRST retired
     // candidate that passed the gate, in list order -- not the BEST
@@ -834,8 +766,6 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     LandmarkEstimate reactivatedPrior{}; // saved before erase invalidates it -- passed to AddLandmark below
     int bestRetiredIndex = -1;
     double bestRetiredMahalanobisSq = kLandmarkGateChiSq;
-    double closestRetiredDistSq = -1.0;
-    double closestRetiredMahalanobisSq = -1.0;
     // Candidates narrowed to the 3x3 grid-cell neighborhood around
     // (worldX, worldY) instead of the full m_retiredLandmarks list -- see
     // m_retiredGrid's comment in ekf.hpp. This is what actually fixes the
@@ -854,20 +784,11 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
         }
         const double dx = m_retiredLandmarks[i].x - worldX;
         const double dy = m_retiredLandmarks[i].y - worldY;
-        const double distSq = dx * dx + dy * dy;
-        if (closestRetiredDistSq < 0.0 || distSq < closestRetiredDistSq)
-        {
-            closestRetiredDistSq = distSq;
-        }
         const double varX = std::max(kMinRetiredMatchVariance,
             m_retiredLandmarks[i].varX + m_P(0, 0) + _stddev * _stddev);
         const double varY = std::max(kMinRetiredMatchVariance,
             m_retiredLandmarks[i].varY + m_P(1, 1) + _stddev * _stddev);
         const double approxMahalanobisSq = (dx * dx) / varX + (dy * dy) / varY;
-        if (closestRetiredMahalanobisSq < 0.0 || approxMahalanobisSq < closestRetiredMahalanobisSq)
-        {
-            closestRetiredMahalanobisSq = approxMahalanobisSq;
-        }
         if (approxMahalanobisSq < bestRetiredMahalanobisSq)
         {
             bestRetiredMahalanobisSq = approxMahalanobisSq;
@@ -901,22 +822,6 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
         // stops brand new ones from being created.
         return;
     }
-
-    // TEMPORARY (landmark-duplication debugging): every AddLandmark call
-    // is either a genuinely new cone or a symptom of a matching-gate
-    // failure -- this print shows which, and if it's the latter, how
-    // close the nearest real candidate actually was and why it didn't
-    // pass (distance alone doesn't say whether the failure was the
-    // active gate or the retired one, so both are reported).
-    std::fprintf(stderr,
-        "[DIAG AddLandmark] color=%d world=(%.2f,%.2f) reactivated=%d "
-        "closestActiveDist=%.2f closestActiveMahalanobisSq=%.2f "
-        "closestRetiredDist=%.2f closestRetiredMahalanobisSq=%.2f "
-        "active=%zu retired=%zu\n",
-        static_cast<int>(_color), worldX, worldY, reactivated ? 1 : 0,
-        closestActiveDistSq < 0.0 ? -1.0 : std::sqrt(closestActiveDistSq), closestActiveMahalanobisSq,
-        closestRetiredDistSq < 0.0 ? -1.0 : std::sqrt(closestRetiredDistSq), closestRetiredMahalanobisSq,
-        m_landmarkColors.size(), m_retiredLandmarks.size());
 
     AddLandmark(_measuredBodyX, _measuredBodyY, _color, _stddev,
                 reactivated ? &reactivatedPrior : nullptr);
@@ -1200,15 +1105,81 @@ void Ekf::EvictStaleIfOverCapacity()
 {
     while (m_landmarkColors.size() > kMaxActiveLandmarks)
     {
+        // Prefer the least-recently-seen landmark AMONG those already
+        // farther than kEvictionMinDistance from the vehicle's current
+        // position -- not just the single globally least-recently-seen
+        // one, which is what this used to do. Confirmed directly as a
+        // real, significant bug (not just a theoretical trade-off): on a
+        // continuously-driven lap, once the active count first reaches
+        // kMaxActiveLandmarks, "least recently seen" very often picks a
+        // landmark that's still well within sensor range -- just the one
+        // that happened to not get re-matched the last cycle or two (a
+        // missed detection, an occlusion, a viewing-angle gap) -- NOT one
+        // the car has actually driven away from. Evicting it right as it's
+        // about to be re-detected converts what would have been a genuine
+        // CorrectMatchedLandmark() call (which corrects vehicle pose too,
+        // via H's {0,1,2} columns) into a reactivation via AddLandmark()
+        // (which does NOT correct vehicle pose at all -- it only appends a
+        // state row/column, see that function). Live measurement (a full
+        // eval_localization.cpp run) found /estimated_pose position error
+        // starting to climb, smoothly and continuously, within ~3 seconds
+        // of active landmark count first hitting the cap -- exactly the
+        // signature of the pose losing a real, ongoing source of
+        // correction, not random noise. Biasing eviction toward landmarks
+        // already far enough to be implausible to re-detect this cycle
+        // keeps a nearby-but-briefly-unseen landmark in the active,
+        // pose-correcting state instead.
+        //
+        // Falls back to the globally least-recently-seen landmark (the old
+        // behavior) only when NO active landmark is farther than
+        // kEvictionMinDistance -- a genuine local-density overflow (more
+        // than kMaxActiveLandmarks real cones within sensor range at once),
+        // which the coarse distance check alone can't resolve.
+        //
+        // Uses the vehicle's OWN current position estimate (m_x(0), m_x(1))
+        // -- the exact thing the original recency-only design deliberately
+        // avoided depending on (see kMaxActiveLandmarks's own history in
+        // this file). That's safe here specifically because the check only
+        // needs to be COARSE (is this landmark plausibly still within
+        // sensor range at all, not a precise distance) -- kEvictionMinDistance
+        // is tens of meters, comfortably larger than the pose error this
+        // mechanism is meant to help prevent in the first place, so even a
+        // moderately-off pose estimate still correctly buckets "clearly far
+        // behind" vs "still nearby" landmarks. And unlike a wrong MATCH
+        // (which injects bad data into the state), a wrong EVICTION choice
+        // here is never worse than the old behavior -- it only ever
+        // degrades gracefully back to the original least-recently-seen
+        // fallback.
+        const double vehX = m_x(0);
+        const double vehY = m_x(1);
+
         size_t staleIndex = 0;
         uint64_t oldest = m_landmarkLastSeen[0];
-        for (size_t i = 1; i < m_landmarkLastSeen.size(); ++i)
+        bool haveFarCandidate = false;
+        size_t farStaleIndex = 0;
+        uint64_t farOldest = 0;
+        for (size_t i = 0; i < m_landmarkLastSeen.size(); ++i)
         {
             if (m_landmarkLastSeen[i] < oldest)
             {
                 oldest = m_landmarkLastSeen[i];
                 staleIndex = i;
             }
+
+            const int liCandidate = kVehicleStateDim + 2 * static_cast<int>(i);
+            const double dx = m_x(liCandidate) - vehX;
+            const double dy = m_x(liCandidate + 1) - vehY;
+            if (dx * dx + dy * dy > kEvictionMinDistance * kEvictionMinDistance
+                && (!haveFarCandidate || m_landmarkLastSeen[i] < farOldest))
+            {
+                haveFarCandidate = true;
+                farOldest = m_landmarkLastSeen[i];
+                farStaleIndex = i;
+            }
+        }
+        if (haveFarCandidate)
+        {
+            staleIndex = farStaleIndex;
         }
 
         const int li = kVehicleStateDim + 2 * static_cast<int>(staleIndex);

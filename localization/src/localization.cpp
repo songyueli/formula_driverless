@@ -84,6 +84,55 @@ constexpr double kGnssPositionStddev = 0.01;   // meters (RTK Fixed)
 constexpr double kGnssHeadingStddevDeg = 0.15; // VN-300 static GNSS-compass spec
 constexpr double kGnssHeadingStddev = kGnssHeadingStddevDeg * M_PI / 180.0;
 
+// Max allowed sim-time gap between the front and rear antenna fixes used
+// for a single heading correction. Confirmed as a real, live failure (not
+// theoretical): direct instrumentation of ApplyCorrection on an 8-minute
+// run caught 3 separate ~180-degree heading corrections (innovation
+// magnitude ~2.5-3.05 rad, essentially pi) landing at near-unity gain
+// (kGnssHeadingStddev is tiny -- the filter treats this measurement as
+// nearly ground truth), each immediately preceded by a 17-20m GNSS
+// position correction -- the signature of dead-reckoning having drifted
+// far off between corrections. Both antennas nominally publish at 400Hz
+// (fsd_car/model.sdf), so under normal operation front/rear are never more
+// than a few ms apart -- but correctHeadingIfPossible (below) pairs
+// whichever fixes are currently cached with NO bound on how old either is.
+// If the single-threaded callback executor ever backlogs one topic's queue
+// relative to the other (plausible given this project's own confirmed RTF
+// stalls -- see kMaxPredictDt's own history in ekf.cpp), a fresh front fix
+// can get paired against a rear fix from well before it: with a 1m
+// baseline, even a modest staleness gap during a turn is enough to rotate
+// the front-minus-rear vector by close to pi. Set to 100ms: two orders of
+// magnitude looser than the nominal 2.5ms inter-sample gap (so ordinary
+// jitter never blocks a correction), but far tighter than the multi-second
+// staleness needed to explain the observed 17-20m drift.
+constexpr double kMaxAntennaPairingAgeS = 0.1;
+
+// Every Nth /gnss/front or /gnss/rear message actually applies an EKF
+// correction (position + heading); the rest only update predictTo() and
+// the cached antenna ENU/timestamp used for staleness checking (both
+// cheap -- no O(n^2) work). Confirmed as the live root cause of the
+// periodic dt=1.0 predict-clamp events chased after the antenna-staleness
+// fix above: `top -H` during an active run showed localization's own
+// thread pinned at 99.9% CPU continuously (not gz-sim, not perception),
+// and both GNSS antennas plus the IMU are each configured at 400Hz
+// (fsd_car/model.sdf) -- unrealistic for real GNSS-compass hardware (real
+// RTK/compass units typically output 5-50Hz; 400Hz reads like a copied
+// default, not a deliberate spec, unlike kGnssHeadingStddevDeg's own
+// datasheet-sourced value). Every correction pays Ekf::ApplyCorrection's
+// O(n^2) covariance update regardless of measurement dimension (P has
+// nonzero vehicle-landmark cross terms even for a 1D heading measurement,
+// so the update is dense over the full n x n matrix -- see that function's
+// own comment); with n up to ~166 once landmarks approach
+// kMaxActiveLandmarks, two antennas firing 400 corrections/sec each is
+// enough on its own to saturate one ARM core, starving gz-transport's
+// receive loop -- which is confirmed lossy under backpressure (drops
+// rather than queues, see kMaxPredictDt's own comment) -- of the CPU time
+// it needs to keep up, producing exactly the message-timestamp gaps that
+// then force a large, uncorrected dead-reckoning jump. 20 -> ~20Hz per
+// antenna (40Hz combined), comfortably inside real hardware's range, an
+// order of magnitude below what was measured saturating the core.
+constexpr int kGnssCorrectionThrottle = 20;
+
 // Cone-landmark correction tuning. Unlike the sensor noise figures above,
 // there's no datasheet for "how accurate is our own lidar+YOLO pipeline's
 // cone localization" -- this is an engineering estimate, not a spec. The
@@ -261,11 +310,19 @@ int main()
 
     // Antenna ENU fixes are cached so a heading correction can be computed
     // whenever EITHER antenna updates, using the other's most recent fix
-    // rather than requiring both to arrive at exactly the same instant.
+    // rather than requiring both to arrive at exactly the same instant --
+    // but only if that "most recent fix" is actually recent: see
+    // kMaxAntennaPairingAgeS's own comment for the confirmed failure a
+    // missing staleness bound here causes.
     std::optional<fsd::EnuPosition> lastFrontEnu, lastRearEnu;
+    std::optional<double> lastFrontTime, lastRearTime;
     auto correctHeadingIfPossible = [&]()
     {
         if (!lastFrontEnu || !lastRearEnu)
+        {
+            return;
+        }
+        if (std::abs(*lastFrontTime - *lastRearTime) > kMaxAntennaPairingAgeS)
         {
             return;
         }
@@ -313,22 +370,15 @@ int main()
         fsd::ScopedTimer timer(publishTiming);
         predictTo(StampToSeconds(_msg.header().stamp()));
         const auto enu = geo.ToEnu(_msg.latitude_deg(), _msg.longitude_deg(), _msg.altitude());
-        {
-            static int diagCalls = 0;
-            if (diagCalls % 50 == 0)
-            {
-                std::cerr << "[DIAG GnssFrontRaw] #" << diagCalls
-                           << " lat=" << _msg.latitude_deg()
-                           << " lon=" << _msg.longitude_deg()
-                           << " alt=" << _msg.altitude()
-                           << " -> east=" << enu.east << " north=" << enu.north << "\n";
-            }
-            ++diagCalls;
-        }
-        ekf.CorrectGnssPosition(enu.east, enu.north, kFrontAntennaX, kFrontAntennaY,
-                                 kGnssPositionStddev);
         lastFrontEnu = enu;
-        correctHeadingIfPossible();
+        lastFrontTime = StampToSeconds(_msg.header().stamp());
+        static int throttleCalls = 0;
+        if (++throttleCalls % kGnssCorrectionThrottle == 0)
+        {
+            ekf.CorrectGnssPosition(enu.east, enu.north, kFrontAntennaX, kFrontAntennaY,
+                                     kGnssPositionStddev);
+            correctHeadingIfPossible();
+        }
         publishEstimate();
     };
     if (!node.Subscribe("/gnss/front", onGnssFront))
@@ -343,10 +393,15 @@ int main()
         fsd::ScopedTimer timer(publishTiming);
         predictTo(StampToSeconds(_msg.header().stamp()));
         const auto enu = geo.ToEnu(_msg.latitude_deg(), _msg.longitude_deg(), _msg.altitude());
-        ekf.CorrectGnssPosition(enu.east, enu.north, kRearAntennaX, kRearAntennaY,
-                                 kGnssPositionStddev);
         lastRearEnu = enu;
-        correctHeadingIfPossible();
+        lastRearTime = StampToSeconds(_msg.header().stamp());
+        static int throttleCalls = 0;
+        if (++throttleCalls % kGnssCorrectionThrottle == 0)
+        {
+            ekf.CorrectGnssPosition(enu.east, enu.north, kRearAntennaX, kRearAntennaY,
+                                     kGnssPositionStddev);
+            correctHeadingIfPossible();
+        }
         publishEstimate();
     };
     if (!node.Subscribe("/gnss/rear", onGnssRear))
