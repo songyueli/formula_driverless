@@ -1,5 +1,7 @@
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -13,12 +15,16 @@
 #include <cstdio>
 
 #include <gz/transport/Node.hh>
+#include <gz/msgs/boolean.pb.h>
+#include <gz/msgs/clock.pb.h>
 #include <gz/msgs/image.pb.h>
+#include <gz/msgs/model.pb.h>
 #include <gz/msgs/pointcloud_packed.pb.h>
 #include <gz/msgs/pose.pb.h>
 #include <gz/msgs/pose_v.pb.h>
 #include <gz/msgs/scene.pb.h>
 #include <gz/msgs/uint64.pb.h>
+#include <gz/msgs/world_control.pb.h>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -96,10 +102,13 @@
 //        CubePrimitive plus 4 wheel CylinderPrimitives, republished every
 //        Pose_V tick alongside /scene/vehicle_pose. Placement in world
 //        space comes entirely from /tf's dynamic world->fsd_car transform,
-//        not from any pose math here. Wheels don't animate steering or
-//        spin: spin is invisible on a symmetric cylinder anyway, and
-//        steering would need parsing live joint_state, which nothing here
-//        needs yet.
+//        not from any pose math here. The two front wheels DO animate
+//        steering now (see BuildVehicleEntity's own comment) by reading
+//        the live /world/<world>/model/fsd_car/joint_state -- without
+//        this, the car is genuinely Ackermann-steered underneath but the
+//        visualization looked like tank/skid-steering, since every wheel
+//        used to sit at a fixed pose fetched once at startup. Wheel SPIN
+//        still isn't animated: invisible on a symmetric cylinder anyway.
 //   /camera/{front,left,right}/image (gz.msgs.Image)
 //     -> /camera/{front,left,right} (Foxglove CompressedImage, JPEG q80 --
 //        see makeImageSubscriber's own comment for why compressed, not
@@ -183,6 +192,14 @@
 //        latest-value-per-field cache is republished in full every time ANY
 //        one of the 4 ticks (same pattern as /tf above, which similarly
 //        merges multiple independently-arriving sources into one output).
+//
+// Sim playback control (Foxglove's native play/pause transport button):
+//   Advertises WebSocketServerCapabilities::PlaybackControl and answers each
+//   request by calling gz-sim's own /world/<world>/control service (pause on
+//   Pause, un-pause on Play) -- no seek/scrub support, since this is a live
+//   sim with no bounded recording to scrub through, just play/pause. Reports
+//   back the sim clock (from /world/<world>/clock, gz.msgs.Clock) as
+//   current_time so Foxglove's UI reflects real sim time, not wall time.
 
 namespace
 {
@@ -496,29 +513,82 @@ std::unordered_map<std::string, foxglove::messages::Pose> FetchStaticWheelPoses(
 // /estimated_vehicle (the EKF's estimate, called from onEstimatedPose) --
 // same shape either way, just a different frame_id/id/colors so Foxglove
 // can place and distinguish the two independently.
+//
+// _frontLeftSteerRad/_frontRightSteerRad animate the two front wheels
+// about the vertical (Z) axis with the REAL steering joint angle (see
+// their own subscription's comment below) -- the car is genuinely
+// Ackermann-steered (confirmed directly: /world/<world>/control's steering
+// joints actually rotate in response to /cmd_ackermann, not a skid-steer
+// approximation), but until now this drew every wheel at a fixed pose
+// fetched once at startup, so the visualization itself looked like
+// tank/skid-steering (car curving with the front wheels never turning)
+// regardless of how the underlying physics actually worked. The EKF
+// doesn't estimate a steering angle (it's not part of its state), so
+// /estimated_vehicle reuses the same real live value as /vehicle -- this
+// is a rendering detail of the physical car, not something either
+// visualization is meant to distinguish.
 foxglove::messages::SceneEntity BuildVehicleEntity(
     const std::string &_frameId, const std::string &_id,
     const foxglove::messages::Color &_chassisColor,
     const foxglove::messages::Color &_wheelColor,
-    const std::unordered_map<std::string, foxglove::messages::Pose> &_wheelStaticPoses)
+    const std::unordered_map<std::string, foxglove::messages::Pose> &_wheelStaticPoses,
+    double _frontLeftSteerRad, double _frontRightSteerRad)
 {
     foxglove::messages::SceneEntity entity;
     entity.timestamp = Now();
     entity.frame_id = _frameId;
     entity.id = _id;
 
+    // Width (Y) deliberately narrower than model.sdf's real 0.84m chassis
+    // collision box -- that width put the box's own half-width (0.42m)
+    // exactly flush against the front wheels' inner face (also 0.42m: wheel
+    // y=0.51 minus half the 0.18m thickness), zero clearance. A flat wheel
+    // disk pivoting right at that boundary either visually clips into the
+    // box or blends into it, hiding the very steering rotation
+    // BuildVehicleEntity now animates (see its own comment) -- confirmed
+    // directly as the reason steering looked invisible even though the
+    // underlying data was already correct. 0.6m leaves a real gap without
+    // seriously misrepresenting the car's footprint: earlier clearance
+    // debugging in this codebase (see kMinCarClearance's comment in
+    // path_generator.cpp) established that nose-to-cone clearance is
+    // governed by the car's LENGTH, not width, so narrowing width here
+    // doesn't affect that.
     foxglove::messages::CubePrimitive chassis;
     chassis.pose = foxglove::messages::Pose{
         foxglove::messages::Vector3{0, 0, 0},
         foxglove::messages::Quaternion{0, 0, 0, 1}};
-    chassis.size = foxglove::messages::Vector3{1.8, 0.84, 0.3};  // matches model.sdf chassis box
+    chassis.size = foxglove::messages::Vector3{1.8, 0.6, 0.3};
     chassis.color = _chassisColor;
     entity.cubes.push_back(chassis);
 
     for (const auto &entry : _wheelStaticPoses)
     {
+        double steerRad = 0.0;  // rear wheels have no steering joint -- stay fixed
+        if (entry.first == "front_left_wheel")
+        {
+            steerRad = _frontLeftSteerRad;
+        }
+        else if (entry.first == "front_right_wheel")
+        {
+            steerRad = _frontRightSteerRad;
+        }
+        // Steering rotates the knuckle about the vertical (Z) axis, in the
+        // model frame, and needs to apply AFTER kWheelRollQuat's roll --
+        // the roll establishes the wheel's spin axis, and steering then
+        // yaws that axis within the ground plane. MultiplyQuaternion(a, b)
+        // composes as "b applied first, then a" (verified numerically: for
+        // a=roll, b=steer(90deg), rotating the cylinder's local symmetry
+        // axis (0,0,1) through MultiplyQuaternion(steer, roll) matches
+        // physically rolling then steering step-by-step; MultiplyQuaternion
+        // (roll, steer) does not -- confirmed directly as the reason
+        // steering looked invisible even with correct live data: that
+        // wrong order left the symmetry axis exactly where it sits
+        // unsteered, regardless of steerRad). So steer goes first here.
+        const foxglove::messages::Quaternion steerQuat{
+            0, 0, std::sin(steerRad / 2.0), std::cos(steerRad / 2.0)};
         foxglove::messages::CylinderPrimitive wheel;
-        wheel.pose = foxglove::messages::Pose{entry.second.position, kWheelRollQuat};
+        wheel.pose = foxglove::messages::Pose{
+            entry.second.position, MultiplyQuaternion(steerQuat, kWheelRollQuat)};
         wheel.size = foxglove::messages::Vector3{
             kWheelRadius * 2, kWheelRadius * 2, kWheelLength};
         wheel.bottom_scale = 1.0;  // full cylinder, not a cone
@@ -746,10 +816,131 @@ int main(int argc, char **argv)
     const std::string worldName = argv[1];
     const std::string poseTopic = "/world/" + worldName + "/pose/info";
     const std::string sceneService = "/world/" + worldName + "/scene/info";
+    const std::string controlService = "/world/" + worldName + "/control";
+    const std::string clockTopic = "/world/" + worldName + "/clock";
+    const std::string jointStateTopic =
+        "/world/" + worldName + "/model/" + kCarModelName + "/joint_state";
+
+    gz::transport::Node node;
+
+    // Set once the server exists below -- onClock needs it to broadcastTime,
+    // which (per Foxglove's own docs) must happen continuously for the
+    // PlaybackControl UI to treat the connection as live/synchronized.
+    foxglove::WebSocketServer *serverPtr = nullptr;
+
+    std::atomic<uint64_t> lastSimTimeNs{0};
+    std::atomic<bool> paused{false};  // gz sim starts unpaused (dev_sim.sh runs `gz sim -r`)
+    std::function<void(const gz::msgs::Clock &)> onClock =
+        [&serverPtr, &lastSimTimeNs](const gz::msgs::Clock &_msg)
+    {
+        const uint64_t ns = static_cast<uint64_t>(_msg.sim().sec()) * 1000000000ULL
+            + static_cast<uint64_t>(_msg.sim().nsec());
+        lastSimTimeNs.store(ns, std::memory_order_relaxed);
+        if (serverPtr != nullptr)
+        {
+            serverPtr->broadcastTime(ns);
+        }
+    };
+    if (!node.Subscribe(clockTopic, onClock))
+    {
+        std::cerr << "Failed to subscribe to " << clockTopic << '\n';
+        return 1;
+    }
+
+    // Live front-wheel steering angles for BuildVehicleEntity -- see its
+    // own comment for why this exists (the car IS really Ackermann-steered;
+    // the visualization just wasn't showing it). Only the front two wheels
+    // have a steering joint at all (see model.sdf's AckermannSteering
+    // plugin config), so nothing here needs the rear pair.
+    std::atomic<double> frontLeftSteerRad{0.0};
+    std::atomic<double> frontRightSteerRad{0.0};
+    std::function<void(const gz::msgs::Model &)> onJointState =
+        [&frontLeftSteerRad, &frontRightSteerRad](const gz::msgs::Model &_msg)
+    {
+        for (const auto &joint : _msg.joint())
+        {
+            if (joint.name() == "front_left_wheel_steering_joint")
+            {
+                frontLeftSteerRad.store(joint.axis1().position(), std::memory_order_relaxed);
+            }
+            else if (joint.name() == "front_right_wheel_steering_joint")
+            {
+                frontRightSteerRad.store(joint.axis1().position(), std::memory_order_relaxed);
+            }
+        }
+    };
+    if (!node.Subscribe(jointStateTopic, onJointState))
+    {
+        std::cerr << "Failed to subscribe to " << jointStateTopic << '\n';
+        return 1;
+    }
 
     foxglove::WebSocketServerOptions ws_options;
     ws_options.host = "0.0.0.0";  // 127.0.0.1 wouldn't be reachable through -p 8765:8765
     ws_options.port = 8765;
+    // Time is required alongside PlaybackControl -- Foxglove's own docs
+    // confirm the play/pause button stays disabled without a continuous
+    // broadcastTime() feed (which is what makes the connection "live" to
+    // the client); PlaybackControl alone (what shipped initially here, and
+    // which left the button permanently greyed out) isn't sufficient.
+    ws_options.capabilities = foxglove::WebSocketServerCapabilities::PlaybackControl
+        | foxglove::WebSocketServerCapabilities::Time;
+    // The SDK hard-requires a playback_time_range whenever PlaybackControl is
+    // advertised (confirmed directly: omitting it aborts the server at
+    // startup with "declared the PlaybackControl capability but did not
+    // provide a playback time range"), even though this is a live, unbounded
+    // sim with no real recording to bound. The range itself is cosmetic here
+    // -- there's nothing to scrub, so the value only needs to comfortably
+    // exceed any real run length -- picked generously (24h) so the
+    // progress bar isn't misleading for a multi-hour soak test.
+    ws_options.playback_time_range =
+        std::make_pair(uint64_t{0}, uint64_t{24} * 3600ULL * 1000000000ULL);
+    ws_options.callbacks.onPlaybackControlRequest =
+        [&node, controlService, &lastSimTimeNs, &paused](const foxglove::PlaybackControlRequest &_req)
+            -> std::optional<foxglove::PlaybackState>
+    {
+        gz::msgs::WorldControl controlMsg;
+        controlMsg.set_pause(_req.playback_command == foxglove::PlaybackCommand::Pause);
+
+        gz::msgs::Boolean reply;
+        bool result = false;
+        const bool ok = node.Request(controlService, controlMsg, 2000u, reply, result);
+        if (!ok || !result)
+        {
+            std::cerr << "Warning: failed to " << (controlMsg.pause() ? "pause" : "resume")
+                      << " sim via " << controlService << '\n';
+            return std::nullopt;
+        }
+        paused.store(controlMsg.pause(), std::memory_order_relaxed);
+
+        foxglove::PlaybackState state;
+        state.status = controlMsg.pause() ? foxglove::PlaybackStatus::Paused
+                                           : foxglove::PlaybackStatus::Playing;
+        state.current_time = lastSimTimeNs.load(std::memory_order_relaxed);
+        state.playback_speed = 1.0f;
+        state.did_seek = false;
+        return state;
+    };
+    // The onPlaybackControlRequest reply above only reaches the client that
+    // sent the request -- a freshly-connected client has never received any
+    // PlaybackState, so Foxglove leaves its play/pause button disabled until
+    // it hears one (confirmed directly: without this, the button stays
+    // greyed out forever). Proactively broadcast the current known state to
+    // every new connection so the button becomes usable immediately.
+    ws_options.callbacks.onClientConnect = [&serverPtr, &lastSimTimeNs, &paused]()
+    {
+        if (serverPtr == nullptr)
+        {
+            return;
+        }
+        foxglove::PlaybackState state;
+        state.status = paused.load(std::memory_order_relaxed) ? foxglove::PlaybackStatus::Paused
+                                                                : foxglove::PlaybackStatus::Playing;
+        state.current_time = lastSimTimeNs.load(std::memory_order_relaxed);
+        state.playback_speed = 1.0f;
+        state.did_seek = false;
+        serverPtr->broadcastPlaybackState(state);
+    };
 
     auto server_result = foxglove::WebSocketServer::create(std::move(ws_options));
     if (!server_result.has_value())
@@ -759,6 +950,7 @@ int main(int argc, char **argv)
         return 1;
     }
     auto server = std::move(server_result.value());
+    serverPtr = &server;
 
     auto pose_channel_result = foxglove::messages::PoseInFrameChannel::create("/vehicle_pose");
     if (!pose_channel_result.has_value())
@@ -777,8 +969,6 @@ int main(int argc, char **argv)
         return 1;
     }
     auto tf_channel = std::move(tf_channel_result.value());
-
-    gz::transport::Node node;
 
     const auto sensorStaticPoses = FetchStaticSensorPoses(node, sceneService);
     std::cout << "Fetched " << sensorStaticPoses.size()
@@ -1051,7 +1241,8 @@ int main(int argc, char **argv)
     constexpr const char *kEstimatedFrameId = "fsd_car_estimated";
 
     std::function<void(const gz::msgs::Pose &)> onEstimatedPose =
-        [&tf_channel, &estimated_vehicle_channel, &wheelStaticPoses](const gz::msgs::Pose &_msg)
+        [&tf_channel, &estimated_vehicle_channel, &wheelStaticPoses,
+         &frontLeftSteerRad, &frontRightSteerRad](const gz::msgs::Pose &_msg)
     {
         foxglove::messages::FrameTransform worldToEstimated;
         worldToEstimated.timestamp = Now();
@@ -1074,7 +1265,9 @@ int main(int argc, char **argv)
             kEstimatedFrameId, "fsd_car_estimated",
             foxglove::messages::Color{0.1, 0.9, 0.3, 0.5},
             foxglove::messages::Color{0.1, 0.6, 0.2, 0.5},
-            wheelStaticPoses);
+            wheelStaticPoses,
+            frontLeftSteerRad.load(std::memory_order_relaxed),
+            frontRightSteerRad.load(std::memory_order_relaxed));
 
         foxglove::messages::SceneUpdate update;
         update.entities.push_back(std::move(entity));
@@ -1315,7 +1508,8 @@ int main(int argc, char **argv)
 
     std::function<void(const gz::msgs::Pose_V &)> onPoseV =
         [&pose_channel, &scene_channel, &vehicle_channel, &tf_channel, &conePoseCache,
-         &sensorStaticPoses, &wheelStaticPoses](const gz::msgs::Pose_V &_msg)
+         &sensorStaticPoses, &wheelStaticPoses,
+         &frontLeftSteerRad, &frontRightSteerRad](const gz::msgs::Pose_V &_msg)
     {
         bool haveCarPose = false;
         foxglove::messages::Pose carPose;
@@ -1374,7 +1568,9 @@ int main(int argc, char **argv)
                 kCarModelName, kCarModelName,
                 foxglove::messages::Color{0.1, 0.1, 0.1, 1},
                 foxglove::messages::Color{0.05, 0.05, 0.05, 1},
-                wheelStaticPoses);
+                wheelStaticPoses,
+                frontLeftSteerRad.load(std::memory_order_relaxed),
+                frontRightSteerRad.load(std::memory_order_relaxed));
 
             foxglove::messages::SceneUpdate vehicleUpdate;
             vehicleUpdate.entities.push_back(std::move(vehicleEntity));
