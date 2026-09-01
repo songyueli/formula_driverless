@@ -57,30 +57,37 @@ if [ ! -x "$BRIDGE" ] || [ ! -x "$PERCEPTION" ] || [ ! -x "$LOCALIZATION" ] \
   exit 1
 fi
 
-# jetson_clocks locks CPU/GPU/EMC to their max frequencies -- only present
-# on Jetson hardware (a no-op check on a laptop/CI, where the command
-# doesn't exist). Not a nice-to-have: confirmed directly (2026-08-23) that
-# a Jetson boots with its GPU at minimum clock (306 of 1300 MHz) until this
-# runs, which alone was a 2.5x real-time-factor difference (0.12 -> 0.31)
-# for this exact pipeline -- bigger than any camera-resolution change.
-# `-n` (non-interactive) so a sudoers misconfiguration fails fast here
-# instead of hanging this script on a password prompt; failure is logged
-# but not fatal, since the sim is still usable (just slower) without it.
-if command -v jetson_clocks >/dev/null 2>&1; then
-  echo "Jetson detected -- locking clocks to max via jetson_clocks..."
-  sudo -n jetson_clocks || echo "warning: jetson_clocks failed (needs passwordless sudo) -- continuing without it" >&2
-fi
-
 # nvpmodel controls the power BUDGET (which CPU/GPU/EMC ceilings are even
-# available to hit) -- a separate axis from jetson_clocks above, which just
-# pins whatever's currently allowed to its max. MAXN (mode 0) removes the
-# power cap entirely for the duration of the sim; restored to MODE_30W
-# (mode 2, this Jetson's normal baseline -- see cleanup() below) on exit so
-# the board doesn't sit at an uncapped power draw/thermal envelope between
-# runs. Same `-n`/non-fatal pattern as jetson_clocks above.
+# available to hit) -- runs BEFORE jetson_clocks below, not after. Order
+# matters and was backwards here until 2026-08-31: confirmed directly that
+# switching nvpmodel mode resets whatever clock lock jetson_clocks had just
+# set, silently dropping the GPU straight back to its minimum clock (306 of
+# 1300 MHz) -- so the OLD jetson_clocks-then-nvpmodel order was locking
+# clocks and then immediately undoing it on every single launch, invisibly
+# (jetson_clocks itself still reported success). Root-caused live by
+# checking `jetson_clocks --show` immediately after each step in isolation,
+# not assumed. MAXN (mode 0) removes the power cap entirely for the
+# duration of the sim; restored to MODE_30W (mode 2, this Jetson's normal
+# baseline -- see cleanup() below) on exit so the board doesn't sit at an
+# uncapped power draw/thermal envelope between runs. `-n` (non-interactive)
+# so a sudoers misconfiguration fails fast here instead of hanging this
+# script on a password prompt; failure is logged but not fatal, since the
+# sim is still usable (just slower) without it.
 if command -v nvpmodel >/dev/null 2>&1; then
   echo "Jetson detected -- setting power mode to MAXN via nvpmodel..."
   sudo -n nvpmodel -m 0 || echo "warning: nvpmodel failed (needs passwordless sudo) -- continuing without it" >&2
+fi
+
+# jetson_clocks locks CPU/GPU/EMC to their max frequencies -- only present
+# on Jetson hardware (a no-op check on a laptop/CI, where the command
+# doesn't exist). Not a nice-to-have: confirmed directly (2026-08-23) that
+# a Jetson boots with its GPU at minimum clock until this runs, which alone
+# was a 2.5x real-time-factor difference (0.12 -> 0.31) for this exact
+# pipeline -- bigger than any camera-resolution change. MUST run AFTER
+# nvpmodel above (see its comment) or this lock gets silently wiped.
+if command -v jetson_clocks >/dev/null 2>&1; then
+  echo "Jetson detected -- locking clocks to max via jetson_clocks..."
+  sudo -n jetson_clocks || echo "warning: jetson_clocks failed (needs passwordless sudo) -- continuing without it" >&2
 fi
 
 echo "World: ${WORLD_NAME} (${WORLD})"

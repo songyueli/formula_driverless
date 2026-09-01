@@ -36,7 +36,17 @@
 <sdf version="1.11">
   <world name="trackdrive">
 
-    <!-- Physics: DART engine, 1 ms step. Good default for vehicle dynamics. -->
+    <!-- Physics: DART engine, 1 ms step. Good default for vehicle dynamics.
+         2ms retried 2026-08-31 -- inconclusive, not reverted-because-bad:
+         the retry ran while control had curvature-based speed scaling
+         removed (separate change, confirmed on its own to strand the car
+         right near the start), so the car was stuck/wedged (z dropped to
+         0.21 from the normal 0.31, near-zero displacement) for the whole
+         sample window. That contaminates every downstream accuracy number
+         -- can't attribute the bad landmark/detection error to the step
+         size vs. the car just sitting jammed against a cone. Needs a clean
+         rerun once the speed-scaling question is settled before this can
+         be judged fairly. -->
     <physics name="default" type="dart">
       <max_step_size>0.001</max_step_size>
       <real_time_factor>1.0</real_time_factor>
