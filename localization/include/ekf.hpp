@@ -354,6 +354,41 @@ private:
     // still a measurable avoidable cost run on every single correction.
     void PruneStaleActiveDuplicates();
 
+    // Two ACTIVE landmarks of OPPOSITE colors sitting within
+    // kDuplicatePruneRadius of each other -- unlike
+    // PruneStaleActiveDuplicates's same-color case, this can never be two
+    // detections of the genuinely same physical cone (a cone is one color),
+    // so it means one of the two color CLASSIFICATIONS is wrong: perception
+    // misclassified a low-confidence detection (real observed confidences
+    // as low as ~0.25 -- see perception.cpp's own per-detection logging),
+    // creating a phantom landmark of the wrong color that CorrectOrAddLandmark's
+    // same-color-gated matching (step 1) can never merge back into the
+    // correct one, since it only ever searches same-color candidates. Left
+    // alone, this phantom sits there indefinitely (or gets corrected FURTHER
+    // by more misclassified detections) and can corrupt
+    // path_generator.cpp's cone pairing right where it matters most --
+    // two real close-together boundary cones plus a same-position phantom
+    // is exactly the kind of ambiguity that pairing logic has no way to
+    // resolve correctly.
+    //
+    // Removes BOTH landmarks rather than trying to guess which color is
+    // right (e.g. via neighboring landmarks' colors) -- consistent with
+    // this codebase's existing "no match is better than a bad match"
+    // philosophy (the same reasoning behind the mutual-nearest-neighbor
+    // requirement in path_generator.cpp's cone pairing, and the Mahalanobis
+    // gate above). A removed real cone gets re-added cleanly from the very
+    // next detection that reaches CorrectOrAddLandmark's "add" path; a
+    // guessed-wrong keep would instead leave a bad landmark ACTIVELY
+    // steering the path away from a real cone, which is worse than briefly
+    // losing it. Reuses kDuplicatePruneRadius (1.5m) rather than a new
+    // constant -- same underlying question ("are these two estimates
+    // actually the same physical cone") as the same-color duplicate case,
+    // just with the opposite resolution once that's true.
+    //
+    // Same throttling and O(active^2) cost profile as
+    // PruneStaleActiveDuplicates, run alongside it.
+    void PruneCrossColorConflicts();
+
     // Packs the grid cell containing world position (_x, _y) into a single
     // key for m_retiredGrid -- see that member's comment for the grid this
     // indexes into and the coverage guarantee it relies on.

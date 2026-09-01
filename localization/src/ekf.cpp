@@ -718,6 +718,7 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
         // PruneStaleRetiredDuplicates's declaration in ekf.hpp).
         PruneStaleRetiredDuplicates();
         PruneStaleActiveDuplicates();
+        PruneCrossColorConflicts();
         return;
     }
 
@@ -837,6 +838,7 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     EvictStaleIfOverCapacity();
     PruneStaleRetiredDuplicates();
     PruneStaleActiveDuplicates();
+    PruneCrossColorConflicts();
 }
 
 void Ekf::LandmarkInnovation(int _landmarkIndex, double _measuredBodyX, double _measuredBodyY,
@@ -1305,6 +1307,48 @@ void Ekf::PruneStaleActiveDuplicates()
         // shifted every later index down by one, so whatever is now at
         // position a (or, if a itself was removed, whatever slid into it)
         // still needs to be checked against the rest of the list.
+    }
+}
+
+void Ekf::PruneCrossColorConflicts()
+{
+    // Throttled -- see this method's declaration in ekf.hpp for why.
+    static int callCount = 0;
+    if (++callCount % 20 != 0)
+    {
+        return;
+    }
+
+    for (size_t a = 0; a < m_landmarkColors.size();)
+    {
+        bool removed = false;
+        const int liA = kVehicleStateDim + 2 * static_cast<int>(a);
+        for (size_t b = a + 1; b < m_landmarkColors.size(); ++b)
+        {
+            if (m_landmarkColors[b] == m_landmarkColors[a])
+            {
+                continue;
+            }
+            const int liB = kVehicleStateDim + 2 * static_cast<int>(b);
+            const double dx = m_x(liA) - m_x(liB);
+            const double dy = m_x(liA + 1) - m_x(liB + 1);
+            if (dx * dx + dy * dy < kDuplicatePruneRadius * kDuplicatePruneRadius)
+            {
+                // Remove BOTH -- see this method's declaration in ekf.hpp
+                // for why neither is kept. Larger index first: removing b
+                // (> a) doesn't shift a's own index, so it stays valid for
+                // the second RemoveActiveLandmark call.
+                RemoveActiveLandmark(b);
+                RemoveActiveLandmark(a);
+                removed = true;
+                break;
+            }
+        }
+        if (!removed)
+        {
+            ++a;
+        }
+        // Same re-scan-from-a reasoning as PruneStaleActiveDuplicates above.
     }
 }
 
