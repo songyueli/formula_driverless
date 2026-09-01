@@ -4,11 +4,36 @@
 #include <cmath>
 #include <utility>
 
+#include "path_utils.hpp"
+
 namespace fsd
 {
 namespace
 {
-constexpr double kMaxPairDistance = 8.0;  // meters -- see algorithm note below
+// MinimizeCurvature: how many neighbor-averaging passes to run, and how
+// much of each pass's pull to actually apply. Picked for a smooth, visibly
+// wider hairpin shape without needing many iterations to converge --
+// see MinimizeCurvature's own comment for the algorithm. Not yet tuned
+// against a second independent live measurement the way some other
+// constants in this file are -- a first, reasoned attempt at a genuinely
+// new algorithm; if live testing shows the racing line isn't wide enough
+// (raise kCurvatureSmoothingIterations or kCurvatureSmoothingRate) or is
+// cutting corners too aggressively into the clearance margin (lower them),
+// that's a reason to retune with fresh measurements, not to have guessed
+// harder up front.
+constexpr int kCurvatureSmoothingIterations = 15;
+constexpr double kCurvatureSmoothingRate = 0.35;
+// Caps how far a SINGLE iteration can move any one waypoint -- confirmed
+// directly as necessary, not just defensive: with only a handful of
+// waypoints visible (a sparse-detection cycle), neighbor gaps can be large
+// (up to kMaxPairDistance apart), and an uncapped pull swung a real live
+// path into an unrealistic near-diagonal line off a legitimate track
+// direction, stalling the car. Bounding the per-iteration step forces the
+// same eventual reshaping to happen gradually over more iterations instead
+// of in one potentially-huge jump, which is what actually keeps this
+// numerically stable regardless of how sparse or wide the current cycle's
+// waypoints happen to be.
+constexpr double kCurvatureSmoothingMaxStep = 0.5;  // meters
 
 // Half the real track width, used by SingleSideOffsetPath below when only
 // ONE boundary color is visible this frame. Measured directly from this
@@ -35,252 +60,10 @@ constexpr double kAssumedHalfTrackWidth = 1.5;  // meters
 // control/src/pure_pursuit_controller.cpp's own SAFETY OVERRIDE comment),
 // a stuck-from-contact car has no way back -- so the right fix is
 // upstream, in the path itself never coming this close to a cone in the
-// first place, not a recovery maneuver after the fact.
-//
-// kMinCarClearance uses the car's HALF-LENGTH (1.8m chassis length per
-// simulation/models/fsd_car/model.sdf's collision box, so 0.9m half), not
-// half-width (0.42m) -- confirmed directly as the right dimension to use,
-// not assumed: an initial 0.7m value (half-width + cone radius + margin)
-// still produced a live stuck-forever case, traced via the car's own
-// ground-truth pose to a near-dead-ahead approach (car yawed almost
-// exactly toward the blocking cone) where the front bumper -- 0.9m ahead
-// of the car's own origin, not 0.42m to the side -- came out to ~0.19m
-// from the cone's center, essentially touching. A pure-pursuit-following
-// car generally approaches a given waypoint roughly nose-on (that's what
-// steering TOWARD a target point means), so the car's LONGER dimension is
-// the one that actually matters for clearance, not the shorter one.
-// 0.9m (half-length) + 0.1425m (largest real cone's own base radius,
-// large_orange -- simulation/models/cone_orange/model.sdf) + margin,
-// rounded up: still comfortably under kAssumedHalfTrackWidth (1.5m) so it
-// can't by itself force a path out of a legally-narrow (>=3m) track.
-//
-// Raised from the original 1.2m (2026-08-30) after live ground-truth
-// tracing through this track's one sustained near-limit corner (realized
-// turn radius holds close to kMinTurnRadius, path_generator.cpp's own
-// constant, over a ~9m arc, not just an instant) found the car repeatedly
-// coming to rest only 0.955-1.004m from a boundary cone -- consistently
-// SHORT of the 1.2m target by about 0.2-0.25m, and consistently against a
-// DIFFERENT cone each attempt (cone_blue_074, then _075, then
-// cone_yellow_076), not the same one -- the signature of pure pursuit's
-// own tracking error eating into the nominal margin under a sustained
-// tight turn, not a one-off bad waypoint. This isn't fixable by tightening
-// the waypoint math further (EnforceMinClearance/EnforceMinTurnRadius
-// already guarantee the INTENDED waypoints and their connecting segments
-// clear kMinCarClearance -- the gap is between intended and REALIZED
-// trajectory). 1.35m directly closes most of that observed shortfall
-// while still leaving 0.3m of centerline slack on this track's own
-// measured 3.00m width (2*1.35 = 2.7m) for the path to lean off-center
-// during a turn without both boundaries' pushes fighting each other at
-// once -- 1.5m (kAssumedHalfTrackWidth, exactly half the track) would
-// leave none.
-constexpr double kMinCarClearance = 1.35;  // meters
+// first place, not a recovery maneuver after the fact. See path_utils.hpp
+// for EnforceMinClearance/EnforceMinTurnRadius, now shared with the
+// landmark-based racing-line pipeline too.
 
-// Pushes any waypoint that ends up too close to ANY known cone (not just
-// whichever pair produced it -- see this namespace's own comment above for
-// why a bad cross-pair can put a waypoint close to an uninvolved THIRD
-// cone) directly away from that cone until it clears kMinCarClearance.
-// Applied uniformly as a final pass after path generation, regardless of
-// which of the 3 return paths below produced the waypoints, rather than
-// duplicated into each -- obstacle clearance is a property every path this
-// module could ever produce needs, not something specific to one
-// algorithm.
-//
-// Checks the SEGMENT between each pair of consecutive waypoints against
-// every cone, not just the waypoints themselves -- confirmed directly as a
-// real, live gap, not a theoretical one: a per-waypoint-only version of
-// this check let the car come to rest only 1.004m from a real cone
-// (cone_blue_074 on the sim's own trackdrive world, at a corner whose
-// required radius sits close to the vehicle's kMinTurnRadius floor, so
-// there's little slack left over) even though BOTH of that segment's own
-// endpoint waypoints individually cleared kMinCarClearance -- the ARC pure
-// pursuit actually traces between them cut inside the cone that the
-// waypoint check alone had no way to see. A straight-line SEGMENT (rather
-// than modeling the true circular arc) is a deliberate, cheap
-// approximation: with EnforceMinTurnRadius already bounding every
-// waypoint's own reachability to >=kMinTurnRadius, and real consecutive
-// cone-derived waypoints only ~2m apart (this track's own real cone
-// spacing, see kDuplicatePruneRadius's comment in ekf.cpp), the sagitta
-// between a true kMinTurnRadius-or-larger arc and its own chord over that
-// short a span is only a few centimeters (L^2/8R at L=2, R=4.5 =~ 0.11m)
-// -- well inside this check's own margin, so the straight-line
-// approximation doesn't need to be exact to close the real gap it's
-// closing.
-//
-// Every violating cone's push -- from either the pointwise check below or
-// this segment check -- is computed against the relevant waypoint's
-// ORIGINAL position and summed into a per-waypoint accumulator, then
-// applied once at the end -- NOT applied in-place per cone/segment as each
-// one is found. Mutating a waypoint in place while iterating was tried
-// first (for the pointwise check alone) and confirmed directly as the
-// cause of a live "car isn't going through the track" regression: in a
-// corner, where several boundary cones legitimately sit within
-// kMinCarClearance of a single midpoint waypoint, each push shifted that
-// waypoint using the ALREADY-shifted position from the previous cone, so
-// the cones' iteration order (not which push actually mattered) decided
-// where the waypoint ended up -- cascading drift that could shove a
-// corner waypoint well off the real track centerline. Summing against
-// each waypoint's fixed original position instead makes the result
-// order-independent: multiple simultaneous violations (whether from
-// distinct cones, or from both the pointwise and segment checks touching
-// the same waypoint) blend into one net direction away from all of them,
-// rather than chaining through intermediate positions none of which were
-// ever the intended target. A segment violation's push is split between
-// its two endpoints, weighted by how close the segment's own nearest
-// point to the cone sits to each end (see ClosestPointOnSegment's `t`) --
-// the endpoint nearer the violation gets more of the correction than the
-// far one, rather than splitting every segment violation 50/50 regardless
-// of where along it the cone actually intrudes.
-struct SegmentClosestPoint
-{
-    double t;  // [0,1] along the segment, clamped -- 0 = point A, 1 = point B
-    double x, y;
-};
-
-SegmentClosestPoint ClosestPointOnSegment(double ax, double ay, double bx, double by,
-                                           double px, double py)
-{
-    const double abx = bx - ax;
-    const double aby = by - ay;
-    const double abLenSq = abx * abx + aby * aby;
-    double t = 0.0;
-    // abLenSq ~0 means A and B are (numerically) the same point -- t stays
-    // 0, collapsing this to "distance from A", the only sensible answer
-    // when there's no real segment to project onto.
-    if (abLenSq > 1e-9)
-    {
-        t = std::clamp(((px - ax) * abx + (py - ay) * aby) / abLenSq, 0.0, 1.0);
-    }
-    return SegmentClosestPoint{t, ax + t * abx, ay + t * aby};
-}
-
-std::vector<PathPoint> EnforceMinClearance(std::vector<PathPoint> waypoints,
-                                            const std::vector<ClassifiedCone> &allCones)
-{
-    const std::vector<PathPoint> original = waypoints;
-    std::vector<double> pushX(waypoints.size(), 0.0);
-    std::vector<double> pushY(waypoints.size(), 0.0);
-
-    for (size_t i = 0; i < original.size(); ++i)
-    {
-        for (const auto &cone : allCones)
-        {
-            const double dx = original[i].x - cone.x;
-            const double dy = original[i].y - cone.y;
-            const double distSq = dx * dx + dy * dy;
-            // distSq > ~0 guards the same near-zero-distance division-by-
-            // zero case as lidar_projector.cpp's own horizRange guard --
-            // a waypoint landing exactly ON a cone's own center isn't a
-            // real case this pipeline produces, but the push direction
-            // would be undefined if it somehow did.
-            if (distSq < kMinCarClearance * kMinCarClearance && distSq > 1e-9)
-            {
-                const double dist = std::sqrt(distSq);
-                const double push = kMinCarClearance - dist;
-                pushX[i] += (dx / dist) * push;
-                pushY[i] += (dy / dist) * push;
-            }
-        }
-    }
-
-    // Assumes consecutive entries in `original` are consecutive along the
-    // actual path -- true for every caller of this function today (all 3
-    // return paths in this file sort their waypoints by body-frame x
-    // before calling this), same assumption pure pursuit's own lookahead
-    // walk already relies on.
-    for (size_t i = 0; i + 1 < original.size(); ++i)
-    {
-        const double ax = original[i].x, ay = original[i].y;
-        const double bx = original[i + 1].x, by = original[i + 1].y;
-        for (const auto &cone : allCones)
-        {
-            const SegmentClosestPoint closest = ClosestPointOnSegment(ax, ay, bx, by, cone.x, cone.y);
-            const double dx = closest.x - cone.x;
-            const double dy = closest.y - cone.y;
-            const double distSq = dx * dx + dy * dy;
-            if (distSq < kMinCarClearance * kMinCarClearance && distSq > 1e-9)
-            {
-                const double dist = std::sqrt(distSq);
-                const double push = kMinCarClearance - dist;
-                const double pushDirX = (dx / dist) * push;
-                const double pushDirY = (dy / dist) * push;
-                pushX[i] += pushDirX * (1.0 - closest.t);
-                pushY[i] += pushDirY * (1.0 - closest.t);
-                pushX[i + 1] += pushDirX * closest.t;
-                pushY[i + 1] += pushDirY * closest.t;
-            }
-        }
-    }
-
-    for (size_t i = 0; i < waypoints.size(); ++i)
-    {
-        waypoints[i].x = original[i].x + pushX[i];
-        waypoints[i].y = original[i].y + pushY[i];
-    }
-    return waypoints;
-}
-
-// The path this module generates is a raw geometric centerline with zero
-// awareness of what curvature the vehicle can actually achieve. Confirmed
-// directly as the cause of a live, reproducible failure: the vehicle's own
-// real minimum turning radius is 4.5m (simulation/models/fsd_car/model.sdf's
-// AckermannSteering plugin: steering_limit=0.332 rad, wheel_base=1.55m,
-// chosen specifically for a 4.5m min-turn-radius per that file's own
-// comment), while the final hairpin's midpoint centerline curves tighter
-// than that. Pure pursuit (control/src/pure_pursuit_controller.cpp)
-// computes curvature = 2y/(x^2+y^2) straight from these waypoints with no
-// clamp of its own, so on that corner it commands a curvature Gazebo's
-// AckermannSteering plugin can't produce; the plugin silently saturates the
-// steering internally, and the car understeers wide of the intended line --
-// exactly the "have to make a wider turn, or it isn't possible at all"
-// symptom this fixes.
-//
-// The fix pulls each waypoint's lateral offset in (toward the car's own
-// current forward axis) just enough that the arc from the car's current
-// position (origin, heading +X -- the same geometry pure pursuit's own
-// curvature formula assumes) through that point never requires tighter
-// than kMinTurnRadius. For a fixed x, the boundary of "achievable" is the
-// circle of radius R tangent to the origin along the x-axis:
-// x^2 + (y-R)^2 = R^2, i.e. |y| <= R - sqrt(R^2 - x^2) for |x| <= R (and no
-// constraint at all once |x| >= R -- that same circle's own max achievable
-// curvature there, 1/x, is already under 1/R by construction, so nothing
-// needs clamping).
-//
-// This is a LOCAL, per-cycle correction, not a real racing line: it only
-// guarantees pure pursuit is never asked for an infeasible arc to a given
-// waypoint, not that the resulting path is an optimal wide-entry/
-// clip-apex/wide-exit line. But since this pipeline regenerates the path
-// fresh every frame (see planning.cpp's class comment), each cycle easing
-// off exactly as much as physically necessary is what actually produces
-// that wide-in/tight-out shape across consecutive frames, without this
-// function needing any notion of "this is a hairpin" at all. No margin
-// beyond the raw physical minimum is applied here -- this is a first,
-// scoped attempt at the confirmed failure; if live testing still shows
-// occasional infeasible commands (e.g. from lookahead/discretization
-// effects this simple per-waypoint check doesn't model), that's a reason
-// to add one, empirically justified, not to guess one in up front.
-constexpr double kMinTurnRadius = 4.5;  // meters -- see comment above
-
-std::vector<PathPoint> EnforceMinTurnRadius(std::vector<PathPoint> waypoints)
-{
-    for (auto &wp : waypoints)
-    {
-        const double absX = std::abs(wp.x);
-        if (absX >= kMinTurnRadius)
-        {
-            continue;
-        }
-        const double maxAbsY = kMinTurnRadius - std::sqrt(kMinTurnRadius * kMinTurnRadius - absX * absX);
-        if (std::abs(wp.y) > maxAbsY)
-        {
-            wp.y = std::copysign(maxAbsY, wp.y);
-        }
-    }
-    return waypoints;
-}
-}  // namespace
-
-namespace
-{
 // Single-boundary fallback: offset every cone on the ONE visible side
 // toward the track's center by kAssumedHalfTrackWidth, along the body
 // frame's lateral (+Y = left; see control.cpp's pure-pursuit curvature
@@ -315,68 +98,67 @@ std::vector<PathPoint> SingleSideOffsetPath(const std::vector<ClassifiedCone> &_
     return waypoints;
 }
 
-// Orders an unordered set of midpoint waypoints into travel order via
-// greedy nearest-neighbor walking, starting from the origin (the vehicle's
-// own position, since this is body-frame data) and repeatedly appending
-// whichever remaining point is nearest to the current chain end.
+// Least-curvature ("racing line") smoothing pass: iteratively pulls each
+// INTERIOR waypoint toward the midpoint of its two neighbors, then projects
+// back off any cone that pull moved it too close to (reusing
+// EnforceMinClearance -- see its own comment). Pulling toward the neighbor
+// midpoint is a standard discrete curvature-reduction step: a point exactly
+// on the line between its neighbors has zero contribution to local
+// curvature there, so repeated pulls straighten the path wherever it has
+// room to, most visibly at the sharpest kinks first.
 //
-// Replaces a plain sort-by-x, which silently assumed the track never
-// curves back on itself within the visible window -- true for gentle
-// curves, but false at a hairpin: far-side waypoints can have a SMALLER
-// body-frame x than near-side ones once the track folds back past
-// perpendicular, so an x-sort interleaves the two sides into a zigzag
-// instead of a curve. Confirmed directly as the cause of the zigzag seen
-// live at this track's hairpin, not just a suspected mechanism. This walk
-// instead follows the actual point-to-point geometry, the standard way to
-// reconstruct an ordered path from an unordered point cloud that folds
-// back on one axis.
+// This replaces hugging the raw geometric centerline (every previous
+// waypoint sat equidistant between its paired cones, which forces the path
+// itself down to the track's own tightest radius at a hairpin -- confirmed
+// directly as the reason the car needed near-max steering angle sustained
+// through the whole corner, leaving it with essentially zero tracking
+// margin and prone to running off the actual track) with something closer
+// to a real racing line: wide on entry and exit, cutting nearer the inside
+// at the apex, because that's the shape that ACTUALLY minimizes curvature
+// between two points on either side of a corner when the only constraint
+// is staying clear of both boundaries -- not something hand-crafted per
+// corner, it falls out of the same neighbor-averaging rule everywhere.
 //
-// kMaxPairDistance also bounds each hop here, same as it bounds cone
-// pairing above and for the same reason: without a cap, the chain could
-// jump across a hairpin's own gap to a spatially-close point that's
-// actually on the opposite, not-yet-reached leg of the track -- a wrong
-// hop would reintroduce the exact zigzag this function exists to remove.
-// Points the walk can't reach within that cap are left out rather than
-// forced in with a bad hop, matching this pipeline's existing "no match is
-// better than a bad match" philosophy (e.g. the mutual-nearest-neighbor
-// check below, lidar_projector.cpp's Localize()).
-std::vector<PathPoint> OrderWaypointsByTraversal(std::vector<PathPoint> _waypoints)
+// First/last waypoints are left as anchors (never pulled): the first is
+// effectively the vehicle's own current position (near the body-frame
+// origin), and moving it would disconnect the path from where the car
+// actually is; the last is wherever visibility currently ends, and has no
+// "next" cone pairing beyond it to justify pulling it inward or outward.
+//
+// EnforceMinClearance runs INSIDE the iteration loop, not just once at the
+// end -- a pull that would cut through a cone needs to be corrected before
+// the NEXT iteration's neighbor-averaging uses that (invalid) position to
+// compute its own neighbors' pulls, or one bad pull can propagate into
+// otherwise-fine nearby waypoints over successive passes.
+std::vector<PathPoint> MinimizeCurvature(std::vector<PathPoint> _waypoints,
+                                          const std::vector<ClassifiedCone> &_allCones)
 {
-    std::vector<PathPoint> ordered;
-    ordered.reserve(_waypoints.size());
-    std::vector<bool> used(_waypoints.size(), false);
-
-    double cursorX = 0.0;
-    double cursorY = 0.0;
-    for (size_t step = 0; step < _waypoints.size(); ++step)
+    if (_waypoints.size() < 3)
     {
-        int bestIdx = -1;
-        double bestDistSq = kMaxPairDistance * kMaxPairDistance;
-        for (size_t i = 0; i < _waypoints.size(); ++i)
-        {
-            if (used[i])
-            {
-                continue;
-            }
-            const double dx = _waypoints[i].x - cursorX;
-            const double dy = _waypoints[i].y - cursorY;
-            const double distSq = dx * dx + dy * dy;
-            if (distSq < bestDistSq)
-            {
-                bestDistSq = distSq;
-                bestIdx = static_cast<int>(i);
-            }
-        }
-        if (bestIdx < 0)
-        {
-            break;  // nothing left within reach of the chain -- stop rather than force a bad hop
-        }
-        used[static_cast<size_t>(bestIdx)] = true;
-        cursorX = _waypoints[static_cast<size_t>(bestIdx)].x;
-        cursorY = _waypoints[static_cast<size_t>(bestIdx)].y;
-        ordered.push_back(_waypoints[static_cast<size_t>(bestIdx)]);
+        return _waypoints;  // nothing with an "interior" to pull
     }
-    return ordered;
+    for (int iter = 0; iter < kCurvatureSmoothingIterations; ++iter)
+    {
+        std::vector<PathPoint> next = _waypoints;
+        for (size_t i = 1; i + 1 < _waypoints.size(); ++i)
+        {
+            const double neighborMidX = (_waypoints[i - 1].x + _waypoints[i + 1].x) / 2.0;
+            const double neighborMidY = (_waypoints[i - 1].y + _waypoints[i + 1].y) / 2.0;
+            double pullX = kCurvatureSmoothingRate * (neighborMidX - _waypoints[i].x);
+            double pullY = kCurvatureSmoothingRate * (neighborMidY - _waypoints[i].y);
+            const double pullDist = std::sqrt(pullX * pullX + pullY * pullY);
+            if (pullDist > kCurvatureSmoothingMaxStep)
+            {
+                const double scale = kCurvatureSmoothingMaxStep / pullDist;
+                pullX *= scale;
+                pullY *= scale;
+            }
+            next[i].x = _waypoints[i].x + pullX;
+            next[i].y = _waypoints[i].y + pullY;
+        }
+        _waypoints = EnforceMinClearance(std::move(next), _allCones);
+    }
+    return _waypoints;
 }
 }  // namespace
 
@@ -397,12 +179,14 @@ std::vector<PathPoint> NearestPairMidpointPath(const TrackBoundaries &boundaries
     if (boundaries.left.empty() && !boundaries.right.empty())
     {
         // Right (yellow) cones only -> offset toward center = leftward = +Y.
-        return EnforceMinClearance(EnforceMinTurnRadius(SingleSideOffsetPath(boundaries.right, +1.0)), allCones);
+        // EnforceMinTurnRadius LAST -- see this file's own NearestPairMidpointPath
+        // return statement for why order matters here.
+        return EnforceMinTurnRadius(EnforceMinClearance(SingleSideOffsetPath(boundaries.right, +1.0), allCones));
     }
     if (boundaries.right.empty() && !boundaries.left.empty())
     {
         // Left (blue) cones only -> offset toward center = rightward = -Y.
-        return EnforceMinClearance(EnforceMinTurnRadius(SingleSideOffsetPath(boundaries.left, -1.0)), allCones);
+        return EnforceMinTurnRadius(EnforceMinClearance(SingleSideOffsetPath(boundaries.left, -1.0), allCones));
     }
 
     // For each left-boundary cone, pair with its nearest right-boundary
@@ -479,12 +263,31 @@ std::vector<PathPoint> NearestPairMidpointPath(const TrackBoundaries &boundaries
 
     // Order into a travel-order chain (not a plain x-sort -- see
     // OrderWaypointsByTraversal's own comment for why that breaks at a
-    // hairpin) so control gets an ordered, nearest-first path.
-    waypoints = OrderWaypointsByTraversal(std::move(waypoints));
+    // hairpin) so control gets an ordered, nearest-first path. Cursor is
+    // the body-frame origin -- this pipeline's own vehicle position.
+    waypoints = OrderWaypointsByTraversal(std::move(waypoints), PathPoint{0, 0});
 
-    // TODO: spline-smooth the path (currently raw midpoints, which can be
-    // jagged with cone-spacing irregularities even once correctly ordered)
-    // before handing it to control.
-    return EnforceMinClearance(EnforceMinTurnRadius(std::move(waypoints)), allCones);
+    // Least-curvature ("racing line") smoothing -- see MinimizeCurvature's
+    // own comment for why this replaces raw centerline-hugging, not just
+    // jaggedness cleanup. EnforceMinTurnRadius/EnforceMinClearance still
+    // run afterward as a hard safety-net clamp in case the smoothing pass
+    // hasn't fully converged (e.g. very few visible waypoints this cycle),
+    // not because MinimizeCurvature is expected to leave real work for them.
+    //
+    // EnforceMinTurnRadius runs LAST, not EnforceMinClearance -- confirmed
+    // directly (2026-08-31) as a real, live bug when it was the other way
+    // around: EnforceMinClearance's cone-avoidance push has no awareness of
+    // the turn-radius constraint, so it can shove a waypoint that
+    // EnforceMinTurnRadius had just correctly pulled in back OUTSIDE the
+    // vehicle's achievable curvature -- pure pursuit then commands a
+    // curvature nearly 2x the physical maximum, which the AckermannSteering
+    // plugin can only respond to by saturating at its own hard steering
+    // limit, producing exactly the "stuck/oscillating, steering not
+    // updating to what we need" symptom this fixes. A physically
+    // UNACHIEVABLE curvature is worse than a slightly-tighter-than-nominal
+    // clearance margin, so turn-radius has to be the final, authoritative
+    // clamp.
+    waypoints = MinimizeCurvature(std::move(waypoints), allCones);
+    return EnforceMinTurnRadius(EnforceMinClearance(std::move(waypoints), allCones));
 }
 }  // namespace fsd

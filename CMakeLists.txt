@@ -211,7 +211,13 @@ target_link_libraries(localization
 add_executable(planning
     planning/src/planning.cpp
     planning/src/track_boundaries.cpp
-    planning/src/path_generator.cpp)
+    planning/src/path_generator.cpp
+    planning/src/path_utils.cpp
+    planning/src/landmark_map.cpp
+    planning/src/centerline_extractor.cpp
+    planning/src/spline.cpp
+    planning/src/corridor.cpp
+    planning/src/racing_line_optimizer.cpp)
 target_include_directories(planning PRIVATE
     planning/include)
 target_link_libraries(planning
