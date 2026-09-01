@@ -520,6 +520,24 @@
       <steering_limit>0.332</steering_limit>   <!-- radians; atan(wheel_base / min_turning_radius),
                                                      here assuming a 4.5m min turning radius -->
 
+      <!-- P-gain for the steering joints' own internal position
+           controller -- undocumented (not shown in gz-sim's own example
+           ackermann_steering.sdf world, not previously set here at all, so
+           this plugin was running on WHATEVER internal default it falls
+           back to when the tag is absent). Added 2026-08-31 after a user-
+           reported "steering feels laggy, oscillating around the planned
+           path" symptom: confirmed directly via a live joint_state trace
+           earlier this session that a HELD, constant steering command took
+           1.5-2+ seconds to ramp from ~0.05 to ~0.07 rad -- a genuinely
+           soft, slow-converging response, not the near-instant tracking
+           pure pursuit's own geometry assumes (it re-derives a fresh
+           target curvature every cycle with no compensation for the
+           steering actuator lagging behind it). 100 is a first, untested-
+           live retry at a much stiffer response; retest at the hairpin and
+           watch for the opposite failure mode (overshoot/oscillation from
+           TOO stiff a gain) before trusting this value. -->
+      <steer_p_gain>100</steer_p_gain>
+
       <min_velocity>-5</min_velocity>          <!-- m/s, typically negative for reverse -->
       <max_velocity>20</max_velocity>          <!-- m/s -->
       <min_acceleration>-8</min_acceleration>  <!-- m/s² -->
