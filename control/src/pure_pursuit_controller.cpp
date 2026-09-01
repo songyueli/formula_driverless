@@ -10,92 +10,74 @@ namespace
 // capacity (kMaxActiveLandmarks=80) once the EKF-side scaling fixes (sparse
 // corrections, spatial-grid retired-landmark search) were in place.
 //
-// Tried raising this (2026-08-30): 7.0 got stuck at a DIFFERENT corner
-// (~31,27) early in the lap that was never a problem at 5.0; backing off
-// to 6.0 then got stuck back at the hairpin itself (~-21,-14) instead --
-// both confirmed live via ground-truth pose (car frozen 3+ consecutive
-// samples). The traversal-ordering fix removed the hairpin's zigzag
-// SHAPE, but the curvature-based slowdown still needs the current ceiling
-// to bring the car down in time entering a sharp corner; a higher
-// straightaway speed outruns that margin at more than one corner on this
-// track, not just the hairpin. Reverted to the confirmed-reliable value
-// (5/5 clean hairpin passes, full-lap soak) rather than kept at a value
-// that only looked fine in a shorter test window.
+// Speed scaling history (2026-08-31): the original curvature-based scheme
+// (instantaneous + EMA + a forward preview) was removed at user request --
+// felt like it slowed "tremendously" for no clear benefit. Removing it
+// entirely was then confirmed live to let the car drift off the intended
+// path on corners (the EMA/preview machinery existed for a reason, just
+// not one this simpler replacement needs the same complexity for). Speed
+// is now a direct linear function of the STEERING ANGLE the current
+// curvature implies (see kWheelBase/kSteeringLimit below), not curvature
+// itself -- the angle naturally saturates at the vehicle's own physical
+// steering_limit, so there's no need for a separate artificial curvature
+// cap the way the old kMaxExpectedCurvature was.
+// Tried 6.0/7.0 before (2026-08-31) and both got stuck -- traced at the
+// time to two real bugs since fixed: (1) the EnforceMinClearance/
+// EnforceMinTurnRadius ordering bug (a clearance push could shove a
+// waypoint back outside the vehicle's achievable curvature after the
+// turn-radius clamp had just pulled it in -- see path_generator.cpp's own
+// NearestPairMidpointPath), and (2) the AckermannSteering plugin's
+// steer_p_gain being an unset, soft default (see model.sdf's own comment
+// -- steering took 1.5-2+ seconds to converge on a held command). Retried
+// 7.0 again after both fixes (plus the behind-car path filter and
+// speed-proportional adaptive lookahead, added the same session) -- still
+// crashed hard (car frozen, chassis z risen from 0.31 to 0.447, consistent
+// with an actual collision, not just a soft wedge). Reverted to the
+// confirmed-reliable 5.0 (a full clean lap including the hairpin,
+// 2026-08-31) to isolate whether the OTHER same-session changes are solid
+// on their own before pushing speed again -- don't re-raise this without a
+// fresh, isolated retest.
 constexpr double kMaxSpeed = 5.0;  // m/s
-// Floor speed for the tightest corners a live path ever produces -- a
-// nonempty path never commands slower than this (an EMPTY path is handled
-// separately, at kCreepSpeed below -- see its own comment for why that's
-// deliberately even slower than this floor, not the same value).
-constexpr double kMinSpeed = 1.0;  // m/s
-constexpr double kLookaheadDistance = 3.0;  // meters
-// Linear falloff from kMaxSpeed as |curvature| grows: speed = kMaxSpeed -
-// kCurvatureSpeedGain * |curvature|, clamped to [kMinSpeed, kMaxSpeed].
-//
-// kMaxExpectedCurvature is the vehicle's own real physical curvature
-// limit (1/kMinTurnRadius), NOT the raw geometric max this lookahead
-// distance could otherwise express (2/kLookaheadDistance =~ 0.667 rad/m,
-// corresponding to an unrealistic ~1.5m turn radius that path_generator.cpp
-// never actually hands this controller anymore). MUST stay in sync with
-// path_generator.cpp's own kMinTurnRadius (4.5m, from
-// simulation/models/fsd_car/model.sdf's AckermannSteering steering_limit +
-// wheel_base) -- confirmed directly as a real, live mismatch between the
-// two: with the OLD, unclamped-geometry-derived value here, the tightest
-// turn EnforceMinTurnRadius can ever produce (curvature = 1/4.5 =~ 0.222
-// rad/m, a third of the old 0.667 assumption) only pulled speed down to
-// ~2.33 m/s, nowhere near kMinSpeed -- meaning the car drove through a
-// corner already AT its own physical steering limit no slower than a
-// fairly gentle turn, leaving little margin for pure pursuit's own
-// tracking error to stay clear of the boundary cones. Live ground-truth
-// tracing through this track's recurring stuck corner found the realized
-// turn radius tightening steadily toward 4.5m over a sustained ~9m arc,
-// right before the car lost contact with a cone -- consistent with
-// entering that sustained near-limit turn too fast to track precisely,
-// not with a single bad instant. Recalibrating so speed reaches exactly
-// kMinSpeed as curvature approaches the vehicle's ACTUAL ceiling (rather
-// than a 3x-larger one the path can no longer even ask for) gives pure
-// pursuit its intended full margin exactly where it's needed most.
-constexpr double kMinTurnRadius = 4.5;  // meters -- see comment above
-constexpr double kMaxExpectedCurvature = 1.0 / kMinTurnRadius;
-constexpr double kCurvatureSpeedGain = (kMaxSpeed - kMinSpeed) / kMaxExpectedCurvature;
+// Floor speed at/beyond the vehicle's max steering angle. Raised from the
+// original 1.0 (2026-08-31, user report: "too slow") -- 1.0 was tuned
+// against the OLD raw-centerline path, which genuinely needed near-max
+// steering angle sustained through the whole hairpin; the new landmark-
+// based racing-line pipeline (see planning/include/racing_line_optimizer.hpp)
+// widens exactly that corner specifically so the car rarely needs to
+// approach kSteeringLimit at all anymore, so the old floor's own
+// justification is largely gone. 2.0 is a first retry, not yet validated
+// live the way 1.0 was -- retest at the hairpin specifically before
+// trusting it the same way.
+constexpr double kMinSpeed = 2.0;  // m/s
 
-// The instantaneous curvature-speed scaling above reacts only to THIS
-// cycle's single lookahead target -- confirmed directly as still
-// insufficient on its own, even after the recalibration above: live
-// ground-truth tracing through this track's one sustained tight corner
-// (radius holding close to kMinTurnRadius over a ~9-15m arc, several
-// consecutive near-limit waypoints, not one) found the car repeatedly
-// coming to rest under kMinCarClearance of a boundary cone -- a DIFFERENT
-// cone each attempt (three separate cones across three separate live
-// runs) -- even with per-cycle speed already reduced toward kMinSpeed at
-// the tightest individual waypoints. A single frame's instantaneous
-// curvature says nothing about whether the CYCLES BEFORE it were also
-// tight; a corner entered at a moderate curvature that ramps up smoothly
-// gets exactly the same per-cycle speed as an isolated one-frame wiggle in
-// otherwise straight running, even though the former needs to have
-// already bled off speed well before its own worst waypoint to leave pure
-// pursuit's tracking any real margin. An EMA of recent |curvature|
-// tracks "how tight has cornering been LATELY", not just "how tight is
-// this exact frame" -- taking the min of the instantaneous- and
-// EMA-based speeds (below) means a sustained run of tight waypoints keeps
-// speed capped down even on an individual cycle whose own target happens
-// to look momentarily easier, so the car can't prematurely speed back up
-// mid-corner just because one frame's path looked slightly gentler than
-// its neighbors.
-//
-// kCurvatureEmaAlpha sized for a ~20-cycle (~0.67s at this pipeline's
-// ~30Hz planning rate, camera-rate-limited -- see perception.cpp) time
-// constant: long enough to genuinely capture "sustained", short enough to
-// still respond within the first couple seconds of entering a real
-// corner rather than lagging behind it. Not (yet) tuned against a second
-// independent live measurement the way the other constants in this file
-// are -- this is a first, reasoned attempt at the confirmed "instantaneous
-// alone isn't enough" failure; if live testing shows this constant itself
-// needs adjustment, that's a reason to retune it with fresh measurements,
-// not to have guessed harder up front.
-constexpr double kCurvatureEmaAlpha = 0.05;
+// Lookahead distance is now proportional to speed (m_lastSpeed, see its
+// own comment in the header for why last-cycle's speed, not this cycle's),
+// bounded to [kMinLookahead, kMaxLookahead] -- replaces a single fixed
+// 3.0m used regardless of speed (2026-08-31, user request). A FIXED
+// lookahead at a higher speed corresponds to a shorter REACTION TIME (the
+// same lookahead distance is covered in less time), which is a real
+// mechanism for exactly the "steering feels lagged/oscillating" symptom
+// this session chased: too-short a lookahead at speed makes the geometric
+// target -- and therefore the commanded curvature -- change more sharply
+// from cycle to cycle than the vehicle (even with steer_p_gain now fixed)
+// can track smoothly. kLookaheadTimeConstant is a "look this many seconds
+// ahead" gain, the standard way adaptive pure-pursuit lookahead is tuned;
+// 1.0s is a first, untested-live value -- retest and retune from a fresh
+// measurement the same way every other first-attempt constant in this file
+// has been.
+constexpr double kLookaheadTimeConstant = 1.0;  // seconds
+constexpr double kMinLookahead = 2.0;  // meters
+constexpr double kMaxLookahead = 6.0;  // meters
+// Bicycle-model geometry for converting curvature to a real steering angle
+// -- same wheel_base and steering_limit as
+// simulation/models/fsd_car/model.sdf's AckermannSteering plugin (MUST
+// stay in sync with it) and path_generator.cpp's own kMinTurnRadius
+// (steering_limit = atan(wheel_base / kMinTurnRadius)).
+constexpr double kWheelBase = 1.55;  // meters
+constexpr double kSteeringLimit = 0.332;  // radians
 
 // Creep speed for an EMPTY path (see the early-return below) -- well under
-// kMinSpeed, cautious but nonzero. Confirmed directly as a real, fatal
+// kMaxSpeed, cautious but nonzero. Confirmed directly as a real, fatal
 // failure mode with the old "stop dead on empty path" behavior: a live
 // full-lap test got permanently stuck (identical /estimated_pose and
 // /cone_detections=pos=none-for-every-detection, frame after frame, for
@@ -128,8 +110,8 @@ constexpr double kCurvatureEmaAlpha = 0.05;
 // forever, the exact same "one bad cycle becomes permanent" failure this
 // whole mechanism exists to avoid, just for heading instead of position.
 // See kSweepYawRate below for the escalation this added. 0.5 m/s is
-// comfortably below kMinSpeed (the slowest a WORKING path ever commands)
-// so a false-empty single cycle costs negligible ground, while a genuine
+// comfortably below kMinSpeed (1.0 m/s, the slowest a WORKING path ever
+// commands) so a false-empty single cycle costs negligible ground, while a genuine
 // multi-cycle gap (like the confirmed 100+ second stall) still recovers
 // instead of stalling forever.
 constexpr double kCreepSpeed = 0.5;  // m/s
@@ -205,12 +187,13 @@ constexpr double kMaxSweepSpeed = 2.0;               // m/s
 //
 // kStuckCyclesBeforeReverse is deliberately short relative to the sweep's
 // own ~21s-per-loop timescale, and shorter still relative to how far even
-// kMinSpeed (1.0 m/s) should carry a normally-driving car: a WORKING
-// sweep or normal drive should show meaningful net displacement well
-// within one loop / one second, so little-to-no displacement this early
-// is already strong evidence of a physical block, not just "hasn't found
-// the way out yet". At this pipeline's ~30Hz planning cycle (camera-rate-
-// limited, see perception.cpp), 90 cycles =~ 3s.
+// kMinSpeed (1.0 m/s, the slowest a WORKING path ever commands) should
+// carry a normally-driving car: a WORKING sweep or normal drive should show
+// meaningful net displacement well within one loop / one second, so
+// little-to-no displacement this early is already strong evidence of a
+// physical block, not just "hasn't found the way out yet". At this
+// pipeline's ~30Hz planning cycle (camera-rate-limited, see
+// perception.cpp), 90 cycles =~ 3s.
 constexpr int kStuckCyclesBeforeReverse = 90;
 // Below this net displacement (from the anchor -- see m_anchorX/Y's
 // comment in the header for why it rolls forward on progress rather than
@@ -255,32 +238,25 @@ constexpr int kMaxReverseAttempt = 4;
 }  // namespace
 
 // Algorithm (classic pure pursuit):
-//   1. Pick the lookahead waypoint: the first path point at or beyond
-//      kLookaheadDistance from the car's own origin (falls back to the
-//      farthest available point if none are that far -- a sparse/short
-//      detected path shouldn't mean no command at all).
+//   1. Pick the lookahead waypoint: the first path point at or beyond the
+//      current lookahead distance (proportional to last cycle's speed,
+//      see kLookaheadTimeConstant's own comment) from the car's own
+//      origin (falls back to the farthest available point if none are
+//      that far -- a sparse/short detected path shouldn't mean no command
+//      at all).
 //   2. curvature = 2*y / (x^2 + y^2) for a target at body-frame (x, y) --
 //      the standard pure pursuit result for the circular arc through the
 //      origin, heading along +X, that passes through the target. This is
 //      purely geometric (depends only on the target's position, not speed),
 //      so it's computed before speed.
-//   3. Curvature-based speed scaling: linearly reduce speed from kMaxSpeed
-//      (straight path, curvature ~0) down to kMinSpeed (tightest turn this
-//      geometry produces) rather than driving every corner at the same
-//      speed a straight ever is -- tighter turns need a smaller yaw_rate
-//      margin to stay controllable at a given lookahead distance, and
-//      constant full speed through a corner was the last part of this
-//      controller still a flat stub (see the original TODO this replaces).
-//   3b. Also scale speed off an EMA of RECENT curvature (see
-//      kCurvatureEmaAlpha's comment), and take the min of the two --
-//      instantaneous curvature alone doesn't distinguish a single-frame
-//      wiggle from a SUSTAINED tight corner, and only the latter needs
-//      speed bled off well before its own worst waypoint to leave any
-//      real tracking margin.
+//   3. Convert curvature to the steering angle it implies via the bicycle
+//      model (atan(wheel_base * curvature)), and scale speed linearly
+//      between kMaxSpeed (zero angle) and kMinSpeed (at/beyond
+//      kSteeringLimit) -- see kMinSpeed's own comment for this scheme's
+//      history.
 //   4. yaw_rate = speed * curvature (curvature = yaw_rate / speed by
-//      definition) -- using the SCALED speed (step 3b's min, not just
-//      step 3's instantaneous value), so the reported yaw_rate stays
-//      consistent with the speed actually commanded.
+//      definition) -- using the SCALED speed from step 3, so the reported
+//      yaw_rate stays consistent with the speed actually commanded.
 DriveCommand PurePursuitController::Compute(const ControlInputs &inputs)
 {
     // Universal stuck-detection watchdog -- runs FIRST, unconditionally,
@@ -393,12 +369,19 @@ DriveCommand PurePursuitController::Compute(const ControlInputs &inputs)
     m_consecutiveEmptyCycles = 0;
     m_sweepDirection = 1.0;  // fresh baseline for whatever the NEXT stuck episode is
 
+    // Lookahead distance for THIS cycle, from LAST cycle's speed -- see
+    // kLookaheadTimeConstant's own comment for why proportional-to-speed,
+    // and m_lastSpeed's own comment in the header for why one cycle
+    // delayed.
+    const double lookaheadDistance =
+        std::clamp(kLookaheadTimeConstant * m_lastSpeed, kMinLookahead, kMaxLookahead);
+
     // inputs.path is already sorted nearest-ahead-first (see planning.cpp).
     double targetX = 0.0, targetY = 0.0;
     bool found = false;
     for (const auto &wp : inputs.path)
     {
-        if (wp.x * wp.x + wp.y * wp.y >= kLookaheadDistance * kLookaheadDistance)
+        if (wp.x * wp.x + wp.y * wp.y >= lookaheadDistance * lookaheadDistance)
         {
             targetX = wp.x;
             targetY = wp.y;
@@ -416,18 +399,15 @@ DriveCommand PurePursuitController::Compute(const ControlInputs &inputs)
     const double lookaheadSq = targetX * targetX + targetY * targetY;
     const double curvature = lookaheadSq > 1e-6 ? (2.0 * targetY / lookaheadSq) : 0.0;
 
-    // See kCurvatureEmaAlpha's comment for why a SUSTAINED tight run needs
-    // its own, longer-memory speed cap on top of the instantaneous one --
-    // updated every normal cycle (not the empty-path/stuck branches above,
-    // which return before reaching here) so it tracks recent REAL
-    // steering demand, not stale history from before a gap.
-    m_curvatureEma += kCurvatureEmaAlpha * (std::abs(curvature) - m_curvatureEma);
-    const double emaSpeed = std::clamp(kMaxSpeed - kCurvatureSpeedGain * m_curvatureEma,
-                                        kMinSpeed, kMaxSpeed);
-    const double instantSpeed = std::clamp(kMaxSpeed - kCurvatureSpeedGain * std::abs(curvature),
-                                            kMinSpeed, kMaxSpeed);
-    const double speed = std::min(instantSpeed, emaSpeed);
+    // Speed linearly proportional to the steering angle this curvature
+    // implies -- kMaxSpeed at zero angle, kMinSpeed at/beyond
+    // kSteeringLimit -- see kMinSpeed/kWheelBase/kSteeringLimit's own
+    // comments.
+    const double steeringAngle = std::atan(kWheelBase * curvature);
+    const double steeringFraction = std::clamp(std::abs(steeringAngle) / kSteeringLimit, 0.0, 1.0);
+    const double speed = kMaxSpeed - (kMaxSpeed - kMinSpeed) * steeringFraction;
     const double yawRate = speed * curvature;
 
-    return DriveCommand{speed, yawRate};
+    m_lastSpeed = speed;  // for NEXT cycle's lookahead distance
+    return DriveCommand{speed, yawRate, targetX, targetY};
 }

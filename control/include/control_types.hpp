@@ -61,4 +61,14 @@ struct DriveCommand
     double speed;     // m/s, commanded forward speed
     double yawRate;   // rad/s, commanded yaw rate (NOT a steering angle --
                        // see control.cpp's topic-doc comment for why)
+    // TEMPORARY debug fields: the body-frame point pure pursuit actually
+    // picked as its lookahead target this cycle -- added to directly
+    // observe, cycle to cycle, whether the TARGET is jumping around (a
+    // planning-side path-instability problem) or staying smooth while the
+    // car still oscillates around it (a control-tracking problem instead).
+    // See control.cpp's /control/debug_target publish. Default {0,0} for
+    // every early-return branch (stuck/empty-path/sweep) that never picks
+    // a real target -- those aren't meaningful to plot anyway.
+    double debugTargetX = 0.0;
+    double debugTargetY = 0.0;
 };

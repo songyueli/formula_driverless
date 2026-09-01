@@ -106,12 +106,20 @@ private:
     // alone fixes that -- only trying the OTHER direction does.
     double m_sweepDirection = 1.0;
 
-    // Exponential moving average of |curvature| across recent normal
-    // (non-empty-path) cycles -- see kCurvatureEmaAlpha's comment in the
-    // .cpp for why instantaneous curvature alone isn't enough through a
-    // SUSTAINED tight corner. Persists across calls the same way
-    // m_consecutiveEmptyCycles/the stuck-detection state above do, for the
-    // same reason: this needs memory of recent cycles, not just the
-    // current one.
-    double m_curvatureEma = 0.0;
+    // The speed COMMANDED last cycle, used to compute THIS cycle's
+    // lookahead distance (see kLookahead* constants in the .cpp) -- a
+    // deliberate one-cycle delay, not a bug: lookahead distance picks the
+    // target waypoint, which determines curvature, which determines speed,
+    // so "lookahead depends on speed" and "speed depends on lookahead's
+    // pick" can't both be resolved within the same cycle without an
+    // artificial iteration. Using the PREVIOUS cycle's already-computed
+    // speed instead is the standard way real pure-pursuit implementations
+    // break this exact cycle; at this pipeline's cycle rate, speed changes
+    // gradually enough between consecutive cycles that a one-cycle-stale
+    // value is a negligible approximation. Initialized to 0.0 (not
+    // kMinSpeed, which lives in the .cpp's anonymous namespace and isn't
+    // reachable from this header) -- the lookahead formula clamps to
+    // kMinLookahead regardless, so 0.0 already produces the same
+    // smallest-most-cautious-lookahead result on the very first cycle.
+    double m_lastSpeed = 0.0;
 };

@@ -64,6 +64,15 @@ int main()
 
     auto cmdPub = node.Advertise<gz::msgs::Twist>("/cmd_ackermann");
 
+    // TEMPORARY: the body-frame point pure pursuit actually picked as its
+    // lookahead target this cycle -- see DriveCommand::debugTargetX/Y's own
+    // comment for why. Published in body frame (frame_id "fsd_car" in
+    // foxglove_bridge.cpp, same as /planned_path) so Foxglove can place it
+    // correctly against the WORLD-frame /planning/debug_racing_line via the
+    // existing world->fsd_car /tf, without this file needing to do its own
+    // frame conversion.
+    auto debugTargetPub = node.Advertise<gz::msgs::Pose>("/control/debug_target");
+
     // Per-cycle compute time (microseconds) -- currently trivial pure
     // pursuit, but wrapping the whole callback body (rather than hand-
     // picking which lines to time) means this keeps working unchanged if
@@ -123,6 +132,11 @@ int main()
         twist.mutable_linear()->set_x(cmd.speed);
         twist.mutable_angular()->set_z(cmd.yawRate);
         cmdPub.Publish(twist);
+
+        gz::msgs::Pose targetMsg;
+        targetMsg.mutable_position()->set_x(cmd.debugTargetX);
+        targetMsg.mutable_position()->set_y(cmd.debugTargetY);
+        debugTargetPub.Publish(targetMsg);
     };
 
     if (!node.Subscribe("/planned_path", onPlannedPath))
