@@ -7,6 +7,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -1202,6 +1203,124 @@ int main(int argc, char **argv)
     {
         std::cerr << "Failed to subscribe to /planned_path\n";
         return 1;
+    }
+
+    // TEMPORARY: the actual body-frame point pure pursuit picked as its
+    // lookahead target this cycle (control.cpp's /control/debug_target) --
+    // see DriveCommand::debugTargetX/Y's own comment for why. frame_id
+    // "fsd_car" (body frame, same as /planned_path above), so Foxglove
+    // places it correctly against the world-frame racing-line debug
+    // topics via the existing world->fsd_car /tf, no conversion needed
+    // here either.
+    auto debug_target_channel_result = foxglove::messages::SceneUpdateChannel::create("/control/debug_target");
+    if (!debug_target_channel_result.has_value())
+    {
+        std::cerr << "Failed to create /control/debug_target channel: "
+                  << foxglove::strerror(debug_target_channel_result.error()) << '\n';
+        return 1;
+    }
+    auto debug_target_channel = std::move(debug_target_channel_result.value());
+
+    std::function<void(const gz::msgs::Pose &)> onDebugTarget =
+        [&debug_target_channel](const gz::msgs::Pose &_msg)
+    {
+        foxglove::messages::SceneEntity entity;
+        entity.timestamp = Now();
+        entity.frame_id = kCarModelName;
+        entity.id = "debug_target";
+
+        foxglove::messages::SpherePrimitive sphere;
+        sphere.pose = foxglove::messages::Pose{
+            foxglove::messages::Vector3{_msg.position().x(), _msg.position().y(), 0.15},
+            foxglove::messages::Quaternion{0, 0, 0, 1}};
+        sphere.size = foxglove::messages::Vector3{0.3, 0.3, 0.3};
+        sphere.color = foxglove::messages::Color{1.0, 1.0, 0.0, 1};  // bright yellow
+        entity.spheres.push_back(sphere);
+
+        foxglove::messages::SceneUpdate update;
+        update.entities.push_back(std::move(entity));
+        debug_target_channel.log(update);
+    };
+    if (!node.Subscribe("/control/debug_target", onDebugTarget))
+    {
+        std::cerr << "Failed to subscribe to /control/debug_target\n";
+        return 1;
+    }
+
+    // Debug visualizations for the landmark-based planning pipeline's own
+    // intermediate stages (planning.cpp's /planning/debug_* topics -- see
+    // its own comment for why these exist: a real forward/backward-window
+    // bug already found and fixed this way, plus a reported oscillation
+    // still being chased down). All WORLD frame (frame_id="world", same as
+    // /scene//estimated_landmarks below), unlike /planned_path above.
+    // TEMPORARY, same as /estimated_landmarks_debug elsewhere in this file
+    // -- fine to remove once the landmark pipeline is trusted.
+    auto publishDebugLineStrip = [](foxglove::messages::SceneUpdateChannel &_channel, const char *_id,
+                                     const foxglove::messages::Color &_color, const gz::msgs::Pose_V &_msg)
+    {
+        foxglove::messages::SceneEntity entity;
+        entity.timestamp = Now();
+        entity.frame_id = kFrameId;
+        entity.id = _id;
+
+        foxglove::messages::LinePrimitive line;
+        line.type = foxglove::messages::LinePrimitive::LineType::LINE_STRIP;
+        line.thickness = 0.04;
+        line.scale_invariant = false;
+        line.color = _color;
+        for (const auto &pose : _msg.pose())
+        {
+            line.points.push_back(foxglove::messages::Point3{pose.position().x(), pose.position().y(), 0.15});
+        }
+        if (line.points.size() >= 2)
+        {
+            entity.lines.push_back(line);
+        }
+
+        foxglove::messages::SceneUpdate update;
+        update.entities.push_back(std::move(entity));
+        _channel.log(update);
+    };
+
+    struct DebugPathTopic
+    {
+        const char *topic;
+        const char *id;
+        foxglove::messages::Color color;
+    };
+    const DebugPathTopic kDebugPathTopics[] = {
+        {"/planning/debug_midpoints", "debug_midpoints", foxglove::messages::Color{1.0, 0.55, 0.0, 1}},   // orange
+        {"/planning/debug_spline", "debug_spline", foxglove::messages::Color{0.9, 0.9, 0.9, 1}},          // white
+        {"/planning/debug_corridor_left", "debug_corridor_left", foxglove::messages::Color{0.1, 0.8, 0.1, 1}},   // green
+        {"/planning/debug_corridor_right", "debug_corridor_right", foxglove::messages::Color{0.1, 0.8, 0.1, 1}}, // green
+        {"/planning/debug_racing_line", "debug_racing_line", foxglove::messages::Color{1.0, 0.1, 0.8, 1}},       // magenta
+    };
+    // Channels held in a fixed-size array (not created inside the loop
+    // below) so each subscription's lambda can safely capture its own
+    // channel by reference -- addresses into this array never move once
+    // constructed, unlike a growing std::vector.
+    std::array<std::optional<foxglove::messages::SceneUpdateChannel>, std::size(kDebugPathTopics)> debugChannels;
+    std::vector<std::function<void(const gz::msgs::Pose_V &)>> debugCallbacks;
+    debugCallbacks.reserve(std::size(kDebugPathTopics));
+    for (size_t i = 0; i < std::size(kDebugPathTopics); ++i)
+    {
+        auto channelResult = foxglove::messages::SceneUpdateChannel::create(kDebugPathTopics[i].topic);
+        if (!channelResult.has_value())
+        {
+            std::cerr << "Failed to create " << kDebugPathTopics[i].topic
+                      << " channel: " << foxglove::strerror(channelResult.error()) << '\n';
+            return 1;
+        }
+        debugChannels[i] = std::move(channelResult.value());
+        debugCallbacks.push_back(
+            [&publishDebugLineStrip, &channel = *debugChannels[i], id = kDebugPathTopics[i].id,
+             color = kDebugPathTopics[i].color](const gz::msgs::Pose_V &_msg)
+            { publishDebugLineStrip(channel, id, color, _msg); });
+        if (!node.Subscribe(kDebugPathTopics[i].topic, debugCallbacks.back()))
+        {
+            std::cerr << "Failed to subscribe to " << kDebugPathTopics[i].topic << '\n';
+            return 1;
+        }
     }
 
     auto scene_channel_result = foxglove::messages::SceneUpdateChannel::create("/scene");
