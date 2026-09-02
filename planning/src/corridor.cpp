@@ -29,7 +29,23 @@ constexpr int kSmoothingWindow = 3;
 // windowed cone set, starting the traversal from _cursorStart -- same
 // technique as centerline_extractor.cpp uses for the midpoint chain
 // itself, just applied per-boundary-color here.
-std::vector<PathPoint> BuildChain(const std::vector<WorldCone> &_cones, const PathPoint &_cursorStart)
+//
+// BUG FIX (2026-09-01): this call was passing no initial heading at all,
+// unlike centerline_extractor.cpp's own two callers (see
+// OrderWaypointsByTraversal's own comment for why an initial heading
+// matters) -- confirmed live as a real, not theoretical, gap: at a real
+// (non-hairpin) ~38-degree bend on this track, this track's own cones are
+// a uniform, measured 3.00m apart (same-index blue/yellow pairing, direct
+// from trackdrive.sdf), but the LIVE computed corridor there narrowed to
+// as little as 0.91-1.05m across several consecutive samples -- a
+// fold-back-style chain-ordering error in this function, not a genuinely
+// narrow track. _haveInitialHeading/_initialHeadingX/_initialHeadingY seed
+// the SAME directional-continuity check centerline_extractor.cpp's callers
+// already use, just sourced from the local spline tangent (this function's
+// own caller has no vehicle pose to draw on, only the spline samples
+// already in hand) instead of the vehicle's yaw.
+std::vector<PathPoint> BuildChain(const std::vector<WorldCone> &_cones, const PathPoint &_cursorStart,
+                                   bool _haveInitialHeading, double _initialHeadingX, double _initialHeadingY)
 {
     std::vector<PathPoint> points;
     points.reserve(_cones.size());
@@ -37,7 +53,8 @@ std::vector<PathPoint> BuildChain(const std::vector<WorldCone> &_cones, const Pa
     {
         points.push_back(PathPoint{c.x, c.y});
     }
-    return OrderWaypointsByTraversal(std::move(points), _cursorStart);
+    return OrderWaypointsByTraversal(std::move(points), _cursorStart, kMaxPairDistance, _haveInitialHeading,
+                                      _initialHeadingX, _initialHeadingY);
 }
 
 // Lateral (perpendicular, left-positive) distance from _sample to the
@@ -142,8 +159,29 @@ std::vector<CorridorSample> ComputeCorridor(const std::vector<PathPoint> &spline
     }
     result.reserve(splineSamples.size());
 
-    const std::vector<PathPoint> blueChain = BuildChain(blue, splineSamples.front());
-    const std::vector<PathPoint> yellowChain = BuildChain(yellow, splineSamples.front());
+    // Initial heading for BuildChain's own fold-back protection (see its
+    // own comment) -- the local tangent between the first two spline
+    // samples, the best directional estimate available here (no vehicle
+    // pose to draw on directly). Falls back to no initial heading only if
+    // there's genuinely just one sample to work with (degenerate input).
+    bool haveInitialHeading = false;
+    double initialHeadingX = 0.0, initialHeadingY = 0.0;
+    if (splineSamples.size() >= 2)
+    {
+        const double dx = splineSamples[1].x - splineSamples[0].x;
+        const double dy = splineSamples[1].y - splineSamples[0].y;
+        const double len = std::sqrt(dx * dx + dy * dy);
+        if (len > 1e-6)
+        {
+            haveInitialHeading = true;
+            initialHeadingX = dx / len;
+            initialHeadingY = dy / len;
+        }
+    }
+    const std::vector<PathPoint> blueChain =
+        BuildChain(blue, splineSamples.front(), haveInitialHeading, initialHeadingX, initialHeadingY);
+    const std::vector<PathPoint> yellowChain =
+        BuildChain(yellow, splineSamples.front(), haveInitialHeading, initialHeadingX, initialHeadingY);
     size_t blueCursor = 0;
     size_t yellowCursor = 0;
     const int sampleCount = static_cast<int>(splineSamples.size());
