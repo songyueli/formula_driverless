@@ -170,15 +170,42 @@ std::vector<PathPoint> EnforceMinTurnRadius(std::vector<PathPoint> waypoints)
 // exact zigzag this exists to remove. Points the walk can't reach within
 // that cap are left out rather than forced in with a bad hop, matching this
 // pipeline's "no match is better than a bad match" philosophy.
+//
+// BUG FIX (2026-09-01): a distance cap alone is NOT sufficient at a sharp
+// hairpin -- confirmed live (a genuine wedge/stuck event, plus a corridor
+// whose left/right boundaries crossed over each other right at this
+// track's own hairpin). The point just before the apex and the point just
+// after it landed only 1.96m apart in raw Euclidean space (the hairpin
+// folds back on itself), comfortably inside kMaxPairDistance=8.0m, so the
+// greedy walk picked the wrong (behind-the-cursor) one -- a near-180-degree
+// reversal that a plain nearest-neighbor rule has no way to notice.
+// Measured directly against this exact hairpin's own true centerline: real
+// hop-to-hop turn angle never exceeds ~24 degrees even at the sharpest
+// point, while the confirmed bad hop represented ~118 degrees -- an
+// enormous, safe margin between "a real turn" and "a fold-back", so
+// requiring each hop to stay within kMaxHeadingReversalDeg=90 of the
+// heading established by the PREVIOUS hop rejects the fold-back outright
+// without ever being close to rejecting a genuine hairpin's own curvature.
+// Only checked once a heading actually exists (from the second accepted
+// point onward) -- the very first hop, from _cursor (not itself a waypoint
+// on the chain), has no established direction to compare against and stays
+// pure nearest-neighbor, same as before.
+constexpr double kMaxHeadingReversalDeg = 90.0;
+
 std::vector<PathPoint> OrderWaypointsByTraversal(std::vector<PathPoint> _waypoints, PathPoint _cursor,
-                                                  double _maxHopDistance)
+                                                  double _maxHopDistance, bool _haveInitialHeading,
+                                                  double _initialHeadingX, double _initialHeadingY)
 {
+    const double minHeadingDot = std::cos(kMaxHeadingReversalDeg * M_PI / 180.0);
+
     std::vector<PathPoint> ordered;
     ordered.reserve(_waypoints.size());
     std::vector<bool> used(_waypoints.size(), false);
 
     double cursorX = _cursor.x;
     double cursorY = _cursor.y;
+    bool haveHeading = _haveInitialHeading;
+    double headingX = _initialHeadingX, headingY = _initialHeadingY;
     for (size_t step = 0; step < _waypoints.size(); ++step)
     {
         int bestIdx = -1;
@@ -192,19 +219,42 @@ std::vector<PathPoint> OrderWaypointsByTraversal(std::vector<PathPoint> _waypoin
             const double dx = _waypoints[i].x - cursorX;
             const double dy = _waypoints[i].y - cursorY;
             const double distSq = dx * dx + dy * dy;
-            if (distSq < bestDistSq)
+            if (distSq >= bestDistSq)
             {
-                bestDistSq = distSq;
-                bestIdx = static_cast<int>(i);
+                continue;
             }
+            if (haveHeading && distSq > 1e-9)
+            {
+                const double invLen = 1.0 / std::sqrt(distSq);
+                const double dot = dx * invLen * headingX + dy * invLen * headingY;
+                if (dot < minHeadingDot)
+                {
+                    continue;  // implausible reversal relative to the established
+                               // heading -- almost certainly a fold-back hop, not
+                               // the real next point; skip rather than take it.
+                }
+            }
+            bestDistSq = distSq;
+            bestIdx = static_cast<int>(i);
         }
         if (bestIdx < 0)
         {
             break;  // nothing left within reach of the chain -- stop rather than force a bad hop
         }
+        const double newX = _waypoints[static_cast<size_t>(bestIdx)].x;
+        const double newY = _waypoints[static_cast<size_t>(bestIdx)].y;
+        const double hopDx = newX - cursorX;
+        const double hopDy = newY - cursorY;
+        const double hopLen = std::sqrt(hopDx * hopDx + hopDy * hopDy);
+        if (hopLen > 1e-9)
+        {
+            headingX = hopDx / hopLen;
+            headingY = hopDy / hopLen;
+            haveHeading = true;
+        }
         used[static_cast<size_t>(bestIdx)] = true;
-        cursorX = _waypoints[static_cast<size_t>(bestIdx)].x;
-        cursorY = _waypoints[static_cast<size_t>(bestIdx)].y;
+        cursorX = newX;
+        cursorY = newY;
         ordered.push_back(_waypoints[static_cast<size_t>(bestIdx)]);
     }
     return ordered;

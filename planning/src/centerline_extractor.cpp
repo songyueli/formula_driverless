@@ -96,7 +96,9 @@ std::vector<PathPoint> TwoPointMidpointExtractor(const std::vector<WorldCone> &b
     // WORLD position (not the body-frame origin -- these are world-frame
     // midpoints), same reasoning as path_generator.cpp's own ordering step
     // for why a plain x-sort breaks at a hairpin.
-    return OrderWaypointsByTraversal(std::move(waypoints), PathPoint{vehiclePose.x, vehiclePose.y});
+    return OrderWaypointsByTraversal(std::move(waypoints), PathPoint{vehiclePose.x, vehiclePose.y},
+                                      kMaxPairDistance, /*_haveInitialHeading=*/true,
+                                      std::cos(vehiclePose.yaw), std::sin(vehiclePose.yaw));
 }
 
 std::vector<PathPoint> ClosedLoopMidpointExtractor(const std::vector<WorldCone> &blue,
@@ -115,10 +117,14 @@ std::vector<PathPoint> ClosedLoopMidpointExtractor(const std::vector<WorldCone> 
     };
 
     const PathPoint cursorStart{vehiclePose.x, vehiclePose.y};
+    const double headingX = std::cos(vehiclePose.yaw);
+    const double headingY = std::sin(vehiclePose.yaw);
     const std::vector<PathPoint> blueChain =
-        OrderWaypointsByTraversal(toPoints(blue), cursorStart, kClosedChainMaxHop);
+        OrderWaypointsByTraversal(toPoints(blue), cursorStart, kClosedChainMaxHop,
+                                   /*_haveInitialHeading=*/true, headingX, headingY);
     const std::vector<PathPoint> yellowChain =
-        OrderWaypointsByTraversal(toPoints(yellow), cursorStart, kClosedChainMaxHop);
+        OrderWaypointsByTraversal(toPoints(yellow), cursorStart, kClosedChainMaxHop,
+                                   /*_haveInitialHeading=*/true, headingX, headingY);
     if (blueChain.empty() || yellowChain.empty())
     {
         return {};

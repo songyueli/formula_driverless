@@ -265,7 +265,12 @@ std::vector<PathPoint> NearestPairMidpointPath(const TrackBoundaries &boundaries
     // OrderWaypointsByTraversal's own comment for why that breaks at a
     // hairpin) so control gets an ordered, nearest-first path. Cursor is
     // the body-frame origin -- this pipeline's own vehicle position.
-    waypoints = OrderWaypointsByTraversal(std::move(waypoints), PathPoint{0, 0});
+    // Initial heading is body-frame "forward" (+X) -- always true by
+    // definition in this frame, same reasoning as world-frame callers
+    // seeding from the vehicle's own yaw (see OrderWaypointsByTraversal's
+    // own comment on why an initial heading matters).
+    waypoints = OrderWaypointsByTraversal(std::move(waypoints), PathPoint{0, 0}, kMaxPairDistance,
+                                           /*_haveInitialHeading=*/true, 1.0, 0.0);
 
     // Least-curvature ("racing line") smoothing -- see MinimizeCurvature's
     // own comment for why this replaces raw centerline-hugging, not just

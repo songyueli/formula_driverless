@@ -75,6 +75,28 @@ std::vector<PathPoint> EnforceMinTurnRadius(std::vector<PathPoint> waypoints);
 // wrong-side hop this parameter exists to prevent. Use the smallest value
 // confirmed (via direct replay against real landmark data) to actually
 // close the chain in question, not an arbitrary generous bump.
+//
+// _haveInitialHeading/_initialHeadingX/_initialHeadingY (2026-09-01): seeds
+// the directional-continuity check (path_utils.cpp's own comment on the
+// heading-reversal rejection) with a known-good starting direction instead
+// of deriving one from scratch off the first accepted hop. Confirmed live
+// as necessary, not optional: leaving the first hop's OWN direction as the
+// sole reference is fine when that hop is clean, but a single noisy first
+// hop (ordinary landmark jitter, or a mutual-pair midpoint that's laterally
+// offset from the true track direction) then wrongly rejects every
+// following LEGITIMATE point that doesn't happen to align with that noisy
+// reference -- observed live as the ordered-chain length intermittently
+// collapsing from a healthy handful of points down to just one, cycle to
+// cycle, with no change in the underlying cone geometry. Defaults to false
+// (no initial heading, matching the original behavior before the heading
+// check existed) -- callers with a genuinely known starting direction
+// (the vehicle's own EKF-filtered yaw, or body-frame "forward" i.e. +X for
+// the reactive pipeline's {0,0}-origin callers) should pass it; callers
+// without one (e.g. corridor.cpp's BuildChain, cursor'd from a spline
+// sample rather than the vehicle itself) are unaffected.
 std::vector<PathPoint> OrderWaypointsByTraversal(std::vector<PathPoint> _waypoints, PathPoint _cursor,
-                                                  double _maxHopDistance = kMaxPairDistance);
+                                                  double _maxHopDistance = kMaxPairDistance,
+                                                  bool _haveInitialHeading = false,
+                                                  double _initialHeadingX = 0.0,
+                                                  double _initialHeadingY = 0.0);
 }  // namespace fsd
