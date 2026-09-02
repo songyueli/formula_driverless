@@ -49,7 +49,26 @@ namespace
 // speed, but this software (lookahead/corridor/turn-radius tuning) has
 // never been validated anywhere near it -- 5.0 is the last speed with a
 // full confirmed-clean run.
-constexpr double kMaxSpeed = 5.0;  // m/s
+//
+// Retrying 8.0 (2026-09-01, target is eventually 15.0): the precondition
+// this file's own comment above was waiting on -- "the cache itself
+// separately confirmed clean at 5.0" -- is now satisfied. This same
+// session ran extensive live testing at 5.0 with racing_line_cache.cpp AND
+// the closed-loop pipeline both active (multiple soak tests, both sharp
+// corners, the hairpin specifically) and found zero rollover/dynamics
+// crashes -- every issue traced to landmark-map/stuck-watchdog bugs, now
+// separately fixed, not vehicle dynamics. kMaxLookahead=9.0 already has
+// headroom above 8.0 (see its own comment), so no lookahead change needed
+// for this step. Going straight to 15.0 is NOT attempted here -- that's a
+// 3x jump past the last confirmed-clean speed with no incremental
+// validation, the same mistake the 20.0 attempt made. Step up from here
+// (8 -> 11 -> 15) only after each step is confirmed clean, specifically
+// through both sharp corners and the hairpin -- raise kMaxLookahead
+// alongside kMaxSpeed once it stops having headroom (kLookaheadTimeConstant
+// =1.0s means the adaptive formula wants exactly kMaxSpeed meters of
+// lookahead at full speed -- see kMaxLookahead's own comment for why
+// under-clamping this was already a confirmed real bug once, at 7.0).
+constexpr double kMaxSpeed = 8.0;  // m/s
 // Floor speed at/beyond the vehicle's max steering angle. Raised from the
 // original 1.0 (2026-08-31, user report: "too slow") -- 1.0 was tuned
 // against the OLD raw-centerline path, which genuinely needed near-max
@@ -91,6 +110,19 @@ constexpr double kMinLookahead = 2.0;  // meters
 // itself was reverted to 5.0 below -- this constant was never implicated
 // in the rollover, no reason to also revert it.
 constexpr double kMaxLookahead = 9.0;  // meters
+
+// Forward-preview braking distance (2026-09-01) -- see its own use in
+// Compute() for why this exists (advance warning of an upcoming tight
+// corner, not just the single reactive lookahead target's own curvature).
+// Deliberately well beyond kMaxLookahead: the whole point is to see a sharp
+// turn coming BEFORE the reactive scheme would have picked it up on its
+// own. 15m fits comfortably inside the closed-loop pipeline's own published
+// horizon (planning.cpp's kClosedLoopPublishCount=60 points at 0.5m
+// spacing = 30m), while still being within the ~20m range perception
+// itself trusts (lidar_projector.cpp's kMaxValidRange) for the open/
+// reactive pipeline's shorter published path.
+constexpr double kBrakePreviewDistance = 15.0;  // meters
+
 // Bicycle-model geometry for converting curvature to a real steering angle
 // -- same wheel_base and steering_limit as
 // simulation/models/fsd_car/model.sdf's AckermannSteering plugin (MUST
@@ -506,7 +538,41 @@ DriveCommand PurePursuitController::Compute(const ControlInputs &inputs)
     // comments.
     const double steeringAngle = std::atan(kWheelBase * curvature);
     const double steeringFraction = std::clamp(std::abs(steeringAngle) / kSteeringLimit, 0.0, 1.0);
-    const double speed = kMaxSpeed - (kMaxSpeed - kMinSpeed) * steeringFraction;
+
+    // Forward-preview braking (2026-09-01): the scheme above only reacts to
+    // the SINGLE lookahead target's own curvature, which is the current
+    // speed's worth of distance ahead (~kLookaheadTimeConstant seconds) --
+    // fine at 5.0 m/s, but confirmed live insufficient once pushed to 8.0:
+    // the car showed a bump-like chassis-height artifact entering this
+    // track's sharp hairpin specifically, arriving too fast to have already
+    // scrubbed down to kMinSpeed by the time the reactive target's own
+    // curvature caught up with the turn actually being that tight. Scanning
+    // every published waypoint out to kBrakePreviewDistance (not just the
+    // one reactive target) and taking the SHARPEST curvature found anywhere
+    // in that window gives the car advance warning of an upcoming tight
+    // corner while it's still comfortably far enough away to actually brake
+    // for it -- same speed law (kMaxSpeed/kMinSpeed linear in steering
+    // fraction), just evaluated over a longer horizon, and only ever able to
+    // pull the final speed DOWN (via the min() below), never up, so this
+    // can't relax the existing reactive behavior on an already-straight
+    // section.
+    double previewSteeringFraction = steeringFraction;
+    for (const auto &wp : inputs.path)
+    {
+        const double distSq = wp.x * wp.x + wp.y * wp.y;
+        if (distSq > kBrakePreviewDistance * kBrakePreviewDistance)
+        {
+            continue;
+        }
+        const double wpCurvature = distSq > 1e-6 ? (2.0 * wp.y / distSq) : 0.0;
+        const double wpSteeringAngle = std::atan(kWheelBase * wpCurvature);
+        const double wpSteeringFraction = std::clamp(std::abs(wpSteeringAngle) / kSteeringLimit, 0.0, 1.0);
+        previewSteeringFraction = std::max(previewSteeringFraction, wpSteeringFraction);
+    }
+
+    const double reactiveSpeed = kMaxSpeed - (kMaxSpeed - kMinSpeed) * steeringFraction;
+    const double previewSpeed = kMaxSpeed - (kMaxSpeed - kMinSpeed) * previewSteeringFraction;
+    const double speed = std::min(reactiveSpeed, previewSpeed);
     const double yawRate = speed * curvature;
 
     m_lastSpeed = speed;  // for NEXT cycle's lookahead distance
