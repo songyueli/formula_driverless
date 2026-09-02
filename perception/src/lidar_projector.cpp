@@ -134,7 +134,23 @@ constexpr float kMaxValidRange = 20.0f; // meters
 // (reducing the frame-to-frame jitter component further), and gives
 // Localize() actual evidence of confidence (point COUNT) to gate on --
 // see kMinPointsForDetection.
-constexpr int kMinPointsForDetection = 2;
+//
+// Raised 2->3 (2026-09-01): confirmed live, a residual (post-duplicate-box-
+// suppression, see perception.cpp's SuppressDuplicateBoxes) low rate of
+// ghost landmarks persisted specifically in dense-cone regions (this
+// track's own hairpin, where cone-to-cone angular separation as seen from
+// the car is smallest). None of Pass 2's existing checks (kClusterRangeBand,
+// kMaxClusterRadius, kMinConeZSpread below) can catch a cluster that's
+// ENTIRELY made of a DIFFERENT, nearby real cone's own lidar returns
+// projecting into this box's pixel footprint -- that cluster looks
+// perfectly clean by every existing geometric check, since it IS a real,
+// tight, single-object surface, just the wrong object. A bare minimum of 2
+// points is the least amount of independent evidence this class of mistake
+// needs to look confident; 3 doesn't eliminate the failure mode (still no
+// direct way to verify WHICH object a clean cluster belongs to) but raises
+// the bar for how much of a nearby wrong object's return pattern has to
+// coincidentally land in this exact box before it's trusted.
+constexpr int kMinPointsForDetection = 3;
 
 // Points within this range of the closest in-box point are treated as the
 // same cluster (the cone's own near surface) -- points farther than this

@@ -200,6 +200,55 @@ constexpr const char *kModelPath = "ml/runs/detect/train/weights/best.onnx";
 #endif
 constexpr float kConfThreshold = 0.25f;
 
+// A SEPARATE, higher bar than kConfThreshold, applied only to lidar
+// localization (see its use at the Localize() call site below) -- a
+// detection can still be logged/drawn at any confidence above
+// kConfThreshold, this only decides whether it's trusted enough to attempt
+// a 3-D position from. Added 2026-09-01: a residual low rate of ghost
+// landmarks (confirmed live, post-duplicate-box-suppression -- see
+// SuppressDuplicateBoxes' own comment) persisted specifically in dense-cone
+// regions, where LidarProjector::Localize() has no way to verify a clean,
+// tight lidar cluster actually belongs to the SAME physical cone the box
+// was drawn around rather than a different, nearby one whose returns
+// happen to also project into this box's pixel footprint (see that
+// function's own kMinPointsForDetection comment for the full reasoning).
+// A lower-confidence box is inherently less precisely localized in pixel
+// space to begin with, making exactly that kind of cross-object pixel
+// overlap more likely -- 0.35 is a modest floor above kConfThreshold,
+// chosen to exclude only the most marginal/uncertain detections (measured
+// directly: confirmed-genuine, correctly-paired detections in this
+// project's own live logs commonly sit at 0.28+ confidence, so a much
+// higher floor risked cutting real landmark coverage, not just ghosts).
+constexpr float kMinConfidenceForLocalization = 0.35f;
+
+// Minimum bounding-box WIDTH (pixels) to attempt lidar localization from --
+// added 2026-09-01 alongside kMinConfidenceForLocalization, confirmed as
+// the more direct cause of this project's residual ghost-landmark rate:
+// visually inspecting a captured /camera/detections/image at a live ghost
+// site found a long, dense line of tiny (~6px), distant boundary cones
+// along the panorama's own horizon -- and directly measured from this same
+// session's own perception log, boxes under 15px wide make up 74.7% of
+// ALL detections (most of the visible track at any moment is far away),
+// of which 6.4% still returned a position despite LidarProjector's own
+// kMaxValidRange=20m and clustering checks -- a small but real fraction,
+// and each one is a candidate ghost. A ~6px box is not an arbitrary small
+// number: this track's real cones (0.115-0.1425m base radius, see
+// simulation/models/cone_*/model.sdf) at exactly kMaxValidRange=20m
+// project to roughly 10px wide (2*radius/range * fPano) -- so a box
+// NARROWER than that implies a cone genuinely FARTHER than the range
+// LidarProjector's own kMaxValidRange already says not to trust, meaning
+// any position such a box DOES manage to get is already inconsistent with
+// that existing boundary and can only be a stray, nearer, unrelated
+// object's lidar return landing in its few-pixel footprint by chance --
+// exactly the "different real cone's returns project into this box"
+// failure mode LidarProjector::Localize() has no way to detect on its own
+// (see kMinPointsForDetection's own comment). 15px keeps a margin above
+// the ~10px geometric floor for ordinary calibration/detection-box slack.
+// The SAME cone gets re-detected at closer range (wider box) as the car
+// keeps approaching, so excluding its first, farthest, most ambiguous
+// glimpse costs little real coverage.
+constexpr float kMinBoxWidthForLocalization = 15.0f;
+
 // A cone straddling the panorama's own left/right edge is only partially
 // visible there (its far side is simply outside the panorama's FOV
 // entirely, not occluded by anything -- see kPanoHFovRad above), and can
@@ -590,7 +639,9 @@ int main()
 
             const bool touchesPanoEdge =
                 d.x1 <= kPanoEdgeMarginPx || d.x2 >= static_cast<float>(kPanoWidth) - kPanoEdgeMarginPx;
-            const auto pos = touchesPanoEdge
+            const bool tooLowConfForLocalization = d.confidence < kMinConfidenceForLocalization;
+            const bool tooNarrowForLocalization = (d.x2 - d.x1) < kMinBoxWidthForLocalization;
+            const auto pos = (touchesPanoEdge || tooLowConfForLocalization || tooNarrowForLocalization)
                                   ? std::nullopt
                                   : lidarProjector.Localize(d.x1, d.y1, d.x2, d.y2);
 
@@ -606,6 +657,14 @@ int main()
             if (touchesPanoEdge)
             {
                 std::cout << " pos=none (touches panorama edge, excluded)";
+            }
+            else if (tooLowConfForLocalization)
+            {
+                std::cout << " pos=none (confidence below kMinConfidenceForLocalization, excluded)";
+            }
+            else if (tooNarrowForLocalization)
+            {
+                std::cout << " pos=none (box narrower than kMinBoxWidthForLocalization, excluded)";
             }
             else if (pos)
             {
