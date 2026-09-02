@@ -125,34 +125,19 @@ constexpr double kMinRetiredMatchVariance = 1.0; // meters^2
 // all rather than a full n x n scan.
 const std::vector<int> kVehicleDims = {0, 1, 2, 3, 4, 5};
 
-// Shared by PruneStaleRetiredDuplicates/PruneStaleActiveDuplicates -- see
-// their declarations in ekf.hpp. BUG FIX: this was 2.0m, based on this
-// file's other comments repeatedly citing ">=5m real cone spacing (FSAE
-// rules)" -- that assumption is WRONG for this specific simulated track,
-// confirmed directly by querying Gazebo's own /world/trackdrive/scene/info
-// service for real cone_blue_* positions: consecutive cones measured
-// ~1.97m apart, not >=5m. At 2.0m, this was actively MERGING two
-// genuinely distinct, legitimately-closely-spaced real cones into one --
-// confirmed directly: a detection would correctly fail the (real,
-// statistical) Mahalanobis gate against its actual nearest neighbor
-// (Mahalanobis 20-1200, correctly signaling "this is a DIFFERENT cone"),
-// get created as a new landmark via AddLandmark (correct), and then
-// immediately get discarded by this prune check because it was within
-// 2.0m of that same, genuinely-different neighbor -- an infinite create-
-// then-immediately-prune cycle that looked identical to "landmark
-// disappearing" from outside.
-//
-// Then dropped to 0.75, which went too far the OTHER way: cross-checking
-// live /estimated_landmarks against Gazebo's real cone_* positions
-// directly (matching each estimate to its nearest same-color real cone)
-// found 5 confirmed straggler duplicate pairs sitting 0.76-1.35m apart --
-// a well-converged landmark plus a slightly-off duplicate that 0.75 was
-// too tight to catch. 1.5m sits roughly halfway between the worst
-// confirmed straggler (1.35m) and the confirmed real minimum spacing
-// (1.97m), with real margin on both sides: comfortably catches every
-// duplicate distance actually observed so far, while staying well clear
-// of merging two genuinely distinct adjacent cones.
-constexpr double kDuplicatePruneRadius = 1.5; // meters
+// A fixed Euclidean prune radius (formerly kDuplicatePruneRadius) lived
+// here through several retunings (2.0m, then 0.75m, then 1.5m), each
+// grounded in real live measurements at the time. All of them were
+// ultimately unsound for the same underlying reason: this track's real
+// cone spacing (confirmed directly from simulation/worlds/trackdrive.sdf,
+// not estimated) ranges from a minimum of 0.57m up to several meters, and
+// genuine duplicate re-detections were separately measured at 0.76-1.5m
+// -- those two ranges directly overlap, so no single distance threshold
+// can distinguish "same cone, noisy re-detection" from "two different
+// cones at a tight corner". Replaced (2026-09-01) with
+// IsStatisticallySameLandmark below, a per-axis Mahalanobis test using
+// each landmark's own retained position variance instead of raw
+// distance -- see its own comment for the full reasoning.
 
 // Shared generous coarse-filter margin (Euclidean) for BOTH the active-
 // landmark search's coarse pre-filter (CorrectOrAddLandmark step 1) and the
@@ -269,6 +254,116 @@ constexpr double kYawVarianceFloor = (0.3 * M_PI / 180.0) * (0.3 * M_PI / 180.0)
 // enough to stop the filter going deaf to itself, not so wide it risks
 // conflating two genuinely distinct adjacent cones.
 constexpr double kLandmarkVarianceFloor = 0.3; // meters^2 (per axis, Pll's diagonal)
+
+// Statistical (per-axis-independent Mahalanobis) test for "these two
+// position estimates could plausibly be the same physical point" --
+// replaces the raw kDuplicatePruneRadius Euclidean check that used to gate
+// PruneStaleRetiredDuplicates/PruneStaleActiveDuplicates/
+// PruneCrossColorConflicts. BUG FIX (2026-09-01): a fixed Euclidean radius
+// cannot safely separate "duplicate re-detection of the same cone" from
+// "two genuinely different, closely-spaced cones at a tight corner" on
+// this track, because the two distance ranges directly overlap --
+// confirmed by measuring real cone placement straight from the track's
+// own static definition (simulation/worlds/trackdrive.sdf): median
+// spacing is ~1.86-2.43m, but the actual MINIMUM is 0.57m (several pairs
+// under 1m), while confirmed genuine duplicate pairs were separately
+// measured at 0.76-1.5m (see kDuplicatePruneRadius's own comment) --
+// dead center inside that same real-spacing range. At kDuplicatePruneRadius
+// =1.5m, any tight-corner pair under 1.5m apart gets merged as a "duplicate"
+// regardless of how confidently each is actually localized, thinning the
+// landmark map exactly where corner precision matters most and producing
+// a corridor that doesn't reflect the real (narrow) track there.
+//
+// Using each landmark's own RETAINED POSITION VARIANCE instead asks the
+// question that actually matters: given how confident each estimate
+// already is, is the observed separation small enough to be explained by
+// ordinary estimation noise, or too large for that regardless of the raw
+// distance? Two independently well-converged tight-corner cones (low
+// variance each) stay distinct even 0.57m apart, because that gap is many
+// standard deviations wide relative to their own tight uncertainty; two
+// still-uncertain estimates of the truly same cone (higher variance) get
+// correctly merged even somewhat farther apart. Same chi-squared gate
+// (kLandmarkGateChiSq, 2 DOF, 95% confidence) already used for real
+// detection-to-landmark matching elsewhere in this file -- same
+// statistical question, same answer. Combined variance (var1+var2), the
+// standard way to combine two independent estimates' uncertainty for a
+// difference-of-two-randoms test.
+// BUG FIX (2026-09-01, second pass): the obsCount maturity gate
+// (kMinObsCountForPruning below) protects a pair once BOTH sides have
+// individually accumulated real history, but does nothing during the
+// window before that -- and confirmed live, that window is exactly where
+// this bug still bites: three genuinely distinct blue cones on this
+// track's second corner (indices 29-31 in trackdrive.sdf, ~1.58m apart)
+// all enter camera view together as the car approaches the corner, so
+// all three are simultaneously immature, and the floor-driven Mahalanobis
+// test alone (accept radius up to sqrt(5.99 * 0.6) =~ 1.89m once both
+// sides sit at kLandmarkVarianceFloor) merges two of them before either
+// has a chance to mature. Confirmed by direct comparison of a live
+// /estimated_landmarks snapshot against trackdrive.sdf's own ground truth:
+// exactly those three cones (plus a few others near other corner apices)
+// missing, matching what was directly observed live in Foxglove.
+//
+// A hard absolute-distance floor closes that window regardless of
+// maturity or variance: kDuplicateAbsoluteDistanceCap is set well under
+// the real minimum genuinely-distinct cone spacing measured directly from
+// this track's own layout (0.57m -- see kLandmarkVarianceFloor's own
+// comment), so no pair of real, distinct cones on THIS track can ever be
+// this close together and still get merged, no matter how uncertain
+// either estimate is. It's deliberately NOT tuned to also catch the
+// full logged genuine-duplicate range (0.76-1.5m, see
+// kLandmarkVarianceFloor's own comment) -- those numbers were measured
+// under the old, since-confirmed-broken flat-radius system, so they may
+// themselves be contaminated by this exact bug rather than being clean
+// ground truth for "genuine duplicate distance"; catching only the
+// short-range, unambiguous case (a single physical cone re-detected with
+// ordinary measurement noise, not a second cone entirely) is the safe
+// tradeoff here -- a few genuine duplicate landmarks surviving in the map
+// is a minor cosmetic/perf cost (kMaxLandmarks=600 has room to spare),
+// while erasing a real track-boundary cone is a safety issue.
+constexpr double kDuplicateAbsoluteDistanceCap = 0.35; // meters
+
+bool IsStatisticallySameLandmark(double dx, double dy, double varX1, double varY1, double varX2, double varY2)
+{
+    if (dx * dx + dy * dy > kDuplicateAbsoluteDistanceCap * kDuplicateAbsoluteDistanceCap)
+    {
+        return false;
+    }
+    const double combinedVarX = std::max(varX1 + varX2, 1e-6);
+    const double combinedVarY = std::max(varY1 + varY2, 1e-6);
+    const double mahalanobisSq = (dx * dx) / combinedVarX + (dy * dy) / combinedVarY;
+    return mahalanobisSq < kLandmarkGateChiSq;
+}
+
+// BUG FIX (2026-09-01): IsStatisticallySameLandmark alone isn't enough --
+// confirmed live (estimated landmarks vanishing on tight corners as the car
+// drove past). Root cause: kLandmarkVarianceFloor clamps EVERY landmark's
+// Pll diagonal to >= 0.3 once its own covariance genuinely converges below
+// that, so two independently well-tracked landmarks both sitting at the
+// floor give combinedVar = 0.6, an accept radius of sqrt(5.99 * 0.6) =~
+// 1.89m -- comfortably swallowing the real minimum tight-corner cone
+// spacing on this track (0.57m, see kLandmarkVarianceFloor's own comment)
+// regardless of how many times either has actually been confirmed. A raw
+// distance floor can't fix this either: this file's own logged merge
+// distances for CONFIRMED genuine duplicates (0.76-1.5m, median 1.15m)
+// directly overlap the real distinct-cone range, so no single distance
+// threshold can separate the two cases.
+//
+// obsCount is the signal Pll can no longer provide once floored: a
+// duplicate is a fresh, spurious extra landmark from a momentary mis-
+// association that (being spurious) rarely gets independently re-observed
+// again, while a real distinct cone keeps accumulating corrections every
+// time the car drives past it. Requiring at least one side of a candidate
+// pair to still be under this count keeps pruning doing its original job
+// (cleaning up a fresh double-add before it accumulates history) while
+// protecting any landmark that's already been confirmed several times
+// over, independent of what its current (possibly floored) covariance
+// says. 3 is a small margin above 1 (every landmark's obsCount starts
+// there) -- enough to survive one stray extra correction without yet
+// counting as "confirmed", not so large that a real duplicate has time to
+// accumulate real history before its first prune pass has a chance to
+// catch it (these run every 20th correction -- see each prune function's
+// own throttling comment).
+constexpr uint32_t kMinObsCountForPruning = 3;
 } // namespace
 
 namespace fsd
@@ -939,6 +1034,7 @@ void Ekf::CorrectMatchedLandmark(int _landmarkIndex, double _measuredBodyX,
     ApplyCorrection({0, 1, 2, li, li + 1}, Hcols, y, R);
 
     m_landmarkLastSeen[static_cast<size_t>(_landmarkIndex)] = ++m_tick;
+    ++m_landmarkObsCount[static_cast<size_t>(_landmarkIndex)];
 }
 
 void Ekf::AddLandmark(double _measuredBodyX, double _measuredBodyY,
@@ -1051,6 +1147,15 @@ void Ekf::AddLandmark(double _measuredBodyX, double _measuredBodyY,
 
     m_landmarkColors.push_back(_color);
     m_landmarkLastSeen.push_back(++m_tick);
+    // Reactivation restarts at 1 rather than inheriting the retired
+    // estimate's own obsCount -- CorrectOrAddLandmark's own gate already
+    // decides whether reactivation is safe; restarting here just means a
+    // just-reactivated landmark is briefly re-eligible for duplicate
+    // pruning again too, which is fine since the pruning maturity gate is
+    // symmetric (see kMinObsCountForPruning) and a genuine reactivation of
+    // a real cone will quickly re-accumulate observations from being
+    // re-driven-past, same as it did the first time.
+    m_landmarkObsCount.push_back(1);
     // Reactivation carries the retired landmark's OWN uid forward -- it's
     // the same physical landmark rediscovered, not a new one -- while a
     // genuinely new landmark gets the next fresh uid. See
@@ -1066,7 +1171,7 @@ std::vector<Ekf::LandmarkEstimate> Ekf::Landmarks() const
     {
         const int li = kVehicleStateDim + 2 * static_cast<int>(i);
         result.push_back(LandmarkEstimate{
-            m_x(li), m_x(li + 1), m_landmarkColors[i], 0.0, 0.0, m_landmarkUid[i]});
+            m_x(li), m_x(li + 1), m_landmarkColors[i], 0.0, 0.0, m_landmarkUid[i], m_landmarkObsCount[i]});
     }
     // Retired landmarks are no longer part of the joint state (see the
     // class comment), but /estimated_landmarks should still show the full
@@ -1110,6 +1215,7 @@ void Ekf::RemoveActiveLandmark(size_t _index)
     m_landmarkColors.erase(m_landmarkColors.begin() + static_cast<long>(_index));
     m_landmarkLastSeen.erase(m_landmarkLastSeen.begin() + static_cast<long>(_index));
     m_landmarkUid.erase(m_landmarkUid.begin() + static_cast<long>(_index));
+    m_landmarkObsCount.erase(m_landmarkObsCount.begin() + static_cast<long>(_index));
 }
 
 void Ekf::EvictStaleIfOverCapacity()
@@ -1196,7 +1302,8 @@ void Ekf::EvictStaleIfOverCapacity()
         const int li = kVehicleStateDim + 2 * static_cast<int>(staleIndex);
         m_retiredLandmarks.push_back(LandmarkEstimate{
             m_x(li), m_x(li + 1), m_landmarkColors[staleIndex],
-            m_P(li, li), m_P(li + 1, li + 1), m_landmarkUid[staleIndex]});
+            m_P(li, li), m_P(li + 1, li + 1), m_landmarkUid[staleIndex],
+            m_landmarkObsCount[staleIndex]});
         RetiredGridInsert(m_retiredLandmarks.size() - 1);
         RemoveActiveLandmark(staleIndex);
     }
@@ -1252,9 +1359,19 @@ void Ekf::PruneStaleRetiredDuplicates()
             {
                 continue;
             }
+            // See kMinObsCountForPruning's comment above -- only erase a
+            // retired entry that was ITSELF never well-confirmed; a
+            // retired landmark that racked up real history before being
+            // evicted is protected regardless of how statistically close
+            // it now looks to a (possibly floored-variance) active one.
+            if (m_retiredLandmarks[r].obsCount >= kMinObsCountForPruning)
+            {
+                continue;
+            }
             const double dx = m_x(li) - m_retiredLandmarks[r].x;
             const double dy = m_x(li + 1) - m_retiredLandmarks[r].y;
-            if (dx * dx + dy * dy < kDuplicatePruneRadius * kDuplicatePruneRadius)
+            if (IsStatisticallySameLandmark(dx, dy, m_P(li, li), m_P(li + 1, li + 1),
+                                             m_retiredLandmarks[r].varX, m_retiredLandmarks[r].varY))
             {
                 EraseRetiredLandmark(r);
             }
@@ -1286,10 +1403,19 @@ void Ekf::PruneStaleActiveDuplicates()
             {
                 continue;
             }
+            // See kMinObsCountForPruning's comment above -- both sides
+            // already independently confirmed means this is two real,
+            // distinct, closely-spaced cones, not a duplicate mis-add.
+            if (m_landmarkObsCount[a] >= kMinObsCountForPruning
+                && m_landmarkObsCount[b] >= kMinObsCountForPruning)
+            {
+                continue;
+            }
             const int liB = kVehicleStateDim + 2 * static_cast<int>(b);
             const double dx = m_x(liA) - m_x(liB);
             const double dy = m_x(liA + 1) - m_x(liB + 1);
-            if (dx * dx + dy * dy < kDuplicatePruneRadius * kDuplicatePruneRadius)
+            if (IsStatisticallySameLandmark(dx, dy, m_P(liA, liA), m_P(liA + 1, liA + 1), m_P(liB, liB),
+                                             m_P(liB + 1, liB + 1)))
             {
                 // Keep whichever was seen more recently -- same recency
                 // signal EvictStaleIfOverCapacity already uses.
@@ -1329,10 +1455,20 @@ void Ekf::PruneCrossColorConflicts()
             {
                 continue;
             }
+            // See kMinObsCountForPruning's comment above -- both sides
+            // already independently confirmed means these are two real,
+            // distinct, closely-spaced (different-colored) cones, not a
+            // misclassification artifact.
+            if (m_landmarkObsCount[a] >= kMinObsCountForPruning
+                && m_landmarkObsCount[b] >= kMinObsCountForPruning)
+            {
+                continue;
+            }
             const int liB = kVehicleStateDim + 2 * static_cast<int>(b);
             const double dx = m_x(liA) - m_x(liB);
             const double dy = m_x(liA + 1) - m_x(liB + 1);
-            if (dx * dx + dy * dy < kDuplicatePruneRadius * kDuplicatePruneRadius)
+            if (IsStatisticallySameLandmark(dx, dy, m_P(liA, liA), m_P(liA + 1, liA + 1), m_P(liB, liB),
+                                             m_P(liB + 1, liB + 1)))
             {
                 // Remove BOTH -- see this method's declaration in ekf.hpp
                 // for why neither is kept. Larger index first: removing b

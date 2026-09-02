@@ -105,6 +105,17 @@ public:
         // be measured in. See localization.cpp's publishLandmarks for how
         // this gets exposed externally.
         uint64_t uid = 0;
+        // How many corrections this landmark has ever received while
+        // active (initial add counts as 1) -- carried across
+        // eviction/reactivation via AddLandmark, same as uid. See
+        // kMinObsCountForPruning's comment in ekf.cpp for why this exists:
+        // Pll's diagonal alone can't distinguish "a genuinely distinct,
+        // well-confirmed cone" from "a fresh, still-uncertain one" once
+        // kLandmarkVarianceFloor has clamped both to the same floor, but
+        // obsCount can -- a duplicate mis-add is a fresh landmark that
+        // rarely gets re-observed again, while a real distinct cone keeps
+        // accumulating corrections indefinitely.
+        uint32_t obsCount = 0;
     };
 
     Ekf();
@@ -424,6 +435,9 @@ private:
     // value at the most recent match or add for that landmark.
     std::vector<ConeColor> m_landmarkColors;
     std::vector<uint64_t> m_landmarkLastSeen;
+    // Parallel to m_landmarkColors -- see LandmarkEstimate::obsCount's own
+    // comment for why this exists (duplicate-pruning maturity gate).
+    std::vector<uint32_t> m_landmarkObsCount;
     // Parallel to m_landmarkColors -- see LandmarkEstimate::uid's comment
     // for why this exists. Assigned once (m_nextLandmarkUid++) the first
     // time a landmark is genuinely newly created, then carried forward
