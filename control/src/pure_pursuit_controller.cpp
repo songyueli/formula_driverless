@@ -31,12 +31,24 @@ namespace
 // -- steering took 1.5-2+ seconds to converge on a held command). Retried
 // 7.0 again after both fixes (plus the behind-car path filter and
 // speed-proportional adaptive lookahead, added the same session) -- still
-// crashed hard (car frozen, chassis z risen from 0.31 to 0.447, consistent
-// with an actual collision, not just a soft wedge). Reverted to the
-// confirmed-reliable 5.0 (a full clean lap including the hairpin,
-// 2026-08-31) to isolate whether the OTHER same-session changes are solid
-// on their own before pushing speed again -- don't re-raise this without a
-// fresh, isolated retest.
+// crashed hard, but traced THAT to a third, genuinely different bug: at
+// speed=7.0, the adaptive lookahead formula wanted 7.0m but kMaxLookahead
+// was still 6.0 (a leftover from before this constant existed), silently
+// giving LESS than a full second of lookahead exactly where more was
+// needed most -- see kMaxLookahead's own comment. Tried 8.0 next (same
+// session) with kMaxLookahead raised to 9.0 for headroom -- still crashed,
+// this time a rollover, WHILE the racing-line cache (racing_line_cache.cpp)
+// was also active for the first time in the same test. Reverted to 5.0
+// (last confirmed-clean full lap) to isolate: is it the speed, the cache,
+// or their interaction? Retry 8.0 again only after the cache itself is
+// separately confirmed clean at 5.0.
+// Reverted from 20.0 (2026-09-01): confirmed live as a real crash, not a
+// theoretical risk -- chassis z spiked to 1.26m (vs. the normal ~0.31m
+// baseline and every prior confirmed collision's own worst case, ~0.56m)
+// within the first 30 seconds of driving. 20 m/s matches real FSAE top
+// speed, but this software (lookahead/corridor/turn-radius tuning) has
+// never been validated anywhere near it -- 5.0 is the last speed with a
+// full confirmed-clean run.
 constexpr double kMaxSpeed = 5.0;  // m/s
 // Floor speed at/beyond the vehicle's max steering angle. Raised from the
 // original 1.0 (2026-08-31, user report: "too slow") -- 1.0 was tuned
@@ -48,7 +60,7 @@ constexpr double kMaxSpeed = 5.0;  // m/s
 // justification is largely gone. 2.0 is a first retry, not yet validated
 // live the way 1.0 was -- retest at the hairpin specifically before
 // trusting it the same way.
-constexpr double kMinSpeed = 2.0;  // m/s
+constexpr double kMinSpeed = 2.0;  // m/s -- reverted alongside kMaxSpeed, see its own comment
 
 // Lookahead distance is now proportional to speed (m_lastSpeed, see its
 // own comment in the header for why last-cycle's speed, not this cycle's),
@@ -67,7 +79,18 @@ constexpr double kMinSpeed = 2.0;  // m/s
 // has been.
 constexpr double kLookaheadTimeConstant = 1.0;  // seconds
 constexpr double kMinLookahead = 2.0;  // meters
-constexpr double kMaxLookahead = 6.0;  // meters
+// Confirmed directly (2026-08-31) as a real mismatch, not just a
+// theoretical one: at kMaxSpeed=7.0 with kLookaheadTimeConstant=1.0, the
+// "look 1 second ahead" formula wants 7.0m, but this was clamped to 6.0 --
+// backwards from the whole point of adaptive lookahead (MORE lookahead at
+// higher speed for stability), giving LESS than a full second of
+// look-ahead exactly in the speed regime that needed it most. Set with
+// headroom above kMaxSpeed's own value so this clamp only ever engages as
+// a genuine safety bound, not a silent ceiling on the adaptive formula
+// itself. Left at 9.0 (headroom above kMaxSpeed) even though kMaxSpeed
+// itself was reverted to 5.0 below -- this constant was never implicated
+// in the rollover, no reason to also revert it.
+constexpr double kMaxLookahead = 9.0;  // meters
 // Bicycle-model geometry for converting curvature to a real steering angle
 // -- same wheel_base and steering_limit as
 // simulation/models/fsd_car/model.sdf's AckermannSteering plugin (MUST
@@ -202,6 +225,25 @@ constexpr int kStuckCyclesBeforeReverse = 90;
 // the meaningful distance even kMinSpeed's normal-driving floor (let alone
 // a working sweep) should cover in 3 seconds.
 constexpr double kStuckDistanceThreshold = 0.3;  // meters
+
+// Independent, LONGER-timescale companion to the short-term check above --
+// see m_haveLongTermAnchor's own header comment for the confirmed live gap
+// this closes: the short-term anchor's own "roll forward on any 0.3m
+// crossing" design, correct for not penalizing real driving, is
+// vulnerable to small noise/wobble (wheels spinning against a genuine
+// physical block) randomly walking past 0.3m before kStuckCyclesBeforeReverse
+// cycles ever elapse, resetting the counter forever. This check instead
+// only samples position every kLongTermStuckWindow cycles (not
+// continuously), so it can't be perpetually reset by noise -- only by
+// ACTUAL displacement since the last snapshot. kLongTermStuckWindow (~10s
+// at 30Hz) and kLongTermStuckThreshold (comfortably more than one
+// snapshot period's worth of noise, comfortably less than kMinSpeed's own
+// normal-driving distance over that period) are both deliberately looser
+// than the short-term check's own -- this is a slower-to-fire backstop
+// for exactly the case the fast check structurally can't catch, not a
+// replacement for it.
+constexpr int kLongTermStuckWindow = 300;      // cycles (~10s at 30Hz)
+constexpr double kLongTermStuckThreshold = 1.0;  // meters
 // Reverse maneuver: mostly straight back, same cautious magnitude as
 // kCreepSpeed but negative, PLUS a small turn (kReverseTurnRate) so
 // backing up also reorients the car rather than just retracing its own
@@ -290,6 +332,17 @@ DriveCommand PurePursuitController::Compute(const ControlInputs &inputs)
         return DriveCommand{0.0, 0.0};
     }
 
+    // Checked before everything else, including the anchor/displacement
+    // logic below -- see m_permanentlyStuck's own header comment for the
+    // confirmed real bug this closes (without this early return, the
+    // log-throttle reset a few lines down let the car resume full normal
+    // driving for ~kStuckCyclesBeforeReverse cycles between each [STUCK]
+    // pulse, forever, instead of actually holding position).
+    if (m_permanentlyStuck)
+    {
+        return DriveCommand{0.0, 0.0};
+    }
+
     if (inputs.poseValid)
     {
         if (!m_haveAnchor)
@@ -333,10 +386,58 @@ DriveCommand PurePursuitController::Compute(const ControlInputs &inputs)
                 // that cannot reverse has no other way out.
                 std::fprintf(stderr,
                     "[STUCK] no forward progress for %d cycles at approx (%.2f,%.2f) -- "
-                    "reverse recovery is DISABLED (FS rules); holding position, needs external reset\n",
+                    "reverse recovery is DISABLED (FS rules); holding position permanently, needs external reset\n",
                     m_cyclesSinceAnchor, inputs.worldX, inputs.worldY);
-                m_cyclesSinceAnchor = 0;  // throttle: re-warn, not spam every cycle, if still stuck
+                // Latch permanently stopped -- see m_permanentlyStuck's own
+                // header comment. The old `m_cyclesSinceAnchor = 0` reset
+                // that used to live here was meant only to throttle
+                // repeated LOG spam, but it also silently let the state
+                // machine resume normal driving for the next ~
+                // kStuckCyclesBeforeReverse cycles before re-triggering --
+                // now handled by the early-return latch check at the top
+                // of this function instead, so this trigger only needs to
+                // fire once.
+                m_permanentlyStuck = true;
                 return DriveCommand{0.0, 0.0};
+            }
+        }
+
+        // Independent long-term check -- see kLongTermStuckWindow/
+        // kLongTermStuckThreshold's own comment for why the short-term
+        // check above can miss a real stuck condition (noise/wobble
+        // perpetually resetting its rolling anchor). Snapshots position
+        // only once every kLongTermStuckWindow cycles, so only genuine
+        // displacement since the last snapshot -- not per-cycle noise --
+        // can ever reset it.
+        if (!m_haveLongTermAnchor)
+        {
+            m_longTermAnchorX = inputs.worldX;
+            m_longTermAnchorY = inputs.worldY;
+            m_haveLongTermAnchor = true;
+            m_cyclesSinceLongTermAnchor = 0;
+        }
+        else
+        {
+            ++m_cyclesSinceLongTermAnchor;
+            if (m_cyclesSinceLongTermAnchor >= kLongTermStuckWindow)
+            {
+                const double ldx = inputs.worldX - m_longTermAnchorX;
+                const double ldy = inputs.worldY - m_longTermAnchorY;
+                const double longTermDisplacement = std::sqrt(ldx * ldx + ldy * ldy);
+                if (longTermDisplacement < kLongTermStuckThreshold)
+                {
+                    std::fprintf(stderr,
+                        "[STUCK-LONGTERM] under %.2fm net displacement over %d cycles at approx "
+                        "(%.2f,%.2f) -- reverse recovery is DISABLED (FS rules); holding position "
+                        "permanently, needs external reset\n",
+                        kLongTermStuckThreshold, m_cyclesSinceLongTermAnchor, inputs.worldX, inputs.worldY);
+                    m_permanentlyStuck = true;
+                    return DriveCommand{0.0, 0.0};
+                }
+                // Real net progress over the window -- snapshot forward.
+                m_longTermAnchorX = inputs.worldX;
+                m_longTermAnchorY = inputs.worldY;
+                m_cyclesSinceLongTermAnchor = 0;
             }
         }
     }

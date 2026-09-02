@@ -217,7 +217,9 @@ add_executable(planning
     planning/src/centerline_extractor.cpp
     planning/src/spline.cpp
     planning/src/corridor.cpp
-    planning/src/racing_line_optimizer.cpp)
+    planning/src/racing_line_optimizer.cpp
+    planning/src/racing_line_cache.cpp
+    planning/src/lap_detector.cpp)
 target_include_directories(planning PRIVATE
     planning/include)
 target_link_libraries(planning

@@ -52,21 +52,43 @@ std::vector<PathPoint> BuildChain(const std::vector<WorldCone> &_cones, const Pa
 // all this cycle (empty chain, or window ran off either end) -- callers
 // treat that as "no boundary data", not zero width.
 double NearestChainLateralDistance(const std::vector<PathPoint> &_chain, size_t &_cursor,
-                                    const PathPoint &_sample, double _tangentX, double _tangentY)
+                                    const PathPoint &_sample, double _tangentX, double _tangentY,
+                                    bool _closed)
 {
     if (_chain.empty())
     {
         return -1.0;
     }
-    const int lo = std::max(0, static_cast<int>(_cursor) - kChainSearchWindow);
-    const int hi = std::min(static_cast<int>(_chain.size()) - 1, static_cast<int>(_cursor) + kChainSearchWindow);
+    const int chainSize = static_cast<int>(_chain.size());
+    // Closed: wrap the search window modulo chain size, so the index right
+    // after the last one is treated as beside the one right before the
+    // first -- see ComputeCorridor's own _closed comment. Open (default):
+    // unchanged, clamp at both ends exactly as before.
+    std::vector<int> indices;
+    indices.reserve(static_cast<size_t>(2 * kChainSearchWindow + 1));
+    if (_closed)
+    {
+        for (int off = -kChainSearchWindow; off <= kChainSearchWindow; ++off)
+        {
+            indices.push_back(((static_cast<int>(_cursor) + off) % chainSize + chainSize) % chainSize);
+        }
+    }
+    else
+    {
+        const int lo = std::max(0, static_cast<int>(_cursor) - kChainSearchWindow);
+        const int hi = std::min(chainSize - 1, static_cast<int>(_cursor) + kChainSearchWindow);
+        for (int i = lo; i <= hi; ++i)
+        {
+            indices.push_back(i);
+        }
+    }
 
     // Prefer the closest-along-tangent candidate within the longitudinal
     // window -- "directly beside" the sample, not diagonally ahead of it.
     double bestLateral = -1.0;
     double bestLongAbs = std::numeric_limits<double>::max();
     int bestIdx = -1;
-    for (int i = lo; i <= hi; ++i)
+    for (int i : indices)
     {
         const double dx = _chain[static_cast<size_t>(i)].x - _sample.x;
         const double dy = _chain[static_cast<size_t>(i)].y - _sample.y;
@@ -85,7 +107,7 @@ double NearestChainLateralDistance(const std::vector<PathPoint> &_chain, size_t 
         // distance candidate rather than reporting "no data" when there IS
         // a chain nearby, just none of it well-aligned.
         double bestDistSq = std::numeric_limits<double>::max();
-        for (int i = lo; i <= hi; ++i)
+        for (int i : indices)
         {
             const double dx = _chain[static_cast<size_t>(i)].x - _sample.x;
             const double dy = _chain[static_cast<size_t>(i)].y - _sample.y;
@@ -109,8 +131,9 @@ double NearestChainLateralDistance(const std::vector<PathPoint> &_chain, size_t 
 std::vector<CorridorSample> ComputeCorridor(const std::vector<PathPoint> &splineSamples,
                                              const std::vector<WorldCone> &blue,
                                              const std::vector<WorldCone> &yellow,
+                                             const std::vector<WorldCone> &orange,
                                              double safetyMargin, double minHalfWidth,
-                                             double maxHalfWidth)
+                                             double maxHalfWidth, bool closed)
 {
     std::vector<CorridorSample> result;
     if (splineSamples.empty())
@@ -123,15 +146,22 @@ std::vector<CorridorSample> ComputeCorridor(const std::vector<PathPoint> &spline
     const std::vector<PathPoint> yellowChain = BuildChain(yellow, splineSamples.front());
     size_t blueCursor = 0;
     size_t yellowCursor = 0;
+    const int sampleCount = static_cast<int>(splineSamples.size());
 
     for (size_t i = 0; i < splineSamples.size(); ++i)
     {
-        // Local tangent via central difference (forward/backward at the
-        // endpoints) -- the spline is already dense (see spline.hpp's own
-        // sample spacing), so this is a good direction estimate without
-        // needing the spline's own analytic derivative.
-        const PathPoint &prev = splineSamples[i == 0 ? i : i - 1];
-        const PathPoint &next = splineSamples[i + 1 < splineSamples.size() ? i + 1 : i];
+        // Local tangent via central difference. Closed: wraps modulo
+        // sampleCount, so index 0's "prev" is the last sample and the last
+        // sample's "next" is index 0 -- see this function's own _closed
+        // comment for why there's no real start/end to clamp at. Open
+        // (default): unchanged, clamp at both ends via forward/backward
+        // difference exactly as before.
+        const PathPoint &prev = closed ? splineSamples[static_cast<size_t>(
+                                              (static_cast<int>(i) - 1 + sampleCount) % sampleCount)]
+                                        : splineSamples[i == 0 ? i : i - 1];
+        const PathPoint &next = closed
+            ? splineSamples[static_cast<size_t>((static_cast<int>(i) + 1) % sampleCount)]
+            : splineSamples[i + 1 < splineSamples.size() ? i + 1 : i];
         double tx = next.x - prev.x;
         double ty = next.y - prev.y;
         const double tlen = std::sqrt(tx * tx + ty * ty);
@@ -146,8 +176,10 @@ std::vector<CorridorSample> ComputeCorridor(const std::vector<PathPoint> &spline
             ty = 0.0;
         }
 
-        const double blueDist = NearestChainLateralDistance(blueChain, blueCursor, splineSamples[i], tx, ty);
-        const double yellowDist = NearestChainLateralDistance(yellowChain, yellowCursor, splineSamples[i], tx, ty);
+        const double blueDist =
+            NearestChainLateralDistance(blueChain, blueCursor, splineSamples[i], tx, ty, closed);
+        const double yellowDist =
+            NearestChainLateralDistance(yellowChain, yellowCursor, splineSamples[i], tx, ty, closed);
 
         double halfWidth;
         if (blueDist < 0.0 && yellowDist < 0.0)
@@ -166,6 +198,25 @@ std::vector<CorridorSample> ComputeCorridor(const std::vector<PathPoint> &spline
         {
             halfWidth = std::min(blueDist, yellowDist) - safetyMargin;
         }
+
+        // Tighten (never widen) against nearby orange gate cones -- see
+        // this function's declaration in corridor.hpp for why blue/yellow
+        // alone can leave the corridor wider than the actual gate
+        // passage. Plain per-cone scan, no chain/cursor: orange is sparse
+        // enough (trackdrive.sdf has exactly 2) that this is cheap and
+        // there's no fold-back ambiguity to guard against.
+        for (const WorldCone &o : orange)
+        {
+            const double odx = o.x - splineSamples[i].x;
+            const double ody = o.y - splineSamples[i].y;
+            const double oLongitudinal = odx * tx + ody * ty;
+            if (std::abs(oLongitudinal) < kLongitudinalWindow)
+            {
+                const double oLateral = std::abs(-odx * ty + ody * tx);
+                halfWidth = std::min(halfWidth, oLateral - safetyMargin);
+            }
+        }
+
         halfWidth = std::clamp(halfWidth, minHalfWidth, maxHalfWidth);
 
         result.push_back(CorridorSample{splineSamples[i], tx, ty, halfWidth});
@@ -173,17 +224,37 @@ std::vector<CorridorSample> ComputeCorridor(const std::vector<PathPoint> &spline
 
     // Smooth the raw per-sample half-width -- see this function's own
     // declaration in corridor.hpp for why it's piecewise by construction.
+    // Closed: wraps modulo result.size(), same reasoning as the tangent
+    // and chain-search wraparound above -- otherwise the smoothing window
+    // would clamp at index 0/size-1 even though those aren't real
+    // boundaries on a closed loop, leaving a visible seam in the smoothed
+    // half-width right at wherever the sample array happens to start.
     std::vector<double> smoothed(result.size());
+    const int resultCount = static_cast<int>(result.size());
     for (size_t i = 0; i < result.size(); ++i)
     {
-        const size_t lo = (i >= static_cast<size_t>(kSmoothingWindow)) ? i - static_cast<size_t>(kSmoothingWindow) : 0;
-        const size_t hi = std::min(result.size() - 1, i + static_cast<size_t>(kSmoothingWindow));
         double sum = 0.0;
-        for (size_t j = lo; j <= hi; ++j)
+        int count = 0;
+        if (closed)
         {
-            sum += result[j].halfWidth;
+            for (int off = -kSmoothingWindow; off <= kSmoothingWindow; ++off)
+            {
+                const int j = ((static_cast<int>(i) + off) % resultCount + resultCount) % resultCount;
+                sum += result[static_cast<size_t>(j)].halfWidth;
+                ++count;
+            }
         }
-        smoothed[i] = sum / static_cast<double>(hi - lo + 1);
+        else
+        {
+            const size_t lo = (i >= static_cast<size_t>(kSmoothingWindow)) ? i - static_cast<size_t>(kSmoothingWindow) : 0;
+            const size_t hi = std::min(result.size() - 1, i + static_cast<size_t>(kSmoothingWindow));
+            for (size_t j = lo; j <= hi; ++j)
+            {
+                sum += result[j].halfWidth;
+                ++count;
+            }
+        }
+        smoothed[i] = sum / static_cast<double>(count);
     }
     for (size_t i = 0; i < result.size(); ++i)
     {

@@ -84,6 +84,39 @@ private:
     double m_anchorY = 0.0;
     int m_cyclesSinceAnchor = 0;
     int m_reverseCyclesRemaining = 0;
+    // One-way latch: once the stuck watchdog fires, STAYS stopped forever
+    // (this process's lifetime) rather than resuming normal driving after
+    // the log-throttle reset below. Confirmed live (2026-09-01) as a real,
+    // not theoretical, gap: without this, m_cyclesSinceAnchor resetting to
+    // 0 purely to throttle repeated [STUCK] log spam ALSO silently let the
+    // very next cycle fall through to normal path-following again (neither
+    // the "real progress" nor the "still stuck" branch matched right after
+    // a reset), so a genuinely, permanently wedged car oscillated between
+    // one cycle of a real stop and ~kStuckCyclesBeforeReverse cycles of
+    // full normal driving commands, forever -- never actually holding
+    // position the way the log message ("holding position, needs external
+    // reset") claimed. See Compute()'s own comment at the trigger site.
+    bool m_permanentlyStuck = false;
+    // Independent, LONGER-timescale stuck check, alongside the short-term
+    // rolling-anchor one above -- confirmed live (2026-09-01) as
+    // necessary, not redundant: the short-term anchor ROLLS FORWARD any
+    // time displacement crosses kStuckDistanceThreshold (0.3m), which is
+    // exactly right for not penalizing genuine driving, but is vulnerable
+    // to small NOISE/WOBBLE (e.g. wheels spinning against a real physical
+    // block, rocking the chassis) randomly walking past 0.3m from a
+    // constantly-chasing anchor before kStuckCyclesBeforeReverse cycles
+    // ever elapse -- confirmed directly: ground truth AND /estimated_pose
+    // both agreed the car sat in the same ~0.3m patch for 120+ seconds,
+    // continuously commanding ~4.8 m/s forward, while the short-term
+    // watchdog never fired even once. This check instead snapshots
+    // position only every kLongTermStuckWindow cycles (not continuously
+    // rolling), so genuine noise can't perpetually reset it -- it only
+    // resets when the car has ACTUALLY covered real ground since the last
+    // snapshot.
+    bool m_haveLongTermAnchor = false;
+    double m_longTermAnchorX = 0.0;
+    double m_longTermAnchorY = 0.0;
+    int m_cyclesSinceLongTermAnchor = 0;
     // Reverse ATTEMPT number in the current stuck episode -- 0 the first
     // time reverse triggers; increments each time the car gets stuck AGAIN
     // without any real (kStuckDistanceThreshold) progress happening since

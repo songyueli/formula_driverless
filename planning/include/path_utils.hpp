@@ -58,6 +58,23 @@ std::vector<PathPoint> EnforceMinTurnRadius(std::vector<PathPoint> waypoints);
 // for that same behavior; the landmark-based pipeline starts from the
 // vehicle's own world position instead). See path_utils.cpp for why a plain
 // x-sort breaks at a hairpin.
-std::vector<PathPoint> OrderWaypointsByTraversal(std::vector<PathPoint> _waypoints,
-                                                  PathPoint _cursor);
+//
+// _maxHopDistance defaults to kMaxPairDistance -- every existing caller's
+// behavior is unchanged. A caller ordering a FULL-TRACK single-color chain
+// (not this project's original small-window use case) can pass a larger
+// value: confirmed live (2026-08-31) as a real, not theoretical, need --
+// this track's own blue boundary has a genuine cone-to-cone gap just over
+// 8.0m somewhere (measured directly from live /estimated_landmarks data),
+// which the default cap broke the chain at, leaving 38 of 99 blue
+// landmarks completely unreached and truncating the closed-loop midpoint
+// chain to barely more than half the track. Raise with real caution, not
+// generously: this is still the same hairpin-fold-back safety margin the
+// default value protects (see this function's own header comment) -- a
+// same-color chain crossing back near itself at a tight hairpin apex could
+// plausibly sit within a few meters, so an oversized cap risks the exact
+// wrong-side hop this parameter exists to prevent. Use the smallest value
+// confirmed (via direct replay against real landmark data) to actually
+// close the chain in question, not an arbitrary generous bump.
+std::vector<PathPoint> OrderWaypointsByTraversal(std::vector<PathPoint> _waypoints, PathPoint _cursor,
+                                                  double _maxHopDistance = kMaxPairDistance);
 }  // namespace fsd

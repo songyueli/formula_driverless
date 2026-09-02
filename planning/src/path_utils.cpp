@@ -170,8 +170,8 @@ std::vector<PathPoint> EnforceMinTurnRadius(std::vector<PathPoint> waypoints)
 // exact zigzag this exists to remove. Points the walk can't reach within
 // that cap are left out rather than forced in with a bad hop, matching this
 // pipeline's "no match is better than a bad match" philosophy.
-std::vector<PathPoint> OrderWaypointsByTraversal(std::vector<PathPoint> _waypoints,
-                                                  PathPoint _cursor)
+std::vector<PathPoint> OrderWaypointsByTraversal(std::vector<PathPoint> _waypoints, PathPoint _cursor,
+                                                  double _maxHopDistance)
 {
     std::vector<PathPoint> ordered;
     ordered.reserve(_waypoints.size());
@@ -182,7 +182,7 @@ std::vector<PathPoint> OrderWaypointsByTraversal(std::vector<PathPoint> _waypoin
     for (size_t step = 0; step < _waypoints.size(); ++step)
     {
         int bestIdx = -1;
-        double bestDistSq = kMaxPairDistance * kMaxPairDistance;
+        double bestDistSq = _maxHopDistance * _maxHopDistance;
         for (size_t i = 0; i < _waypoints.size(); ++i)
         {
             if (used[i])

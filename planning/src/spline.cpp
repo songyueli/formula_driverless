@@ -111,4 +111,65 @@ std::vector<PathPoint> FitAndSampleSpline(const std::vector<PathPoint> &points, 
     }
     return sampled;
 }
+
+std::vector<PathPoint> FitAndSampleClosedSpline(const std::vector<PathPoint> &points, double sampleSpacing)
+{
+    const size_t n = points.size();
+    if (n < 4)
+    {
+        return points;  // not enough for even one real Catmull-Rom segment
+    }
+
+    // Every control point wraps modulo n -- no phantom endpoints, unlike
+    // the open version, because a closed loop has no real end to
+    // extrapolate past (see this function's own header comment).
+    std::vector<PathPoint> dense;
+    dense.reserve(n * static_cast<size_t>(kSubStepsPerSegment) + 1);
+    dense.push_back(points[0]);
+    for (size_t i = 0; i < n; ++i)
+    {
+        const PathPoint &p0 = points[(i + n - 1) % n];
+        const PathPoint &p1 = points[i];
+        const PathPoint &p2 = points[(i + 1) % n];
+        const PathPoint &p3 = points[(i + 2) % n];
+        const double t0 = 0.0;
+        const double t1 = t0 + SegmentParamStep(p0, p1);
+        const double t2 = t1 + SegmentParamStep(p1, p2);
+        const double t3 = t2 + SegmentParamStep(p2, p3);
+        for (int s = 1; s <= kSubStepsPerSegment; ++s)
+        {
+            const double u = static_cast<double>(s) / kSubStepsPerSegment;
+            const double t = t1 + u * (t2 - t1);
+            dense.push_back(CatmullRomEval(p0, p1, p2, p3, t0, t1, t2, t3, t));
+        }
+    }
+    // The loop above's final segment (i = n-1) evaluates up to p2 =
+    // points[0] at u=1, so dense's very last point exactly duplicates
+    // dense.front(). Drop it: the arc-length walk below should measure the
+    // loop's true circumference without a zero-length final step, and the
+    // output shouldn't carry a redundant point at the seam -- downstream
+    // callers wrap via modulo (see header comment), so sampled[0] already
+    // IS the point right after this dropped duplicate.
+    dense.pop_back();
+
+    std::vector<PathPoint> sampled;
+    sampled.push_back(dense.front());
+    double accumulated = 0.0;
+    for (size_t i = 1; i < dense.size(); ++i)
+    {
+        const double dx = dense[i].x - dense[i - 1].x;
+        const double dy = dense[i].y - dense[i - 1].y;
+        accumulated += std::sqrt(dx * dx + dy * dy);
+        if (accumulated >= sampleSpacing)
+        {
+            sampled.push_back(dense[i]);
+            accumulated = 0.0;
+        }
+    }
+    // No forced final "reach the endpoint" push (unlike the open version):
+    // the endpoint of a closed loop IS sampled[0], already covered. The gap
+    // from sampled.back() wrapping back to sampled[0] is just whatever's
+    // left over (<sampleSpacing), same as every other inter-sample gap.
+    return sampled;
+}
 }  // namespace fsd

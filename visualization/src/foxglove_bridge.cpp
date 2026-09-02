@@ -1272,6 +1272,36 @@ int main(int argc, char **argv)
         {
             line.points.push_back(foxglove::messages::Point3{pose.position().x(), pose.position().y(), 0.15});
         }
+        // LINE_STRIP never draws a segment from the last point back to the
+        // first on its own -- confirmed live (2026-09-01) as the source of
+        // a real user-visible complaint ("the midpoints path is not
+        // actually closed around the track") even once planning.cpp's own
+        // closed-loop data genuinely does wrap (first/last points only a
+        // couple meters apart, not the tens-of-meters gap a real open
+        // windowed path has). Auto-detect "this is a closed loop" purely
+        // from the geometry already in the message -- this file has no
+        // other signal for it (the same topics carry BOTH the windowed/
+        // open pre-lap data and the closed post-lap data depending on
+        // planning.cpp's own internal state, which isn't published
+        // anywhere) -- and duplicate the first point onto the end so the
+        // rendered strip visually closes. kClosedLoopGapThreshold is
+        // generous past ordinary closed-loop wrap gaps (confirmed live:
+        // 0.05-2m) while comfortably under how far apart a genuinely open
+        // windowed path's own two ends normally sit (tens of meters, since
+        // one end is near the vehicle and the other is out at the edge of
+        // the query window).
+        constexpr double kClosedLoopGapThreshold = 5.0;  // meters
+        if (line.points.size() >= 3)
+        {
+            const auto &first = line.points.front();
+            const auto &last = line.points.back();
+            const double dx = last.x - first.x;
+            const double dy = last.y - first.y;
+            if (std::sqrt(dx * dx + dy * dy) < kClosedLoopGapThreshold)
+            {
+                line.points.push_back(first);
+            }
+        }
         if (line.points.size() >= 2)
         {
             entity.lines.push_back(line);

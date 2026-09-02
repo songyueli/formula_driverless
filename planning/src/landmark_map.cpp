@@ -71,4 +71,23 @@ LandmarkMap::WindowResult LandmarkMap::QueryWindow(double _radius) const
     }
     return result;
 }
+
+LandmarkMap::WindowResult LandmarkMap::QueryAll() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    WindowResult result;
+    result.vehiclePose = m_pose;
+    result.poseValid = m_poseValid;
+    for (const auto &cone : m_landmarks)
+    {
+        switch (cone.color)
+        {
+            case ConeColor::Blue:   result.blue.push_back(cone);   break;
+            case ConeColor::Yellow: result.yellow.push_back(cone); break;
+            case ConeColor::Orange: result.orange.push_back(cone); break;
+            default: break;
+        }
+    }
+    return result;
+}
 }  // namespace fsd

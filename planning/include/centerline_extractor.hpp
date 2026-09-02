@@ -41,4 +41,34 @@ using MidpointExtractorFn = std::function<std::vector<PathPoint>(
 std::vector<PathPoint> TwoPointMidpointExtractor(const std::vector<WorldCone> &blue,
                                                   const std::vector<WorldCone> &yellow,
                                                   const Pose2D &vehiclePose);
+
+// Full-track counterpart, used once a lap completes (see lap_detector.hpp)
+// when blue/yellow span the WHOLE track (~100-200+ candidates each)
+// instead of a small local window. TwoPointMidpointExtractor's GLOBAL
+// mutual-nearest-neighbor search doesn't scale to that: confirmed live
+// (2026-08-31) that at full-track scale, far more pairs fail the strict
+// reciprocal-match requirement (many more candidates competing globally
+// for each match, vs. a handful in a local window), and
+// OrderWaypointsByTraversal's own hop-distance cap then stops the
+// resulting chain early at the first real gap -- only 11 of ~200+ raw
+// cones survived, forming a short arc, not a loop.
+//
+// This extractor never does a global search at all: order EACH COLOR's
+// cones into its own chain independently first (OrderWaypointsByTraversal,
+// same proven technique corridor.cpp's BuildChain already uses
+// successfully at this same full-track scale), then walk the blue chain
+// in its own already-correct order and, for each point, find its paired
+// yellow via a LOCAL, cursor-advancing index window into the yellow chain
+// -- the same anti-fold-back discipline corridor.cpp's
+// NearestChainLateralDistance already relies on (a window can only ever
+// advance a few indices per step, so it can't jump across a hairpin
+// fold-back to a same-color-adjacent-but-wrong-side candidate). Both
+// chains' own traversal starts near the vehicle's current position, so
+// their index-0 entries are already reasonably close to each other --
+// a sound starting alignment for the cursor. Output is implicitly in
+// travel order already (blueChain's own order), no separate
+// OrderWaypointsByTraversal pass needed on the result.
+std::vector<PathPoint> ClosedLoopMidpointExtractor(const std::vector<WorldCone> &blue,
+                                                    const std::vector<WorldCone> &yellow,
+                                                    const Pose2D &vehiclePose);
 }  // namespace fsd

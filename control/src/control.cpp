@@ -1,3 +1,4 @@
+#include <chrono>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -61,6 +62,22 @@ int main()
 {
     gz::transport::Node node;
     ActiveController controller;
+
+    // Startup hold: no forward velocity (or yaw rate) is actually applied
+    // to the vehicle for the first kStartupHoldSeconds after this process
+    // starts, regardless of what the controller itself computes -- gives
+    // localization/perception a fixed window to stabilize before the car
+    // is allowed to move, rather than potentially acting on a still-
+    // converging early pose/landmark estimate. Wall-clock (steady_clock),
+    // not a cycle count, since the ask is specifically "N seconds", and
+    // cycle rate varies with planning/perception load. The controller's
+    // OWN internal state (m_lastSpeed, stuck-detection anchors, etc.)
+    // still updates normally from whatever it actually computed each
+    // cycle during the hold -- only the PUBLISHED command is overridden
+    // to a full stop -- so there's no special-cased "resume" behavior
+    // needed once the hold ends.
+    constexpr double kStartupHoldSeconds = 3.0;
+    const auto startTime = std::chrono::steady_clock::now();
 
     auto cmdPub = node.Advertise<gz::msgs::Twist>("/cmd_ackermann");
 
@@ -128,9 +145,17 @@ int main()
 
         const DriveCommand cmd = controller.Compute(inputs);
 
+        // See kStartupHoldSeconds's own comment above -- the controller
+        // still computed cmd normally (its internal state stays
+        // consistent), only the published twist is held at zero during
+        // the startup window.
+        const double elapsedSeconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+        const bool inStartupHold = elapsedSeconds < kStartupHoldSeconds;
+
         gz::msgs::Twist twist;
-        twist.mutable_linear()->set_x(cmd.speed);
-        twist.mutable_angular()->set_z(cmd.yawRate);
+        twist.mutable_linear()->set_x(inStartupHold ? 0.0 : cmd.speed);
+        twist.mutable_angular()->set_z(inStartupHold ? 0.0 : cmd.yawRate);
         cmdPub.Publish(twist);
 
         gz::msgs::Pose targetMsg;

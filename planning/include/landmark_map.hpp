@@ -56,6 +56,14 @@ public:
     // but still use them for clearance.
     WindowResult QueryWindow(double _radius) const;
 
+    // Every landmark ever seen, no radius/forward-facing filter -- used
+    // once a lap completes (see lap_detector.hpp) to build the full-track
+    // CLOSED-LOOP racing line instead of a local window. Reuses
+    // WindowResult's shape (blue/yellow/orange + pose) even though nothing
+    // here is actually "windowed" -- same fields callers already know how
+    // to consume.
+    WindowResult QueryAll() const;
+
 private:
     mutable std::mutex m_mutex;
     std::vector<WorldCone> m_landmarks;
