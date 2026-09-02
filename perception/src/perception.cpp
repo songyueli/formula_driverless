@@ -16,6 +16,7 @@
 #endif
 #include "lidar_projector.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -258,6 +259,79 @@ const cv::Scalar kClassColorsRgb[] = {
                                // from orange at a glance)
 };
 
+// BUG FIX (2026-09-01): confirmed live -- the model's own baked-in NMS
+// regularly leaves two overlapping same-class boxes for what a person
+// would call one detection (831 same-class pairs with IoU > 0.3 in one
+// ~10-minute run, via direct log analysis), NOT confined to the panorama
+// edges kPanoEdgeMarginPx already guards -- these occur at arbitrary
+// x-positions across the whole image. Each such pair independently reaches
+// LidarProjector::Localize() and, when their (slightly different) boxes
+// happen to pick up DIFFERENT nearby lidar returns, produces two DIFFERENT
+// world positions for what is really one physical cone -- exactly the
+// downstream symptom reported live: cones "populated where they shouldn't
+// be" and a corridor/racing-line that goes wrong, concentrated on this
+// track's sharp hairpin, where cone density in-frame is highest and this
+// kind of double-box is most likely. This is a second, general instance of
+// the exact bug kPanoEdgeMarginPx's own comment already describes ("two
+// near-identical boxes... exactly the kind of duplicate a downstream SLAM
+// landmark gate can't distinguish from two real nearby cones") -- kept
+// separate from that edge-specific exclusion rather than folded into it,
+// since the mechanism (imperfect NMS) and the fix (suppress the weaker
+// duplicate) are both different from "this box is only partially in
+// frame".
+//
+// Greedy, same-class-only NMS: highest confidence first, suppressing any
+// remaining same-class box whose IoU with it exceeds kDuplicateBoxIouThreshold.
+// 0.3 is comfortably below the overlap two genuinely DISTINCT cones could
+// ever produce (their screen-space boxes essentially never overlap at all
+// unless one is occluding the other, a different, rarer case this isn't
+// meant to address) and comfortably above the ordinary jitter between two
+// YOLO passes over the same true object (0.53-0.94 IoU measured directly
+// in the confirmed duplicate pairs above).
+constexpr float kDuplicateBoxIouThreshold = 0.3f;
+
+template <typename DetectionT>
+float DetectionIou(const DetectionT &_a, const DetectionT &_b)
+{
+    const float ix1 = std::max(_a.x1, _b.x1);
+    const float iy1 = std::max(_a.y1, _b.y1);
+    const float ix2 = std::min(_a.x2, _b.x2);
+    const float iy2 = std::min(_a.y2, _b.y2);
+    const float iw = std::max(0.0f, ix2 - ix1);
+    const float ih = std::max(0.0f, iy2 - iy1);
+    const float inter = iw * ih;
+    const float areaA = (_a.x2 - _a.x1) * (_a.y2 - _a.y1);
+    const float areaB = (_b.x2 - _b.x1) * (_b.y2 - _b.y1);
+    const float unionArea = areaA + areaB - inter;
+    return unionArea > 0.0f ? inter / unionArea : 0.0f;
+}
+
+template <typename DetectionT>
+std::vector<DetectionT> SuppressDuplicateBoxes(std::vector<DetectionT> _detections)
+{
+    std::sort(_detections.begin(), _detections.end(),
+              [](const DetectionT &_a, const DetectionT &_b) { return _a.confidence > _b.confidence; });
+    std::vector<DetectionT> kept;
+    kept.reserve(_detections.size());
+    for (const auto &d : _detections)
+    {
+        bool suppressed = false;
+        for (const auto &k : kept)
+        {
+            if (k.classId == d.classId && DetectionIou(k, d) > kDuplicateBoxIouThreshold)
+            {
+                suppressed = true;
+                break;
+            }
+        }
+        if (!suppressed)
+        {
+            kept.push_back(d);
+        }
+    }
+    return kept;
+}
+
 gz::msgs::Image ToImageMsg(const cv::Mat &_img)
 {
     gz::msgs::Image msg;
@@ -488,7 +562,12 @@ int main()
         // types (no shared base), so this must deduce via auto rather than
         // naming either one explicitly.
         const auto detectStart = std::chrono::steady_clock::now();
-        const auto detections = detector->Detect(stitched);
+        // SuppressDuplicateBoxes: see its own declaration above -- collapses
+        // the model's own near-duplicate same-class boxes before anything
+        // downstream (logging, lidar localization, publishing) ever sees
+        // them, rather than trying to reconcile two different world
+        // positions for one physical cone after the fact.
+        const auto detections = SuppressDuplicateBoxes(detector->Detect(stitched));
         publishTimingUs(detectTimingPub, std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - detectStart).count());
 
