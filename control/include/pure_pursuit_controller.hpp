@@ -154,5 +154,15 @@ private:
     // reachable from this header) -- the lookahead formula clamps to
     // kMinLookahead regardless, so 0.0 already produces the same
     // smallest-most-cautious-lookahead result on the very first cycle.
+    // Smoothed cycle-to-cycle (EMA, see kSpeedSmoothingAlpha in the .cpp)
+    // -- NOT the raw min(reactiveSpeed, previewSpeed) result, which is
+    // used directly to compute this same cycle's own commanded speed. See
+    // kSpeedSmoothingAlpha's own comment for why raw was insufficient once
+    // kBrakePreviewDistance's forward-preview scan was added: confirmed
+    // live as visible target-distance jitter (2.3-5.1m swings cycle to
+    // cycle) traced to the preview scan's own max-over-window statistic
+    // reacting to single-cycle path-shape noise from the reactive
+    // pipeline's own live recompute, which then fed back into THIS cycle's
+    // lookahead distance and made it jitter too.
     double m_lastSpeed = 0.0;
 };

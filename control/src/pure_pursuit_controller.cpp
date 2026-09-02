@@ -68,7 +68,18 @@ namespace
 // =1.0s means the adaptive formula wants exactly kMaxSpeed meters of
 // lookahead at full speed -- see kMaxLookahead's own comment for why
 // under-clamping this was already a confirmed real bug once, at 7.0).
-constexpr double kMaxSpeed = 8.0;  // m/s
+//
+// Stepping to 11.0 (2026-09-01): 8.0 was confirmed clean (chassis stayed
+// at the 0.31m baseline through both sharp corners and the hairpin, with
+// kBrakePreviewDistance's forward-preview braking added the same session)
+// AFTER the actual wedge root cause -- OrderWaypointsByTraversal's
+// hairpin-fold-back bug, see path_utils.cpp's own comment -- was found and
+// fixed, confirmed by a full clean lap (311.836m, zero stuck events) plus
+// continued clean driving into lap 2. kMaxLookahead's own headroom no
+// longer covers this step (9.0 < 11.0, the exact under-clamping pattern
+// already confirmed as a real bug once before at 7.0/6.0) -- raised
+// alongside it, see kMaxLookahead's own comment for the new value.
+constexpr double kMaxSpeed = 11.0;  // m/s
 // Floor speed at/beyond the vehicle's max steering angle. Raised from the
 // original 1.0 (2026-08-31, user report: "too slow") -- 1.0 was tuned
 // against the OLD raw-centerline path, which genuinely needed near-max
@@ -109,7 +120,12 @@ constexpr double kMinLookahead = 2.0;  // meters
 // itself. Left at 9.0 (headroom above kMaxSpeed) even though kMaxSpeed
 // itself was reverted to 5.0 below -- this constant was never implicated
 // in the rollover, no reason to also revert it.
-constexpr double kMaxLookahead = 9.0;  // meters
+//
+// Raised to 13.0 (2026-09-01) alongside kMaxSpeed's own step to 11.0 --
+// same ~2m headroom margin as the prior 9.0-for-8.0 pairing, keeping this
+// a genuine safety bound rather than a silent ceiling on the adaptive
+// formula (see this comment's own opening paragraph for why that matters).
+constexpr double kMaxLookahead = 13.0;  // meters
 
 // Forward-preview braking distance (2026-09-01) -- see its own use in
 // Compute() for why this exists (advance warning of an upcoming tight
@@ -121,7 +137,16 @@ constexpr double kMaxLookahead = 9.0;  // meters
 // spacing = 30m), while still being within the ~20m range perception
 // itself trusts (lidar_projector.cpp's kMaxValidRange) for the open/
 // reactive pipeline's shorter published path.
-constexpr double kBrakePreviewDistance = 15.0;  // meters
+//
+// Raised to 20.0 (2026-09-01) alongside kMaxSpeed's step to 11.0 -- kept
+// at the same ratio above kMaxLookahead as before (was 15/9 =~ 1.67x; 20/13
+// =~ 1.54x, close enough) so the margin between "reactive" and "preview"
+// horizons doesn't shrink as speed climbs. Capped at 20.0 rather than
+// scaled further: this is lidar_projector.cpp's own kMaxValidRange ceiling
+// (see the paragraph above) -- the open/reactive pipeline's published path
+// realistically can't extend meaningfully past there regardless of this
+// constant's own value, since no trusted cone data exists beyond it.
+constexpr double kBrakePreviewDistance = 20.0;  // meters
 
 // Bicycle-model geometry for converting curvature to a real steering angle
 // -- same wheel_base and steering_limit as
@@ -572,7 +597,30 @@ DriveCommand PurePursuitController::Compute(const ControlInputs &inputs)
 
     const double reactiveSpeed = kMaxSpeed - (kMaxSpeed - kMinSpeed) * steeringFraction;
     const double previewSpeed = kMaxSpeed - (kMaxSpeed - kMinSpeed) * previewSteeringFraction;
-    const double speed = std::min(reactiveSpeed, previewSpeed);
+    const double rawSpeed = std::min(reactiveSpeed, previewSpeed);
+
+    // Smoothing (2026-09-01): confirmed live as necessary once
+    // kBrakePreviewDistance's forward-preview scan was added -- the raw
+    // min() above is a max-over-window statistic recomputed from scratch
+    // every cycle against the reactive pipeline's own freshly-recomputed
+    // path, so a single momentarily-noisy waypoint (ordinary landmark
+    // jitter, not a real corner) can yank rawSpeed down hard for one cycle
+    // and let it bounce back the next -- confirmed directly via
+    // /control/debug_target: the published target's own distance from the
+    // car swinging 2.3-5.1m cycle to cycle, a direct, visible symptom
+    // since lookahead distance is proportional to m_lastSpeed. A light EMA
+    // damps that single-cycle noise while still tracking a REAL, sustained
+    // speed change (entering/exiting an actual corner) within a handful of
+    // cycles -- kSpeedSmoothingAlpha=0.3 gives a settling time constant of
+    // roughly 3 cycles (~0.3-0.4s at this pipeline's ~9-10Hz rate), fast
+    // enough to still brake for a genuine tight corner in time, slow
+    // enough to reject a one-cycle blip. m_lastSpeed starts at 0.0 (see
+    // its own header comment) but has several cycles to converge during
+    // control.cpp's own 3s startup hold before any command actually
+    // matters, so the cold-start bias this could otherwise cause is a
+    // non-issue in practice.
+    constexpr double kSpeedSmoothingAlpha = 0.3;
+    const double speed = kSpeedSmoothingAlpha * rawSpeed + (1.0 - kSpeedSmoothingAlpha) * m_lastSpeed;
     const double yawRate = speed * curvature;
 
     m_lastSpeed = speed;  // for NEXT cycle's lookahead distance
