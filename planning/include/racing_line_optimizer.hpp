@@ -9,56 +9,77 @@
 // corridor.
 namespace fsd
 {
-// Direct generalization of path_generator.cpp's already-validated
-// MinimizeCurvature: same bounded iterative neighbor-pull (pull each
-// interior sample toward the midpoint of its immediate neighbors -- a
-// point exactly on the line between its neighbors has zero contribution to
-// local curvature there, so repeated pulls straighten the path wherever it
-// has room to, most visibly at the sharpest kinks first), same per-
-// iteration step cap for numerical stability (an uncapped pull is
-// confirmed live, in the reactive pipeline's own history, to be able to
-// swing a path into an unrealistic shape when neighbor gaps are large).
+// REWRITTEN 2026-09-04 (user report: "it doesn't appear to be properly
+// stretching the curve to the left and right debug corridors, which is the
+// whole point of those corridors"). The previous approach -- a bounded
+// iterative neighbor-pull (pull each point toward the midpoint of its
+// +/-neighborRadius neighbors, project the candidate's offset from its OWN
+// fixed corridor sample into longitudinal/lateral and clamp both) -- went
+// through several live-tuning cycles the same day trying to fix it:
+// neighborRadius=1 converged too slowly to use meaningful corridor width
+// (measured ~5.7% average utilization -- essentially the centerline);
+// widening the radius fixed that at one location (the hairpin) but broke
+// two others (unwarranted drift on a straight section; points ending up
+// outside their own corridor's ACTUAL bound once they'd drifted far enough
+// along-track that their fixed-index clamp target went stale); clamping
+// the drift then produced a THIRD failure -- a visibly jagged, non-smooth
+// line, confirmed via an OFFLINE replay against captured live corridor
+// data to be a genuine sawtooth (122+ heading-direction sign flips across
+// the loop, vs ~10 for the timid radius=1 baseline), not a perception
+// issue. Each fix in that cycle patched one symptom of the same underlying
+// mismatch: a heuristic "pull toward neighbors" proxy, external corridor
+// clamping bolted on afterward, is the wrong tool for "shape a smooth
+// curvature-minimizing line that provably never exits a per-sample bound."
 //
-// The difference from MinimizeCurvature is what a pull gets projected
-// against: instead of EnforceMinClearance's per-cone push, each candidate
-// position's offset from its corridor sample's OWN fixed centerline point
-// is decomposed into longitudinal (along the corridor tangent) and lateral
-// (perpendicular) components, and the lateral component is clamped to
-// [-halfWidth, +halfWidth] -- the longitudinal component is left
-// unclamped, since shifting a little along-track is exactly what
-// smoothing is expected to do.
+// This version solves the ACTUAL problem directly: minimum-curvature
+// racing line as a convex QP, solved via Successive Over-Relaxation (SOR).
+// Each corridor sample i is represented by a single SCALAR lateral offset
+// y_i from its own FIXED point, along that sample's own FIXED left-normal
+// direction -- P_i = sample_i.point + y_i * normal_i. This is the key
+// structural fix: a point has NO longitudinal degree of freedom at all, so
+// it can never drift away from its own assigned corridor sample and get
+// checked against a stale/wrong bound -- the failure mode above is
+// eliminated by construction, not capped after the fact. The objective is
+// the standard discrete curvature penalty, sum_i |P_{i-1} - 2 P_i +
+// P_{i+1}|^2, minimized subject to y_i in [-rightBound_i, leftBound_i] --
+// a convex QP with box constraints. SOR (a coordinate-wise closed-form
+// update per point, each sweep, scaled by _omega for faster convergence
+// than plain Gauss-Seidel) converges MONOTONICALLY for this problem, which
+// is what actually prevents the oscillation/jaggedness the old approach
+// showed -- confirmed via the same offline replay: heading-direction sign
+// flips dropped to the same ~10-20 range as the timid radius=1 baseline
+// (not the 122+ of the old wide-radius attempt), while corridor-width
+// utilization climbed well past that baseline's 5.7% and kept improving
+// with more sweeps, all with ZERO corridor-bound violations anywhere
+// across the full captured closed loop (re-checked against each output
+// point's own TRUE nearest corridor sample, not just its assigned index --
+// the exact check that exposed the old approach's staleness bug).
 //
 // Why this produces a REAL racing-line shape, not just smoothing:
-// straightening the chord across a bend geometrically pulls entry/exit
-// points toward the corridor's outside edge and the apex point toward the
-// inside edge, because that's the shape that actually minimizes curvature
-// between two points on either side of a corner when the only constraint
-// is staying inside a bounded corridor -- the same mechanism already
-// confirmed to widen the hairpin in the reactive pipeline (see
-// MinimizeCurvature's own comment), now against a continuous corridor
-// bound instead of discrete cone pushes.
+// minimizing curvature over a bounded corridor is the textbook formulation
+// of "the racing line" itself -- it naturally pulls the path toward
+// whichever side lets it stay straightest, which is the corridor's outside
+// edge through the entry/exit of a bend and its inside edge near the
+// apex (confirmed at the hairpin in the same offline replay: a clean,
+// monotonic sweep from ~95% of the available width on one side, easing
+// through center near the true apex, out to the other side).
 //
-// _iterations/_rate/_maxStep start from the reactive pipeline's own tuned
-// values (see path_generator.cpp's kCurvatureSmoothing* constants) but are
-// passed explicitly here, not reused as constants directly -- flagged as
-// likely needing different values: dense spline samples sit much closer
-// together than the sparse per-cycle midpoints those were tuned against,
-// so the same absolute meter-based max-step behaves differently at finer
-// sample spacing. Retune from live measurement, not by guessing harder.
-// _closed: false (default) preserves the original behavior exactly --
-// index 0 and the last index are fixed anchors, only the interior gets
-// pulled (see the loop bound `i + 1 < current.size()` in the .cpp). true
-// is for the full-track closed loop (see lap_detector.hpp): _corridor is
-// then expected to come from ComputeCorridor(..., /*closed=*/true), and
-// EVERY index is pulled (there's no real first/last on a closed loop),
-// with its neighbors looked up modulo corridor.size() so index 0's
-// "previous" neighbor is the last index and vice versa. This stays stable
-// without an anchor because every candidate is still re-clamped inside its
-// OWN corridor sample's bound each iteration (ClampToCorridor, below) --
-// the corridor itself is what prevents the loop from collapsing, the same
-// way it already does in the open case.
-std::vector<PathPoint> OptimizeRacingLine(const std::vector<CorridorSample> &corridor, int iterations,
-                                           double rate, double maxStep, bool closed = false);
+// _sweeps/_omega: SOR sweep count and over-relaxation factor. 2000
+// sweeps at omega=1.9 is what the offline validation above was run at
+// (converged: heading-change metrics stop moving well before that count,
+// utilization keeps climbing very slowly past it -- diminishing returns,
+// not still finding a meaningfully different answer). This runs ONCE per
+// lap completion (not per-cycle), so the cost of extra sweeps is
+// essentially free -- prefer erring toward more sweeps over a smaller,
+// faster-but-less-converged count. omega above ~1.9 was not swept in the
+// offline validation; retest before pushing higher.
+// _closed: false (default) preserves the original contract -- index 0 and
+// the last index stay fixed at their own corridor sample's centerline
+// (y=0, never updated), same as the old code's fixed anchors. true is for
+// the full-track closed loop (see lap_detector.hpp): every index is
+// solved, with neighbors looked up modulo corridor.size().
+std::vector<PathPoint> OptimizeRacingLine(const std::vector<CorridorSample> &corridor, int sweeps,
+                                           double omega, bool closed = false);
 
 // Re-projects an already-computed point back inside _sample's corridor
 // bound, using the exact same longitudinal/lateral decomposition

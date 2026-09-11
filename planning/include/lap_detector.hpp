@@ -33,11 +33,17 @@
 // stuck. kMinLapDistance requires the car to have actually covered
 // meaningful ground before a return-to-start proximity hit is trusted.
 //
-// One-way latch, same convention as planning.cpp's own
-// landmarkPipelineActive: once a lap completes, stays completed --  a
+// One-way latch BY DEFAULT, same convention as planning.cpp's own
+// landmarkPipelineActive: once a lap completes, stays completed -- a
 // momentary GPS-noise-driven dip back near the start mid-lap (unlikely at
 // kReturnRadius's scale, but not impossible near a track section that
-// happens to pass close to the start) shouldn't un-complete it.
+// happens to pass close to the start) shouldn't un-complete it. Reset()
+// (2026-09-04) is the one opt-in exception -- a caller that explicitly
+// wants REPEATING lap detection (e.g. per-lap timing across an entire
+// race, not just the single pipeline-switch trigger this class was
+// originally built for) can call it after each observed completion to
+// re-arm for the next one. Never call Reset() on an instance also used for
+// the one-way pipeline-switch purpose -- use a separate instance instead.
 namespace fsd
 {
 class LapDetector
@@ -54,6 +60,24 @@ public:
     // output) confirm how much ground was actually covered before
     // trusting a "lap complete" result, without needing a separate topic.
     double DistanceTraveled() const { return m_distanceTraveled; }
+
+    // Re-arms this detector to find the NEXT lap completion, for callers
+    // that want REPEATING lap detection (2026-09-04, user request: "modify
+    // the lap counter so that it includes a last lap time") rather than
+    // the one-way-latch-forever behavior every other caller of this class
+    // relies on (see this class's own header comment -- planning.cpp's
+    // pipeline-switch instance must NEVER call this). Deliberately keeps
+    // m_startX/m_startY/m_haveStart unchanged -- the start/finish
+    // reference point is a fixed location on the track for every lap, only
+    // m_distanceTraveled and m_lapComplete need to clear so the SAME
+    // distance-gated leave-then-return logic (already proven correct for
+    // detecting lap 1) can fire again for lap 2, 3, etc. against that same
+    // fixed point.
+    void Reset()
+    {
+        m_distanceTraveled = 0.0;
+        m_lapComplete = false;
+    }
 
 private:
     bool m_haveStart = false;

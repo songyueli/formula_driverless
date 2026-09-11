@@ -15,17 +15,42 @@ struct CorridorSample
 {
     PathPoint point;             // spline sample position
     double tangentX, tangentY;   // unit tangent along the spline at this sample
-    double halfWidth;            // meters, lateral bound from the centerline
+    // Independent, asymmetric lateral bounds (left-positive convention,
+    // blue=left/yellow=right -- see ComputeCorridor's own comment for why
+    // this replaced a single symmetric halfWidth, 2026-09-02): how far the
+    // racing-line optimizer may push this sample toward blue (leftBound)
+    // and toward yellow (rightBound), independently. Each is already
+    // (distance to that side's own nearest boundary cone) - safetyMargin,
+    // so [-rightBound, +leftBound] is the actual clearance-safe interval,
+    // not an approximation of it.
+    double leftBound, rightBound;
 };
 
-// _safetyMargin subtracted from the raw measured half-width (same role as
-// path_generator.hpp's kMinCarClearance for the reactive pipeline);
-// _minHalfWidth/_maxHalfWidth clamp the result -- a floor guards against a
-// single jittery/mislocalized landmark collapsing the corridor to nothing,
-// a ceiling guards against a sparse-window region (few nearby landmarks)
-// letting the bound balloon out to "no real constraint", which would let
-// stage 4 cut a "racing line" through empty space the data simply doesn't
-// cover rather than because the track is actually that wide there.
+// _safetyMargin subtracted from each side's own raw measured distance (same
+// role as path_generator.hpp's kMinCarClearance for the reactive pipeline)
+// -- BUG FIX (2026-09-02): used to be subtracted from a single
+// min(blueDist, yellowDist), then the result clamped up to _minHalfWidth
+// regardless of which side was actually tight. Confirmed live as the
+// mechanism behind a real wedge: on this track's normal ~3.00m width, a
+// centered sample's true per-side room (~1.5m) minus a correctly-sized
+// safetyMargin (1.35m) is only ~0.15m -- BELOW _minHalfWidth (0.5m), so the
+// floor silently overrode the real clearance requirement and let stage 4
+// place the line up to 0.5m from a boundary cone anyway, well under the
+// 1.35m it was supposed to guarantee. Computing each side independently
+// (see CorridorSample's own comment) fixes this at the root instead of
+// papering over it with EnforceMinClearance's post-hoc push: a floor that
+// applies per side only kicks in when that side's chain has NO data at all
+// (see the "no boundary data" branch below), never as a blanket override of
+// a real, valid measurement. This also directly improves racing-line
+// utilization: when the two sides aren't equidistant (the normal case
+// anywhere but a razor-straight, perfectly centered stretch), stage 4 can
+// now use the FULL room on the wider side up to _maxHalfWidth instead of
+// being capped to whichever side is tighter, which a single symmetric bound
+// always did even when there was no reason to restrict the wide side too.
+// _maxHalfWidth still guards against a sparse-window region (few nearby
+// landmarks) letting a bound balloon out to "no real constraint", which
+// would let stage 4 cut a "racing line" through empty space the data simply
+// doesn't cover rather than because the track is actually that wide there.
 //
 // See corridor.cpp for the full algorithm: ordered per-color boundary
 // chains, walked with a monotonic per-color cursor and a small local
@@ -33,9 +58,9 @@ struct CorridorSample
 // same hairpin fold-back misattribution risk OrderWaypointsByTraversal
 // already had to solve elsewhere: a global search could pick up a
 // same-color landmark from across the fold, not the one that's actually
-// beside this sample), plus a moving-average smoothing pass over the raw
-// per-sample half-width (it's piecewise by construction -- jumps whenever
-// the nearest boundary landmark switches from one cone to the next as the
+// beside this sample), plus a moving-average smoothing pass over each raw
+// per-sample bound (piecewise by construction -- jumps whenever the
+// nearest boundary landmark switches from one cone to the next as the
 // sample index advances -- and an unsmoothed discontinuous bound would
 // make stage 4's clamp oscillate against it).
 // _closed: false (default) preserves the original windowed/open behavior
@@ -64,9 +89,11 @@ struct CorridorSample
 // Typically just 1-2 cones on the whole track (trackdrive.sdf has exactly
 // 2), so this is a simple per-sample scan against every orange cone, not
 // the chain/cursor machinery blue/yellow need -- no fold-back ambiguity
-// risk with so few points. halfWidth stays a single SYMMETRIC bound (see
-// CorridorSample), so a gate cone close on just one side also tightens
-// the other side -- over-conservative but safe.
+// risk with so few points. Deliberately kept as a SYMMETRIC tightening of
+// both leftBound and rightBound (unlike the asymmetric blue/yellow
+// treatment above) -- a gate cone close on just one side tightens the
+// other side too, over-conservative but safe, and gate cones are rare
+// enough that the utilization loss doesn't matter.
 std::vector<CorridorSample> ComputeCorridor(const std::vector<PathPoint> &splineSamples,
                                              const std::vector<WorldCone> &blue,
                                              const std::vector<WorldCone> &yellow,

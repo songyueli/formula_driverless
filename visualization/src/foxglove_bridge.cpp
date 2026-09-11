@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -18,13 +19,18 @@
 #include <gz/transport/Node.hh>
 #include <gz/msgs/boolean.pb.h>
 #include <gz/msgs/clock.pb.h>
+#include <gz/msgs/double.pb.h>
+#include <gz/msgs/double_v.pb.h>
 #include <gz/msgs/image.pb.h>
+#include <gz/msgs/marker.pb.h>
 #include <gz/msgs/model.pb.h>
 #include <gz/msgs/pointcloud_packed.pb.h>
 #include <gz/msgs/pose.pb.h>
 #include <gz/msgs/pose_v.pb.h>
 #include <gz/msgs/scene.pb.h>
+#include <gz/msgs/twist.pb.h>
 #include <gz/msgs/uint64.pb.h>
+#include <gz/msgs/vector3d.pb.h>
 #include <gz/msgs/world_control.pb.h>
 
 #include <opencv2/core.hpp>
@@ -855,8 +861,44 @@ int main(int argc, char **argv)
     // plugin config), so nothing here needs the rear pair.
     std::atomic<double> frontLeftSteerRad{0.0};
     std::atomic<double> frontRightSteerRad{0.0};
+
+    // STEERING-RESPONSE INSTRUMENTATION (2026-09-09, user request: measure
+    // actual vs. commanded steering directly, to test a suspected tracking-
+    // lag/understeer contribution to this session's own recurring hairpin-
+    // area wedges -- see pure_pursuit_controller.cpp's own history and
+    // model.sdf's steer_p_gain/damping history for why that suspicion
+    // exists, and why it was never directly instrumented before (the
+    // joint_state subscription above already existed, but only ever fed the
+    // 3D rendering, never a numeric comparison against what was actually
+    // commanded). /cmd_ackermann carries the commanded body twist
+    // (gz.msgs.Twist -- see control.cpp's own comment for why that message
+    // type, not a dedicated Ackermann one); tracked here purely to derive
+    // the steering angle the AckermannSteering plugin is itself targeting,
+    // via the identical bicycle-model relation the plugin uses internally.
+    std::atomic<double> lastCmdLinearX{0.0};
+    std::atomic<double> lastCmdAngularZ{0.0};
+    std::function<void(const gz::msgs::Twist &)> onCmdAckermann =
+        [&lastCmdLinearX, &lastCmdAngularZ](const gz::msgs::Twist &_msg)
+    {
+        lastCmdLinearX.store(_msg.linear().x(), std::memory_order_relaxed);
+        lastCmdAngularZ.store(_msg.angular().z(), std::memory_order_relaxed);
+    };
+    if (!node.Subscribe("/cmd_ackermann", onCmdAckermann))
+    {
+        std::cerr << "Failed to subscribe to /cmd_ackermann\n";
+        return 1;
+    }
+    // Throttle for the [STEER] trace below -- gated on SIM time (already
+    // tracked by lastSimTimeNs for the clock/playback-control handling
+    // above), not a raw message-count or wall-clock throttle, since
+    // joint_state's own publish rate isn't documented/guaranteed here and a
+    // wall-clock gate would drift relative to the sim under a paused or
+    // sped-up run.
+    std::atomic<uint64_t> lastSteerLogNs{0};
+
     std::function<void(const gz::msgs::Model &)> onJointState =
-        [&frontLeftSteerRad, &frontRightSteerRad](const gz::msgs::Model &_msg)
+        [&frontLeftSteerRad, &frontRightSteerRad, &lastCmdLinearX, &lastCmdAngularZ, &lastSimTimeNs,
+         &lastSteerLogNs](const gz::msgs::Model &_msg)
     {
         for (const auto &joint : _msg.joint())
         {
@@ -868,6 +910,39 @@ int main(int argc, char **argv)
             {
                 frontRightSteerRad.store(joint.axis1().position(), std::memory_order_relaxed);
             }
+        }
+
+        // kWheelBase MUST stay in sync with model.sdf's AckermannSteering
+        // plugin wheel_base (1.55m) -- same cross-file-constant convention
+        // this codebase already uses for e.g. pure_pursuit_controller.cpp's
+        // kTireFrictionAccel/kPluginMaxDeceleration, rather than trying to
+        // read it back out of the plugin's own live state.
+        constexpr double kWheelBase = 1.55;  // meters
+        const double linearX = lastCmdLinearX.load(std::memory_order_relaxed);
+        const double angularZ = lastCmdAngularZ.load(std::memory_order_relaxed);
+        // Commanded steering angle via the SAME bicycle-model relation the
+        // AckermannSteering plugin itself uses to convert a body twist into
+        // a steering joint target (curvature = angularZ/linearX, angle =
+        // atan(wheelBase*curvature)). Guarded at near-zero speed -- the
+        // curvature (and therefore this angle) is genuinely UNDEFINED there,
+        // not just numerically noisy, so a real near-stop cycle reads as "no
+        // comparison" (0) rather than a meaningless division-driven spike
+        // that would look like a huge tracking error but isn't one.
+        const double commandedSteerRad =
+            std::abs(linearX) > 0.05 ? std::atan(kWheelBase * angularZ / linearX) : 0.0;
+        const double actualSteerRad = frontLeftSteerRad.load(std::memory_order_relaxed);
+
+        const uint64_t nowNs = lastSimTimeNs.load(std::memory_order_relaxed);
+        const uint64_t lastLogNs = lastSteerLogNs.load(std::memory_order_relaxed);
+        constexpr uint64_t kSteerLogIntervalNs = 200000000ULL;  // 0.2s of SIM time
+        if (nowNs >= lastLogNs + kSteerLogIntervalNs)
+        {
+            lastSteerLogNs.store(nowNs, std::memory_order_relaxed);
+            constexpr double kRadToDeg = 180.0 / M_PI;
+            std::cerr << "[STEER] commanded=" << (commandedSteerRad * kRadToDeg)
+                      << "deg actual=" << (actualSteerRad * kRadToDeg)
+                      << "deg error=" << ((commandedSteerRad - actualSteerRad) * kRadToDeg)
+                      << "deg cmdLinearX=" << linearX << " cmdAngularZ=" << angularZ << '\n';
         }
     };
     if (!node.Subscribe(jointStateTopic, onJointState))
@@ -1482,6 +1557,282 @@ int main(int argc, char **argv)
     if (!node.Subscribe("/estimated_landmarks", onEstimatedLandmarks))
     {
         std::cerr << "Failed to subscribe to /estimated_landmarks\n";
+        return 1;
+    }
+
+    // Velocity/acceleration vector visualization + plotting (2026-09-02,
+    // user request) -- localization.cpp publishes 4 new gz-transport topics
+    // (/estimated_velocity[_marker], /estimated_acceleration[_marker] --
+    // see its own doc comment), but like everything else in this file they
+    // need an explicit subscribe+translate step to actually reach Foxglove;
+    // this bridge has no generic passthrough of arbitrary gz-transport
+    // topics.
+    //
+    // Plot-able numeric values: same RawChannel("json") pattern as /timing
+    // below -- Foxglove's Plot panel charts these via field path (e.g.
+    // /estimated_velocity_plot.x).
+    constexpr const char *kVectorSchemaJson =
+        R"({"type":"object","properties":{)"
+        R"("x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"}}})";
+    foxglove::Schema vectorSchema;
+    vectorSchema.name = "Vector3";
+    vectorSchema.encoding = "jsonschema";
+    vectorSchema.data = reinterpret_cast<const std::byte *>(kVectorSchemaJson);
+    vectorSchema.data_len = std::char_traits<char>::length(kVectorSchemaJson);
+
+    auto velocity_plot_result = foxglove::RawChannel::create("/estimated_velocity_plot", "json", vectorSchema);
+    if (!velocity_plot_result.has_value())
+    {
+        std::cerr << "Failed to create /estimated_velocity_plot channel: "
+                  << foxglove::strerror(velocity_plot_result.error()) << '\n';
+        return 1;
+    }
+    auto velocity_plot_channel = std::move(velocity_plot_result.value());
+
+    auto acceleration_plot_result =
+        foxglove::RawChannel::create("/estimated_acceleration_plot", "json", vectorSchema);
+    if (!acceleration_plot_result.has_value())
+    {
+        std::cerr << "Failed to create /estimated_acceleration_plot channel: "
+                  << foxglove::strerror(acceleration_plot_result.error()) << '\n';
+        return 1;
+    }
+    auto acceleration_plot_channel = std::move(acceleration_plot_result.value());
+
+    auto publishVectorPlot = [](foxglove::RawChannel &_channel, const gz::msgs::Vector3d &_msg)
+    {
+        char buf[128];
+        const int len = std::snprintf(buf, sizeof(buf), R"({"x":%.6f,"y":%.6f,"z":%.6f})", _msg.x(),
+                                       _msg.y(), _msg.z());
+        _channel.log(reinterpret_cast<const std::byte *>(buf), static_cast<size_t>(len));
+    };
+
+    std::function<void(const gz::msgs::Vector3d &)> onEstimatedVelocity =
+        [&velocity_plot_channel, &publishVectorPlot](const gz::msgs::Vector3d &_msg)
+    { publishVectorPlot(velocity_plot_channel, _msg); };
+    if (!node.Subscribe("/estimated_velocity", onEstimatedVelocity))
+    {
+        std::cerr << "Failed to subscribe to /estimated_velocity\n";
+        return 1;
+    }
+
+    std::function<void(const gz::msgs::Vector3d &)> onEstimatedAcceleration =
+        [&acceleration_plot_channel, &publishVectorPlot](const gz::msgs::Vector3d &_msg)
+    { publishVectorPlot(acceleration_plot_channel, _msg); };
+    if (!node.Subscribe("/estimated_acceleration", onEstimatedAcceleration))
+    {
+        std::cerr << "Failed to subscribe to /estimated_acceleration\n";
+        return 1;
+    }
+
+    // Lap timing (2026-09-03 user request, then "combine the lap time
+    // topics into a single topic with multiple variables") -- planning.cpp
+    // publishes gz.msgs.Double independently on /lap_time/elapsed (live,
+    // ticks every sim clock update) and /lap_time/first_lap (republished
+    // continuously once known -- see that file's own comment for why
+    // continuous, not one-shot). Combined into ONE Foxglove topic here,
+    // same aggregate-struct-plus-republish-on-any-update pattern /timing
+    // above already uses for perception/localization/planning/control --
+    // each field still updates independently as its own gz-transport topic
+    // ticks (different rates), but /lap_time always reflects the latest
+    // known value for both. Foxglove's Plot panel charts these via field
+    // path (e.g. /lap_time.elapsed_seconds).
+    constexpr const char *kLapTimeSchemaJson =
+        R"({"type":"object","properties":{)"
+        R"("elapsed_seconds":{"type":"number"},)"
+        R"("first_lap_seconds":{"type":"number"},)"
+        R"("last_lap_seconds":{"type":"number"},)"
+        R"("laps":{"type":"array","items":{"type":"number"}}}})";
+    foxglove::Schema lapTimeSchema;
+    lapTimeSchema.name = "LapTime";
+    lapTimeSchema.encoding = "jsonschema";
+    lapTimeSchema.data = reinterpret_cast<const std::byte *>(kLapTimeSchemaJson);
+    lapTimeSchema.data_len = std::char_traits<char>::length(kLapTimeSchemaJson);
+
+    auto lap_time_channel_result = foxglove::RawChannel::create("/lap_time", "json", lapTimeSchema);
+    if (!lap_time_channel_result.has_value())
+    {
+        std::cerr << "Failed to create /lap_time channel: "
+                  << foxglove::strerror(lap_time_channel_result.error()) << '\n';
+        return 1;
+    }
+    auto lap_time_channel = std::move(lap_time_channel_result.value());
+
+    struct LapTimeSeconds
+    {
+        double elapsed = 0.0;
+        double firstLap = 0.0;
+        double lastLap = 0.0;
+        // Fixed 10-slot lap history (2026-09-04, user request: "post the
+        // lap times as a fixed size array of length 10, since laps never
+        // exceed 10") -- mirrors planning.cpp's own kMaxTrackedLaps array
+        // exactly; index 0 = lap 1, not-yet-completed slots stay 0.0.
+        std::array<double, 10> laps{};
+    };
+    LapTimeSeconds lapTime;
+
+    auto publishLapTime = [&lap_time_channel, &lapTime]()
+    {
+        char buf[256];
+        int len = std::snprintf(buf, sizeof(buf),
+            R"({"elapsed_seconds":%.3f,"first_lap_seconds":%.3f,"last_lap_seconds":%.3f,"laps":[)",
+            lapTime.elapsed, lapTime.firstLap, lapTime.lastLap);
+        for (size_t i = 0; i < lapTime.laps.size(); ++i)
+        {
+            len += std::snprintf(buf + len, sizeof(buf) - static_cast<size_t>(len), "%s%.3f",
+                                  i == 0 ? "" : ",", lapTime.laps[i]);
+        }
+        len += std::snprintf(buf + len, sizeof(buf) - static_cast<size_t>(len), "]}");
+        lap_time_channel.log(reinterpret_cast<const std::byte *>(buf), static_cast<size_t>(len));
+    };
+
+    std::function<void(const gz::msgs::Double &)> onLapElapsed =
+        [&lapTime, &publishLapTime](const gz::msgs::Double &_msg)
+    {
+        lapTime.elapsed = _msg.data();
+        publishLapTime();
+    };
+    if (!node.Subscribe("/lap_time/elapsed", onLapElapsed))
+    {
+        std::cerr << "Failed to subscribe to /lap_time/elapsed\n";
+        return 1;
+    }
+
+    std::function<void(const gz::msgs::Double &)> onLapFirstLap =
+        [&lapTime, &publishLapTime](const gz::msgs::Double &_msg)
+    {
+        lapTime.firstLap = _msg.data();
+        publishLapTime();
+    };
+    if (!node.Subscribe("/lap_time/first_lap", onLapFirstLap))
+    {
+        std::cerr << "Failed to subscribe to /lap_time/first_lap\n";
+        return 1;
+    }
+
+    // /lap_time/last_lap (2026-09-04, user request: "modify the lap
+    // counter so that it includes a last lap time") -- planning.cpp
+    // publishes the most recently completed lap's own duration here,
+    // updating every lap, not just the first.
+    std::function<void(const gz::msgs::Double &)> onLapLastLap =
+        [&lapTime, &publishLapTime](const gz::msgs::Double &_msg)
+    {
+        lapTime.lastLap = _msg.data();
+        publishLapTime();
+    };
+    if (!node.Subscribe("/lap_time/last_lap", onLapLastLap))
+    {
+        std::cerr << "Failed to subscribe to /lap_time/last_lap\n";
+        return 1;
+    }
+
+    // /lap_time/laps (2026-09-04, user request: "post the lap times as a
+    // fixed size array of length 10") -- gz.msgs.Double_V (repeated
+    // double), always exactly 10 entries from planning.cpp's own side.
+    std::function<void(const gz::msgs::Double_V &)> onLapTimes =
+        [&lapTime, &publishLapTime](const gz::msgs::Double_V &_msg)
+    {
+        const int n = std::min(_msg.data_size(), static_cast<int>(lapTime.laps.size()));
+        for (int i = 0; i < n; ++i)
+        {
+            lapTime.laps[static_cast<size_t>(i)] = _msg.data(i);
+        }
+        publishLapTime();
+    };
+    if (!node.Subscribe("/lap_time/laps", onLapTimes))
+    {
+        std::cerr << "Failed to subscribe to /lap_time/laps\n";
+        return 1;
+    }
+
+    // 3D vector line visualization: translates localization.cpp's
+    // gz.msgs.Marker (2-point LINE_STRIP, VEHICLE-local frame -- see
+    // MakeVectorMarker's own comment there) into a Foxglove SceneUpdate,
+    // same LinePrimitive approach /planned_path already uses above. See
+    // publishVectorMarker's own comment below for why frame_id is
+    // kEstimatedFrameId, not kFrameId ("world") -- these two vectors are
+    // body-frame (2026-09-02 user request), not world-frame.
+    auto velocity_marker_channel_result =
+        foxglove::messages::SceneUpdateChannel::create("/estimated_velocity_marker");
+    if (!velocity_marker_channel_result.has_value())
+    {
+        std::cerr << "Failed to create /estimated_velocity_marker channel: "
+                  << foxglove::strerror(velocity_marker_channel_result.error()) << '\n';
+        return 1;
+    }
+    auto velocity_marker_channel = std::move(velocity_marker_channel_result.value());
+
+    auto acceleration_marker_channel_result =
+        foxglove::messages::SceneUpdateChannel::create("/estimated_acceleration_marker");
+    if (!acceleration_marker_channel_result.has_value())
+    {
+        std::cerr << "Failed to create /estimated_acceleration_marker channel: "
+                  << foxglove::strerror(acceleration_marker_channel_result.error()) << '\n';
+        return 1;
+    }
+    auto acceleration_marker_channel = std::move(acceleration_marker_channel_result.value());
+
+    auto publishVectorMarker = [](foxglove::messages::SceneUpdateChannel &_channel, const char *_id,
+                                   const foxglove::messages::Color &_color, const gz::msgs::Marker &_msg)
+    {
+        foxglove::messages::SceneEntity entity;
+        entity.timestamp = Now();
+        // kEstimatedFrameId (declared above, "fsd_car_estimated"), NOT
+        // kFrameId ("world") -- 2026-09-02, user request: velocity/
+        // acceleration are body-frame, not world-frame (see
+        // localization.cpp's own comment on why it stopped rotating them).
+        // A body-frame vector only means anything drawn relative to the
+        // vehicle's OWN moving/rotating frame -- anchoring to world would
+        // draw it "in some absolute direction" that's only meaningful
+        // relative to whichever way the car happened to be pointed at that
+        // instant. This frame already has a live world transform published
+        // via /tf (see onEstimatedPose above), so Foxglove places/rotates
+        // this line with the car automatically -- the marker's own two
+        // points, published by localization.cpp, are local vehicle-frame
+        // coordinates, not world ones.
+        entity.frame_id = kEstimatedFrameId;
+        entity.id = _id;
+
+        foxglove::messages::LinePrimitive line;
+        line.type = foxglove::messages::LinePrimitive::LineType::LINE_STRIP;
+        line.thickness = 0.05;
+        line.scale_invariant = false;
+        line.color = _color;
+        for (const auto &pt : _msg.point())
+        {
+            line.points.push_back(foxglove::messages::Point3{pt.x(), pt.y(), pt.z()});
+        }
+        if (line.points.size() >= 2)
+        {
+            entity.lines.push_back(line);
+        }
+
+        foxglove::messages::SceneUpdate update;
+        update.entities.push_back(std::move(entity));
+        _channel.log(update);
+    };
+
+    std::function<void(const gz::msgs::Marker &)> onVelocityMarker =
+        [&velocity_marker_channel, &publishVectorMarker](const gz::msgs::Marker &_msg)
+    {
+        publishVectorMarker(velocity_marker_channel, "velocity", foxglove::messages::Color{0.0, 1.0, 0.0, 1},
+                             _msg);  // green
+    };
+    if (!node.Subscribe("/estimated_velocity_marker", onVelocityMarker))
+    {
+        std::cerr << "Failed to subscribe to /estimated_velocity_marker\n";
+        return 1;
+    }
+
+    std::function<void(const gz::msgs::Marker &)> onAccelerationMarker =
+        [&acceleration_marker_channel, &publishVectorMarker](const gz::msgs::Marker &_msg)
+    {
+        publishVectorMarker(acceleration_marker_channel, "acceleration",
+                             foxglove::messages::Color{1.0, 0.0, 0.0, 1}, _msg);  // red
+    };
+    if (!node.Subscribe("/estimated_acceleration_marker", onAccelerationMarker))
+    {
+        std::cerr << "Failed to subscribe to /estimated_acceleration_marker\n";
         return 1;
     }
 

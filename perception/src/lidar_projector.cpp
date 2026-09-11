@@ -196,6 +196,68 @@ constexpr float kClusterRangeBand = 0.4f; // meters
 // same measurement) -- this stays a pure radial (horizontal-range-only, z
 // uncorrected) correction, not a 2-D one, for the same reason as before.
 constexpr float kConeSurfaceToAxisCorrection = -0.088f; // meters
+
+// BUG FIX (2026-09-01): closes the actual gap every prior Localize() pass
+// leaves open -- see this file's own class comment above ("no notion of
+// whether that point is actually a good depth match for what's IN the
+// box"). Every existing pass only ever checks properties of the CANDIDATE
+// points themselves (range band, spatial spread, z-spread); none of them
+// ever asks whether the resulting CENTROID actually corresponds to
+// whatever the vision model drew this box around. Confirmed live as a
+// real, distinct failure mode from the far-range one kMinBoxWidthFor
+// Localization (perception.cpp) already closes: a ghost landmark found
+// sitting almost exactly on top of the vehicle itself, at a mid-range,
+// decent-confidence, reasonably-sized box -- none of the existing gates
+// would have rejected it, since nothing about the CANDIDATE points looked
+// wrong in isolation. The only way to catch this is to check the
+// RESULT: reproject the centroid back through the exact same lidar
+// point -> pixel transform SetPointCloud() itself uses, and require it to
+// land back inside the ORIGINAL detection box -- if it doesn't, the
+// accepted points cannot actually be surface returns off whatever the
+// vision model saw there, regardless of how clean the cluster otherwise
+// looks. cx/cy/cz here are CHASSIS frame (this class's own output
+// convention), matching the same math SetPointCloud applies to raw lidar
+// points before reaching pixel space.
+struct ReprojectedPixel
+{
+    float u, v;
+};
+
+ReprojectedPixel ProjectChassisToPixel(double _cx, double _cy, double _cz, double _panoWidth,
+                                        double _panoHeight, double _fPano)
+{
+    const double cosPitch = std::cos(kCamPitchRad);
+    const double sinPitch = std::sin(kCamPitchRad);
+
+    const double relX = _cx - kCamX;
+    const double relY = _cy - kCamY;
+    const double relZ = _cz - kCamZ;
+    const double fwd = relX * cosPitch - relZ * sinPitch;
+    const double left = relY;
+    const double up = relX * sinPitch + relZ * cosPitch;
+
+    if (fwd <= 1e-3)
+    {
+        // Behind the camera reference plane -- can't correspond to any
+        // real detection box; caller's own bounds check will reject this.
+        return ReprojectedPixel{-1.0f, -1.0f};
+    }
+
+    const double theta = std::atan2(left, fwd);
+    const double horizMag = std::sqrt(fwd * fwd + left * left);
+    const double h = up / horizMag;
+
+    return ReprojectedPixel{static_cast<float>(_panoWidth / 2.0 - theta * _fPano),
+                              static_cast<float>(_panoHeight / 2.0 - h * _fPano)};
+}
+
+// How far outside the original box the reprojected centroid can land and
+// still be trusted -- a small margin (not zero) to absorb kConeSurface
+// ToAxisCorrection's own outward push (which moves the centroid along the
+// range axis, slightly shifting its reprojected pixel position too) and
+// ordinary floating-point/geometry slack, without being loose enough to
+// let a genuinely wrong-object centroid back in.
+constexpr float kReprojectionMarginPx = 8.0f;
 } // namespace
 
 LidarProjector::LidarProjector(int panoWidth, int panoHeight, double fPano)
@@ -430,6 +492,22 @@ std::optional<LidarProjector::ConePosition> LidarProjector::Localize(
         const float scale = (horizRange + kConeSurfaceToAxisCorrection) / horizRange;
         centroid.x *= scale;
         centroid.y *= scale;
+    }
+
+    // Pass 5: reprojection consistency check -- see ProjectChassisToPixel's
+    // own comment for why this is the only pass that actually verifies the
+    // RESULT rather than the candidate points. A centroid built from real
+    // surface returns off whatever this box was drawn around must, by
+    // construction, reproject back to roughly where that box actually is;
+    // one that doesn't can only mean the accepted cluster's points belong
+    // to a different real object whose returns happened to spill into this
+    // box's pixel footprint.
+    const ReprojectedPixel reproj =
+        ProjectChassisToPixel(centroid.x, centroid.y, centroid.z, m_panoWidth, m_panoHeight, m_fPano);
+    if (reproj.u < x1 - kReprojectionMarginPx || reproj.u > x2 + kReprojectionMarginPx ||
+        reproj.v < y1 - kReprojectionMarginPx || reproj.v > y2 + kReprojectionMarginPx)
+    {
+        return std::nullopt;
     }
 
     centroid.range = std::sqrt(centroid.x * centroid.x + centroid.y * centroid.y

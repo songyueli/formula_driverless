@@ -330,6 +330,66 @@
           <effort>1e6</effort>    <!-- DART only enforces position limits under
                                         velocity control if an effort limit is set -->
         </limit>
+        <!-- Joint damping, added 2026-09-08 (user report: "we're
+             oscillating the steering", "the overcorrection is so high" --
+             traced to the ROOT, not just retuned around: steer_p_gain=100
+             below is a P-ONLY position controller acting on this joint,
+             which previously had NO damping specified at all, and the
+             child knuckle link's own rotational inertia about this axis is
+             tiny (izz=0.001 kg*m^2, see front_left_steering_knuckle's own
+             <inertial>). A stiff P-only gain on a near-zero-inertia,
+             zero-damping joint is a textbook overshoot-and-ring setup --
+             confirmed as the likely real mechanism by a live rollover with
+             NO cone within 4m of the car (ruling out a path/planning
+             cause; a cone-free flip points at the vehicle's own dynamics
+             going unstable). Critical damping for this joint's own inertia
+             against steer_p_gain=100 works out to
+             2*sqrt(k*I)=2*sqrt(100*0.001)~=0.63 -- 0.8 is deliberately a
+             bit ABOVE that (favors killing the ring over minimizing
+             settling time, since eliminating oscillation is the whole
+             point here). First, not yet live-validated value -- retest at
+             the hairpin and watch joint response directly (a joint_state
+             publisher isn't currently enabled; add one if this needs
+             finer tuning) before trusting it further.
+
+             LOWERED 0.8 -> 0.5, then REVERTED BACK TO 0.8 within the same
+             session (2026-09-09). The 0.5 attempt was grounded in real
+             [STEER]-trace data (see visualization/src/foxglove_bridge.cpp's
+             own commanded-vs-actual instrumentation, added this same
+             session specifically to measure this joint's response
+             directly): steer_p_gain had been separately lowered 100 -> 40
+             on an earlier day without this damping value ever being
+             re-derived for the new gain (critical damping is
+             gain-dependent, c_crit=2*sqrt(k*I) -- at k=40 that's 0.4, so
+             the leftover 0.8 was running at 2x ITS OWN critical damping,
+             not the ~1.27x-of-critical margin originally intended),
+             and the trace showed a real, measured LAG signature (1.47deg
+             mean steering error, transients up to 5-6deg) consistent with
+             that mismatch. 0.5 was the mathematically-matched fix
+             (0.5/0.4=1.25, restoring the same margin ratio as the
+             original 0.8/0.63=1.27) -- but confirmed live, it caused a
+             genuine ROLLOVER (roll angle measured at ~180 degrees from a
+             live /world/.../pose/info capture) within under two minutes of
+             driving, no cone contact involved -- the exact failure mode
+             this damping mechanism was introduced to prevent in the first
+             place. The joint-level critical-damping formula only models
+             this ONE joint in isolation; it doesn't capture the full
+             vehicle's own lateral dynamics response to a more responsive
+             front axle, which is evidently the dominant effect here, not
+             the joint's own local ringing. Reverted to the
+             previously-validated 0.8 (4 consecutive clean laps, zero STUCK
+             events, before this retune) -- a real, confirmed lag is a far
+             safer failure mode to live with than a confirmed rollover.
+             Resolving the lag properly needs retuning against the
+             VEHICLE's actual dynamics response (e.g. sweeping damping in
+             smaller steps while watching for rollover onset, or a
+             different controller structure entirely), not a bigger jump
+             from a joint-only model -- do not retry 0.5 (or lower) without
+             new evidence specifically addressing the rollover mechanism
+             found here. -->
+        <dynamics>
+          <damping>0.8</damping>
+        </dynamics>
       </axis>
     </joint>
 
@@ -373,6 +433,21 @@
         <surface><friction><ode>
           <mu>1.5</mu>    <!-- longitudinal grip -->
           <mu2>1.5</mu2>  <!-- lateral grip -->
+          <!-- Without fdir1, ODE/DART picks the mu/mu2 split from contact
+               geometry, not guaranteed aligned to this wheel's actual
+               rolling axis -- the "longitudinal"/"lateral" labels above
+               weren't actually being enforced (2026-09-03 finding, user
+               request: "check the simulation parameters for the tires").
+               "1 0 0" here is in the COLLISION's own local frame (rotated
+               90deg about X from the link frame, see this collision's own
+               <pose> above) -- since that rotation is about X itself, a
+               vector along X is invariant under it, so "1 0 0" here equals
+               "1 0 0" (forward) in the unrotated link frame too, no extra
+               transform needed. For front wheels this link frame rotates
+               WITH the steering knuckle, so this stays the wheel's own
+               rolling direction as it steers, not a fixed vehicle-forward
+               vector. Not yet live-validated. -->
+          <fdir1>1 0 0</fdir1>
         </ode></friction></surface>
       </collision>
     </link>
@@ -388,6 +463,13 @@
           <upper>0.332</upper>
           <effort>1e6</effort>
         </limit>
+        <!-- Mirror of front_left_wheel_steering_joint's own damping -- see
+             its comment for the full reasoning (0.5 was tried and reverted
+             back to 0.8 the same session after a confirmed live rollover
+             -- do not retry a lower value without new evidence). -->
+        <dynamics>
+          <damping>0.8</damping>
+        </dynamics>
       </axis>
     </joint>
 
@@ -424,6 +506,10 @@
         <surface><friction><ode>
           <mu>1.5</mu>
           <mu2>1.5</mu2>
+          <!-- See front_left_wheel's collision block above for why "1 0 0"
+               here (this collision's own local frame) is correct without
+               further transform, and why it stays valid under steering. -->
+          <fdir1>1 0 0</fdir1>
         </ode></friction></surface>
       </collision>
     </link>
@@ -457,6 +543,10 @@
         <surface><friction><ode>
           <mu>1.5</mu>
           <mu2>1.5</mu2>
+          <!-- See front_left_wheel's collision block above for why "1 0 0"
+               here (this collision's own local frame) is correct without
+               further transform, and why it stays valid under steering. -->
+          <fdir1>1 0 0</fdir1>
         </ode></friction></surface>
       </collision>
     </link>
@@ -486,6 +576,10 @@
         <surface><friction><ode>
           <mu>1.5</mu>
           <mu2>1.5</mu2>
+          <!-- See front_left_wheel's collision block above for why "1 0 0"
+               here (this collision's own local frame) is correct without
+               further transform, and why it stays valid under steering. -->
+          <fdir1>1 0 0</fdir1>
         </ode></friction></surface>
       </collision>
     </link>
@@ -532,16 +626,42 @@
            soft, slow-converging response, not the near-instant tracking
            pure pursuit's own geometry assumes (it re-derives a fresh
            target curvature every cycle with no compensation for the
-           steering actuator lagging behind it). 100 is a first, untested-
-           live retry at a much stiffer response; retest at the hairpin and
-           watch for the opposite failure mode (overshoot/oscillation from
-           TOO stiff a gain) before trusting this value. -->
-      <steer_p_gain>100</steer_p_gain>
+           steering actuator lagging behind it). 100 was a first,
+           untested-live retry at a much stiffer response -- the comment
+           at the time explicitly flagged "watch for the opposite failure
+           mode (overshoot/oscillation from TOO stiff a gain)" but that
+           re-validation never happened.
+           LOWERED 100 -> 40 (2026-09-08, user report: "we're oscillating
+           the steering... why is the overcorrection so high" -- exactly
+           the flagged-but-never-checked failure mode, confirmed live via a
+           cone-free rollover (no cone within 4m, pointing at the vehicle's
+           own dynamics rather than a path/planning cause). Paired with the
+           steering joints' own axis dynamics damping (see their own
+           comment, added the same day) rather than relying on the P-gain
+           alone to avoid ringing -- a properly damped joint can stay
+           reasonably responsive at a more moderate gain instead of needing
+           either "too soft" or "too stiff" as the only two data points.
+           First, not yet live-validated value for THIS combination (gain
+           + damping together) -- retest at the hairpin specifically. -->
+      <steer_p_gain>40</steer_p_gain>
 
       <min_velocity>-5</min_velocity>          <!-- m/s, typically negative for reverse -->
       <max_velocity>20</max_velocity>          <!-- m/s -->
       <min_acceleration>-8</min_acceleration>  <!-- m/s² -->
-      <max_acceleration>5</max_acceleration>   <!-- m/s² -->
+      <!-- RAISED 5 -> 9.81 (2026-09-04, user request: "increase the
+           acceleration to 1 g"). 9.81 m/s^2 = 1.0g. Well within the sim's
+           own tire model (mu=1.5, see this file's own wheel collision
+           blocks -- theoretical max ~14.7 m/s^2/1.5g), so this isn't
+           asking the plugin to demand more forward grip than the tires
+           could plausibly deliver. Left min_acceleration (braking) at -8
+           unchanged -- not part of this request, and already closer to
+           1g (0.82g) than max_acceleration was. This governs how fast the
+           SIM PHYSICS can actually change the car's speed toward whatever
+           pure_pursuit_controller.cpp commands -- raising it doesn't
+           change what speed gets commanded, just how quickly the real
+           vehicle can catch up to a commanded increase. Not yet live-
+           validated. -->
+      <max_acceleration>9.81</max_acceleration>   <!-- m/s² (1.0g) -->
 
       <!-- gz-transport topic the control process publishes commands to -->
       <topic>/cmd_ackermann</topic>

@@ -65,7 +65,7 @@ public:
 private:
     int m_consecutiveEmptyCycles = 0;
 
-    // Universal stuck-detection state -- see kStuckCyclesBeforeReverse's
+    // Universal stuck-detection state -- see kStuckCyclesBeforeLatch's
     // comment in the .cpp for why this exists (a confirmed real deadlock:
     // physically wedged against a cone, so no forward/turning command --
     // NORMAL path-following included, not just the empty-path creep/sweep
@@ -74,16 +74,20 @@ private:
     // m_anchor{X,Y} is the world position the CURRENT displacement window
     // is measured from; it rolls forward to the latest position every time
     // real progress is confirmed (see Compute()), so "stuck" means "hasn't
-    // meaningfully moved in the last kStuckCyclesBeforeReverse cycles",
+    // meaningfully moved in the last kStuckCyclesBeforeLatch cycles",
     // not "hasn't moved since some arbitrary fixed point in the past".
-    // m_reverseCyclesRemaining counts down an in-progress backward
-    // maneuver, checked first in Compute() so it always runs to completion
-    // once triggered.
     bool m_haveAnchor = false;
     double m_anchorX = 0.0;
     double m_anchorY = 0.0;
     int m_cyclesSinceAnchor = 0;
-    int m_reverseCyclesRemaining = 0;
+    // Total Compute() calls since process start -- see kStartupGraceCycles's
+    // own comment in the .cpp for why the stuck-watchdog needs this: without
+    // it, the anchor above starts timing from the first valid pose, which
+    // arrives before the rest of the pipeline (perception/planning) has
+    // actually warmed up, and a confirmed real false-trigger during that
+    // window permanently disables the car for the rest of the process's
+    // life (m_permanentlyStuck never resets).
+    int m_totalCycles = 0;
     // One-way latch: once the stuck watchdog fires, STAYS stopped forever
     // (this process's lifetime) rather than resuming normal driving after
     // the log-throttle reset below. Confirmed live (2026-09-01) as a real,
@@ -92,7 +96,7 @@ private:
     // very next cycle fall through to normal path-following again (neither
     // the "real progress" nor the "still stuck" branch matched right after
     // a reset), so a genuinely, permanently wedged car oscillated between
-    // one cycle of a real stop and ~kStuckCyclesBeforeReverse cycles of
+    // one cycle of a real stop and ~kStuckCyclesBeforeLatch cycles of
     // full normal driving commands, forever -- never actually holding
     // position the way the log message ("holding position, needs external
     // reset") claimed. See Compute()'s own comment at the trigger site.
@@ -104,7 +108,7 @@ private:
     // exactly right for not penalizing genuine driving, but is vulnerable
     // to small NOISE/WOBBLE (e.g. wheels spinning against a real physical
     // block, rocking the chassis) randomly walking past 0.3m from a
-    // constantly-chasing anchor before kStuckCyclesBeforeReverse cycles
+    // constantly-chasing anchor before kStuckCyclesBeforeLatch cycles
     // ever elapse -- confirmed directly: ground truth AND /estimated_pose
     // both agreed the car sat in the same ~0.3m patch for 120+ seconds,
     // continuously commanding ~4.8 m/s forward, while the short-term
@@ -117,26 +121,16 @@ private:
     double m_longTermAnchorX = 0.0;
     double m_longTermAnchorY = 0.0;
     int m_cyclesSinceLongTermAnchor = 0;
-    // Reverse ATTEMPT number in the current stuck episode -- 0 the first
-    // time reverse triggers; increments each time the car gets stuck AGAIN
-    // without any real (kStuckDistanceThreshold) progress happening since
-    // the previous reverse finished, reset to 0 once real progress DOES
-    // happen. Scales reverse duration on each retry -- see kMaxReverse
-    // Attempt's comment in the .cpp for why a single fixed-magnitude
-    // backup isn't always enough.
-    int m_reverseAttempt = 0;
-    // Set whenever the "real progress" branch fires in Compute() (see
-    // kStuckDistanceThreshold), cleared when a new reverse maneuver
-    // starts -- read at the START of the NEXT reverse to decide whether
-    // that one is a fresh episode (progress happened since the last
-    // reverse) or an escalating retry (it didn't).
-    bool m_madeProgressSinceLastReverse = false;
-    // +1 or -1, multiplies kSweepYawRate (and kReverseTurnRate) -- flips
-    // sign on every escalating reverse retry (see Compute()'s own comment
-    // at the reverse-trigger site for why): if the sweep's fixed turn
-    // direction happens to be exactly what re-drives the car back into
-    // the same obstacle every loop, no amount of extra reverse DISTANCE
-    // alone fixes that -- only trying the OTHER direction does.
+    // +1 or -1, multiplies kSweepYawRate. Always +1 currently (2026-09-02):
+    // the escalating-reverse-retry logic that used to flip this sign
+    // between attempts (so a sweep re-driving the car back into the same
+    // obstacle every loop could try the OTHER direction) was removed along
+    // with all reverse-attempt code, since reverse driving is disallowed
+    // under FS rules and was already dead-code hard-stopped before this
+    // (see the SAFETY OVERRIDE comment at Compute()'s stuck-watchdog site).
+    // Kept as a member (not simplified to a constant) as an obvious hook if
+    // some other, rules-compliant reason to flip the sweep direction shows
+    // up later.
     double m_sweepDirection = 1.0;
 
     // The speed COMMANDED last cycle, used to compute THIS cycle's
@@ -165,4 +159,25 @@ private:
     // pipeline's own live recompute, which then fed back into THIS cycle's
     // lookahead distance and made it jitter too.
     double m_lastSpeed = 0.0;
+
+    // Same EMA treatment as m_lastSpeed, applied to yawRate (2026-09-04,
+    // user report: "a lot of jitter in the planned path that's causing
+    // oscillations"). yawRate was previously computed fresh every cycle
+    // from raw curvature (speed*curvature, no smoothing at all) -- unlike
+    // speed, which already gets this same treatment. Root cause of the
+    // jitter itself: /planned_path is body-frame, recomputed from a stable
+    // WORLD-frame source every cycle via WorldToBody using the CURRENT
+    // pose estimate -- so ordinary pose-estimation noise (a few cm of x/y,
+    // a fraction of a degree of yaw) gets baked directly into the
+    // published path's own body-frame coordinates even when the
+    // underlying world-frame line hasn't moved, and can flip which
+    // waypoint the lookahead search picks as the reactive target cycle to
+    // cycle. Re-framing /planned_path itself to world frame was considered
+    // and rejected -- pure pursuit's own curvature math fundamentally needs
+    // the vehicle at the origin, so that would require control.cpp to
+    // subscribe to pose itself and redo this geometry, a much bigger
+    // change than smoothing the output. Initialized to 0.0 for the same
+    // reason m_lastSpeed is -- a straight-line command on the very first
+    // cycle is the safe default regardless.
+    double m_lastYawRate = 0.0;
 };

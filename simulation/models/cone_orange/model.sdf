@@ -1,42 +1,30 @@
 <?xml version="1.0" ?>
-<!--
-  Orange "big" cone — start/finish gate marker. Dimensions confirmed
-  against FS Driverless Specification 2026, Table 1 "Cone specs": big
-  orange cone base 285mm, height 505mm -- 0.1425m base radius (285/2),
-  0.505m tall.
--->
+<!-- Orange "big" cone — start/finish gate marker. Dimensions confirmed against FS Driverless Specification 2026, Table 1 "Cone specs": big orange cone base 285mm, height 505mm \-\- 0.1425m base radius (285/2), 0.505m tall. -->
 <sdf version="1.11">
   <model name="cone_orange">
     <static>true</static>
     <link name="link">
+      
+      <!-- ORANGE CONE BODY -->
       <visual name="visual">
         <geometry>
           <cone><radius>0.1425</radius><length>0.505</length></cone>
         </geometry>
-        <!-- #CC6600 -- #FF8000 (an earlier iteration) was flagged directly
-             by the user as too bright; darkened while keeping the same hue
-             (80% of FF8000's value). -->
         <material>
-          <ambient>0.8 0.4 0 1</ambient>
-          <diffuse>0.8 0.4 0 1</diffuse>
+          <ambient>1 0.35 0 1</ambient>
+          <diffuse>1 0.35 0 1</diffuse>
+          <specular>0.8 0.8 0.8 1</specular>
+          <emissive>0.4 0.02 0 1</emissive>
+          <pbr>
+            <metal>
+              <roughness>0.1</roughness>
+              <metalness>0.0</metalness>
+            </metal>
+          </pbr>
         </material>
       </visual>
-      <!--
-        TWO white stripes -- FS Driverless Specification 2026, Table 1
-        (big orange cone: two white stripes, vs. one for every small
-        cone). Positioned to match the reference photo in the FSG rules'
-        own DE6 Dynamic Events cone table: a lower band centered at 34%
-        of total height from the base and an upper band at 64%, each
-        spanning 16% of total height, leaving clear orange gaps below/
-        between/above them. Real frustum meshes (meshes/stripe_lower.obj,
-        meshes/stripe_upper.obj), not cylinders -- see cone_blue's own
-        stripe comment for why: a cylinder approximation can only match
-        the parent cone's taper at one height, which the user flagged
-        directly as both visually too thin AND not actually flush. Each
-        mesh's radius follows the same formula as the parent cone at
-        every height along its own band, so both stay genuinely flush
-        regardless of thickness.
-      -->
+
+      <!-- LOWER WHITE STRIPE -->
       <visual name="stripe_lower">
         <pose>0 0 -0.1212 0 0 0</pose>
         <geometry>
@@ -45,8 +33,18 @@
         <material>
           <ambient>1 1 1 1</ambient>
           <diffuse>1 1 1 1</diffuse>
+          <specular>0.9 0.9 0.9 1</specular>
+          <emissive>0.45 0.45 0.45 1</emissive>
+          <pbr>
+            <metal>
+              <roughness>0.1</roughness>
+              <metalness>0.0</metalness>
+            </metal>
+          </pbr>
         </material>
       </visual>
+
+      <!-- UPPER WHITE STRIPE -->
       <visual name="stripe_upper">
         <pose>0 0 0.0303 0 0 0</pose>
         <geometry>
@@ -55,8 +53,17 @@
         <material>
           <ambient>1 1 1 1</ambient>
           <diffuse>1 1 1 1</diffuse>
+          <specular>0.9 0.9 0.9 1</specular>
+          <emissive>0.45 0.45 0.45 1</emissive>
+          <pbr>
+            <metal>
+              <roughness>0.1</roughness>
+              <metalness>0.0</metalness>
+            </metal>
+          </pbr>
         </material>
       </visual>
+
       <collision name="collision">
         <geometry>
           <cone><radius>0.1425</radius><length>0.505</length></cone>

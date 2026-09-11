@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cmath>
@@ -10,6 +11,9 @@
 #include <vector>
 
 #include <gz/transport/Node.hh>
+#include <gz/msgs/clock.pb.h>
+#include <gz/msgs/double.pb.h>
+#include <gz/msgs/double_v.pb.h>
 #include <gz/msgs/pose.pb.h>
 #include <gz/msgs/pose_v.pb.h>
 #include <gz/msgs/uint64.pb.h>
@@ -96,27 +100,112 @@ const fsd::BoundaryExtractorFn kActiveBoundaryExtractor = fsd::ColorSplitBoundar
 const fsd::PathGeneratorFn kActivePathGenerator = fsd::NearestPairMidpointPath;
 const fsd::MidpointExtractorFn kActiveMidpointExtractor = fsd::TwoPointMidpointExtractor;
 
-// Last-line-of-defense filter, applied to BOTH pipelines' final body-frame
-// output right before publish: drops any waypoint that ends up BEHIND the
-// vehicle (negative body-frame x) -- confirmed directly (2026-08-31) as a
-// real, user-reported symptom ("the planned line gets drawn behind the
-// car"). Rather than chase down every possible upstream cause across two
-// pipelines and several stages each (a spline's phantom-endpoint
-// extrapolation, a smoothing pass's pull, a stale pose used for the
-// world->body conversion mid-turn, etc. -- any of which COULD occasionally
-// produce one), this guarantees the invariant unconditionally at the one
-// place both pipelines' output has to pass through anyway. A small
-// negative tolerance (not a hard x>=0) absorbs ordinary floating-point
-// noise around the origin without discarding a legitimately-just-ahead
-// point.
-constexpr double kBehindCarTolerance = -0.05;  // meters
+// Last-line-of-defense filter, applied to the open pipeline's final body-
+// frame output right before publish: drops any waypoint that ends up
+// BEHIND the vehicle (negative body-frame x) -- confirmed directly
+// (2026-08-31) as a real, user-reported symptom ("the planned line gets
+// drawn behind the car"). Rather than chase down every possible upstream
+// cause across two pipelines and several stages each (a spline's phantom-
+// endpoint extrapolation, a smoothing pass's pull, a stale pose used for
+// the world->body conversion mid-turn, etc. -- any of which COULD
+// occasionally produce one), this guarantees the invariant unconditionally
+// at the one place both pipelines' output has to pass through anyway. A
+// small negative tolerance (not a hard x>=0) absorbs ordinary floating-
+// point noise around the origin without discarding a legitimately-just-
+// ahead point.
+//
+// WIDENED -0.05 -> -3.0 (2026-09-09, user report: /planned_path "still
+// gets shorter and shorter, then pops back up by luck" even after the
+// all-negative safeguard above was added). Root cause: this near-zero
+// tolerance was never given the SAME fix already applied to the
+// structurally IDENTICAL problem in landmark_map.cpp's own
+// kBehindMargin -- a genuinely-ahead point can read as negative body-
+// frame x purely from the vehicle's heading lagging the track's local
+// curvature mid-turn (see kBehindMargin's own comment for the full
+// mechanism and its own confirmed live case), not because the car
+// actually passed it. kBehindMargin was widened from -3.0 to -8.0 for
+// this exact reason; this constant was left at a near-zero cutoff the
+// whole time, so the landmark stage generously kept forward data
+// (confirmed live: /planning/debug_racing_line stayed healthy throughout)
+// while THIS filter stripped it right back out on every cycle the
+// heading lag was large enough -- the fluctuating lag crossing this
+// razor-thin threshold cycle to cycle is exactly the "shrinks, then
+// recovers by luck" pattern reported. -3.0 (not the full -8.0) is a
+// deliberately smaller step: pure_pursuit_controller.cpp's own reactive
+// target search is gated on TOTAL distance, not body-frame x sign, so a
+// kept point that's both negative-x AND farther than the lookahead
+// distance could in principle get picked as the steering target -- -3.0
+// keeps that risk small (this array's own leading points are the
+// closest-along-track ones, typically well under the 2.0m lookahead
+// before any sign ambiguity matters) while still meaningfully covering
+// ordinary heading-lag effects. Retest specifically for a "car aims at a
+// point behind it" symptom before widening further toward -8.0.
+constexpr double kBehindCarTolerance = -3.0;  // meters
 
+// PREFIX-ONLY removal, not a global filter (2026-09-05, user report: the
+// car stalling at the hairpin/tight turns traced to /planned_path getting
+// truncated -- confirmed the mechanism: this used to be a global
+// std::remove_if, stripping EVERY negative-x point anywhere in the array,
+// not just a leading run of already-passed ones. That's fine on a straight
+// or gentle curve, where "behind the car" and "negative body-frame x" are
+// the same thing everywhere in the array -- but at a sharp/hairpin turn,
+// if the vehicle's own heading hasn't caught up with the track's local
+// curvature yet (mid-turn, nose still pointed closer to the OLD direction
+// than the tighter curve ahead), a genuinely-forward-along-the-track
+// stretch of the racing line can read as negative-x in the car's CURRENT
+// heading frame purely from that heading lag, not because the car actually
+// passed it. The old global filter stripped that whole stretch out
+// wherever it fell in the array, which can gut the published path down to
+// just the short leading run that happened to still read as positive-x --
+// exactly the "reaches the end of /planned_path and stops" symptom
+// reported live. Restricting removal to a genuine LEADING PREFIX (stop at
+// the first point that's already positive-x, keep everything from there
+// onward regardless of what any LATER point's own x sign is) preserves the
+// original intent (still trims genuinely-just-passed points at the very
+// start of the array) without discarding real, still-ahead track data
+// later in the sequence just because of a transient heading/curvature
+// mismatch. Only ever applied to the open pipeline's own short, forward-
+// windowed output (never the closed loop, which has its own reason not to
+// use this filter at all -- see that call site's own comment) -- that
+// window doesn't loop back near the car the way a closed loop's seam does,
+// so a prefix-only rule doesn't need the same "far side of the track, not
+// actually passed" caveat the closed-loop case has.
+// ALL-NEGATIVE SAFEGUARD (2026-09-09, user report + direct live capture:
+// "it just did the same thing... stopped because there's no planned path
+// at all" -- confirmed live via a 250-cycle side-by-side trace,
+// /planning/debug_racing_line steady at 11-13 points / ~27.7m reach the
+// ENTIRE time while /planned_path sat at EXACTLY 0 points, the whole time,
+// starting within the first few cycles of the capture). Root cause: this
+// function's own 2026-09-05 fix (the prefix-only restriction above)
+// already correctly diagnosed the mechanism -- a heading/curvature
+// mismatch can make genuinely-ahead points read as negative-x -- but only
+// handled the case where SOME prefix of the array is affected. When the
+// mismatch is severe enough that EVERY point reads negative-x (confirmed
+// live: firstAhead walked all the way to the array's own end), the
+// prefix-walk still empties the whole array, exactly the "reaches the end
+// of /planned_path and stops" symptom this function was originally
+// written to fix, just via the one case its own 2026-09-05 comment didn't
+// yet cover. Matches this session's own established principle (see
+// EnforceMinTurnRadius's matching 2026-09-09 fix in path_utils.cpp): the
+// published path should have the same reach as the debug racing line --
+// there's no reason to publish nothing when world-frame data this good
+// still exists. If trimming would remove the ENTIRE array, don't trim at
+// all -- publishing a few genuinely-already-passed points at the front
+// (pure pursuit's own lookahead search just walks past them to the first
+// point far enough away, see its own header comment) is a far smaller
+// cost than publishing nothing and stopping the car dead.
 std::vector<fsd::PathPoint> RemoveBehindCarPoints(std::vector<fsd::PathPoint> _waypoints)
 {
-    _waypoints.erase(
-        std::remove_if(_waypoints.begin(), _waypoints.end(),
-                        [](const fsd::PathPoint &_p) { return _p.x < kBehindCarTolerance; }),
-        _waypoints.end());
+    size_t firstAhead = 0;
+    while (firstAhead < _waypoints.size() && _waypoints[firstAhead].x < kBehindCarTolerance)
+    {
+        ++firstAhead;
+    }
+    if (firstAhead >= _waypoints.size())
+    {
+        return _waypoints;  // every point read as "behind" -- don't empty the array, see comment above
+    }
+    _waypoints.erase(_waypoints.begin(), _waypoints.begin() + static_cast<long>(firstAhead));
     return _waypoints;
 }
 
@@ -126,17 +215,245 @@ std::vector<fsd::PathPoint> RemoveBehindCarPoints(std::vector<fsd::PathPoint> _w
 // retune from real driving, not to have guessed harder up front.
 constexpr double kWindowRadius = 20.0;          // meters
 constexpr double kSplineSampleSpacing = 0.5;    // meters of arc length
-constexpr double kCorridorSafetyMargin = 0.3;   // meters
+// Was fsd::kMinCarClearance directly (1.35m) from 2026-09-02 through
+// 2026-09-03 -- that DID fix a real bug (see the history this comment used
+// to carry, preserved in git blame: a smaller 0.3m corridor margin let the
+// optimizer route the racing line somewhere EnforceMinTurnRadius's own
+// zero-cone-awareness clamp couldn't safely follow, a confirmed live wedge
+// crash). But 1.35m itself is the WRONG DIMENSION for this use -- confirmed
+// live (2026-09-03, user report: "debug left and debug right corridor...
+// not consistent near the hairpin, and they go wide by a lot"): a live
+// /planning/debug_corridor_left vs _right snapshot measured a mean corridor
+// width of just 0.41m on this track's own measured 3.00m real width, with
+// occasional spikes (e.g. 4.00m right at the hairpin) that only LOOK
+// dramatic because the baseline they're swinging against is a near-zero
+// sliver -- not a hairpin-specific bug, a track-wide one the hairpin's
+// tighter chain-tracking just exposes hardest. Root cause: kMinCarClearance
+// is explicitly derived from the car's HALF-LENGTH (0.9m, see its own
+// comment in path_utils.cpp -- sized for EnforceMinClearance's job of
+// pushing a waypoint away from a cone the car might drive straight INTO,
+// nose-on) -- but a corridor sample's blue/yellow distance is measured
+// PERPENDICULAR TO THE LOCAL TANGENT, i.e. genuinely LATERAL, where the
+// car's HALF-WIDTH (0.42m, same comment) is the physically correct
+// dimension, not half-length. Using the longer dimension here reserves
+// roughly 2x the margin actually needed on EACH side independently (2x
+// kMinCarClearance = 2.70m taken from a 3.00m track), which is why the
+// corridor came out pinned to a sliver almost everywhere.
+// kCorridorLateralClearance is a NEW, separate constant using the correct
+// dimension: 0.42m (half-width) + 0.1425m (largest real cone's own base
+// radius, same value kMinCarClearance's own derivation uses) + a
+// comparable proportional tracking-error buffer to the one that pushed
+// kMinCarClearance itself from 1.2 to 1.35 (~13%) -- rounds to 0.65m.
+// kMinCarClearance ITSELF is left unchanged at 1.35m (still correct for
+// EnforceMinClearance's own nose-on, direction-agnostic use, downstream of
+// this corridor).
+//
+// RESIDUAL RISK, not fully closed by this change: EnforceMinClearance still
+// runs AFTER the corridor-constrained racing line is built, and still
+// enforces the full 1.35m EUCLIDEAN radius against every cone regardless of
+// approach direction -- so a racing-line point placed near this new,
+// smaller 0.65m corridor edge can still get pushed further in by
+// EnforceMinClearance afterward. This is a smaller, more bounded version of
+// the ORIGINAL 2026-09-02 wedge bug (which happened at a 0.3m corridor
+// margin, a ~1.05m gap to close; this leaves only a ~0.7m gap), not a fully
+// eliminated risk -- needs live validation specifically at the hairpin and
+// any other tight section, watching for the same wedge signature (a
+// published point matching EnforceMinTurnRadius's clamp boundary exactly).
+// Raised 0.65 -> 0.85m (2026-09-04, user report: "we crashed into a cone
+// again... decrease the width of the corridor" -- right after
+// EnforceMinClearance was removed from the corridor-based racing-line path
+// entirely, see that removal's own comment above). This constant is now the
+// SOLE clearance guarantee on that path (there is no more downstream push
+// to lean on), so the margin needs to cover tracking error + cone radius on
+// its own rather than being a belt to EnforceMinClearance's suspenders.
+// +0.20m leaves 3.00 - 2*0.85 = 1.30m of drivable width on this track's
+// nominal 3.00m gates -- still comfortably more than the car's own 0.84m
+// physical width -- while meaningfully increasing the buffer against the
+// exact failure just reported. kCorridorMinHalfWidth's own 0.5m floor is
+// unchanged, so an already-tight section is no more constrained than
+// before; this only tightens sections that had margin to spare.
+// RAISED 0.85 -> 0.95 (2026-09-05, user goal: 10 laps, zero stuck events --
+// confirmed live, the car STILL wedged near a cone at ~0.96-0.97m even
+// after corridor.cpp's own safety-floor fix that same night, which
+// addressed a real, confirmed bug (the floor claiming more space than
+// truly available) but evidently wasn't the whole story -- a racing line
+// that legitimately, intentionally hugs an apex at exactly this margin's
+// own distance leaves very little room for any additional real-world
+// tracking error before actual contact. +0.10m leaves 3.00 - 2*0.95 =
+// 1.10m of drivable width on this track's nominal 3.00m gates -- still
+// more than the car's own 0.84m physical width, but with less slack than
+// before, so this can't grow indefinitely without conflicting with
+// kCorridorMinHalfWidth's own 0.5m floor (1.0m combined) in genuinely
+// narrow sections -- if wedging persists at this value, the next lever is
+// tracking fidelity (control-side), not squeezing this further.
+constexpr double kCorridorLateralClearance = 0.95;  // meters
+constexpr double kCorridorSafetyMargin = kCorridorLateralClearance;  // meters
 constexpr double kCorridorMinHalfWidth = 0.5;   // meters
 constexpr double kCorridorMaxHalfWidth = 2.0;   // meters
-// Ported from path_generator.cpp's kCurvatureSmoothing* -- explicitly
-// expected to need different values here: dense spline samples (every
-// ~0.5m) sit much closer together than the sparse per-cycle midpoints
-// those were originally tuned against, so the same absolute meter-based
-// max-step behaves differently at finer sample spacing.
-constexpr int kRacingLineIterations = 15;
-constexpr double kRacingLineRate = 0.35;
-constexpr double kRacingLineMaxStep = 0.5;      // meters
+
+// Dynamic closed-loop corridor margin (2026-09-04, user request: "make the
+// track width dynamic, between a min and max value... first lap would be
+// the min width, and then as the confidence of the cone locations increase
+// lap after lap... we can increase the left and right widths accordingly,
+// up to the max"). Applies ONLY to the CLOSED-loop corridor build -- the
+// full-map recompute done at every lap completion (see the closedLoop
+// block below, now re-run every lap rather than once) -- not to
+// kCorridorLateralClearance above, which stays fixed for the open/fallback
+// pipeline: that pipeline is inherently a "map still forming" case with no
+// accumulated confidence signal yet to lean on.
+//
+// kConfidenceObsCountConservative/Optimistic bound the INPUT: the mean
+// per-landmark OBSERVATION COUNT across the whole discovered map, published
+// by localization.cpp's landmarksConfidencePub (see its own comment for the
+// full derivation). NOT variance/stddev-based, despite that being the
+// first, more obvious-looking choice -- confirmed LIVE, immediately, that
+// mean position stddev is floor-saturated in this EKF (captured at
+// ~0.540-0.542m repeatedly within the first several seconds of a run and
+// never moved, since kLandmarkVarianceFloor clamps nearly every landmark to
+// the same value on its very first correction, not gradually -- see
+// localization.cpp's own comment at the actual computation for the full
+// explanation). obsCount has no such floor and genuinely accumulates with
+// repeated observation.
+//
+// RELATIVE to lap 1's own measured baseline, NOT a fixed absolute number
+// (2026-09-04, same day, changed before this ever shipped): a first attempt
+// hardcoded conservative=3.0/optimistic=20.0 as guesses, but a live check
+// (before even one lap had completed) already showed the whole-map mean at
+// 19.4 within ~15s and 47.2 by ~40s -- both already past the guessed
+// "optimistic" ceiling, meaning the corridor would reach max width almost
+// immediately, defeating "lap 1 = min width" entirely. The real growth
+// rate depends on THIS track's own size, cone density, and driving speed
+// (all things that also change between runs/tracks), so any fixed absolute
+// number is fragile the same way -- instead, kFirstLapMeanObsCount (below)
+// captures whatever the mean genuinely IS the moment lap 1's own line is
+// first computed, and that becomes the CONSERVATIVE anchor by construction
+// -- lap 1 always reads confidence==its own baseline (t=0, exactly
+// kCorridorMarginConservative), regardless of this track's specific
+// numbers. kConfidenceGrowthMultiplier=3.0 (OPTIMISTIC = 3x the lap-1
+// baseline) is the one still-first-guess, not-yet-live-validated part of
+// this mapping -- retune from an actual multi-lap /estimated_landmarks_
+// confidence trace (this file's own per-lap log line already reports the
+// mean at every recompute) if the corridor still widens too fast/slow
+// relative to how many laps a real race actually runs.
+//
+// kCorridorMarginConservative/Aggressive bound the OUTPUT: Conservative
+// matches kCorridorLateralClearance's own current value -- used at lap 1
+// itself, so lap 1's own margin is UNCHANGED from right before this
+// feature, not a fresh regression risk on the lap that matters most (least
+// map confidence, first time through every corner).
+//
+// Aggressive TEMPORARILY PINNED EQUAL TO CONSERVATIVE (2026-09-05, user
+// goal: 10 laps, zero stuck events). This feature's whole point is to
+// let the margin shrink (corridor widen) on later laps -- but the SAME
+// night this was built, wedging was confirmed live at kCorridorLateralClearance
+// =0.85m, i.e. AT-OR-ABOVE the old 0.55m aggressive value, meaning 0.55m
+// is now known to be less safe than a value already shown to wedge, not
+// more. Letting the margin narrow further while the underlying wedge
+// mechanism is still being run down would work directly against tonight's
+// reliability goal. Pinning both to the same (currently 0.95m) value
+// disables the narrowing behavior WITHOUT removing the feature -- once
+// kCorridorLateralClearance is confirmed to reliably avoid wedging across
+// many clean laps, re-derive a genuinely lower, live-validated aggressive
+// value rather than restoring 0.55m blindly.
+constexpr double kConfidenceGrowthMultiplier = 3.0;  // optimistic = this many x the lap-1 baseline
+constexpr double kCorridorMarginConservative = kCorridorLateralClearance;  // meters
+constexpr double kCorridorMarginAggressive = kCorridorLateralClearance;    // meters (see comment above)
+
+double MarginForConfidence(double _meanObsCount, double _lap1BaselineMeanObsCount)
+{
+    // Floored at 1.0 (obsCount's own minimum, "initial add counts as 1") --
+    // guards the divide below for the pathological case of a lap 1 that
+    // somehow discovered zero landmarks, which would otherwise be a 0/0.
+    const double baseline = std::max(_lap1BaselineMeanObsCount, 1.0);
+    const double t = std::clamp(
+        (_meanObsCount / baseline - 1.0) / (kConfidenceGrowthMultiplier - 1.0), 0.0, 1.0);
+    return kCorridorMarginConservative + t * (kCorridorMarginAggressive - kCorridorMarginConservative);
+}
+
+// RACING LINE ALGORITHM REPLACED 2026-09-04 (user report: "it doesn't
+// appear to be properly stretching the curve to the left and right debug
+// corridors, which is the whole point of those corridors"). The previous
+// Laplacian neighbor-pull approach went through FOUR distinct live-tuning
+// cycles the same day (radius=1 too timid, ~5.7% corridor-width
+// utilization on average -> wider radius fixed the hairpin but drifted
+// unwarranted on a straight -> clamping the drift fixed THAT but produced
+// a confirmed-jagged, non-smooth line -> reverted entirely) without ever
+// landing on something both smooth and corridor-respecting -- see
+// racing_line_optimizer.hpp's own header comment for the full postmortem
+// and why a heuristic neighbor-pull-then-clamp was the wrong tool for this
+// job. OptimizeRacingLine is now a proper minimum-curvature QP (per-sample
+// scalar lateral offset, box-constrained, solved via SOR) -- see that same
+// header comment for the algorithm itself and its own offline validation
+// numbers (zero corridor violations across the full captured closed loop,
+// heading-direction sign flips back down near the old timid baseline's
+// own smoothness while corridor-width utilization climbed well past it).
+//
+// kClosedRacingLineSweeps/kClosedRacingLineOmega: this runs ONCE per lap
+// completion, so cost is essentially free -- 2000 sweeps is what the
+// offline validation was actually run at (see racing_line_optimizer.hpp),
+// not a smaller/faster-but-less-converged guess.
+constexpr int kClosedRacingLineSweeps = 2000;
+constexpr double kClosedRacingLineOmega = 1.9;
+// kOpenRacingLineSweeps/kOpenRacingLineOmega: the open/windowed pipeline
+// recomputes fresh every cycle (unlike the closed loop's one-time solve),
+// so this needs to fit inside a real per-cycle budget.
+//
+// LOWERED omega 1.9 -> 1.0 (2026-09-04, user report: "look at how
+// zigzagged it is now... it's much more warped than the debug lines").
+// omega=1.9 was carried over from the closed-loop value UNVALIDATED at
+// this scale (the offline validation that picked 1.9 only checked zero-
+// violations and utilization for the open case, never a smoothness/
+// heading-change metric the way the closed-loop case's own jaggedness
+// investigation did) -- confirmed live as a real problem, not a guess: a
+// captured /planned_path showed genuine heading-direction reversals over
+// 100 degrees, TWICE in a row, with the underlying corridor confirmed
+// smooth at a nearby capture, pointing at the solver itself rather than
+// noisy input data. SOR's textbook 0<omega<2 convergence guarantee is for
+// the UNCONSTRAINED problem -- once a large over-relaxed step overshoots
+// past a sample's own corridor bound and gets clipped every sweep (far
+// more likely on this pipeline's smaller, less pre-smoothed per-cycle
+// corridor than the closed loop's own heavily-smoothed 560-sample one),
+// that guarantee doesn't cleanly carry over, and the repeated overshoot-
+// then-clip cycle is a plausible direct mechanism for the observed
+// oscillation. 1.0 is plain Gauss-Seidel -- slower per-sweep progress, but
+// monotonically convergent even through constraint clipping, which is what
+// actually matters here. kOpenRacingLineSweeps raised 200->600 to
+// compensate for the slower per-sweep rate -- there is enormous headroom
+// for this: this pipeline's own /timing/planning was measured at
+// 235-267us per cycle at 200 sweeps/omega=1.9, a tiny fraction of the
+// ~70-75ms cycle budget, so 3x the sweep count at a cheaper (no
+// overshoot-driven extra iterations to converge past) omega is still
+// nowhere close to a real cost concern. Needs live validation specifically
+// for the zigzag symptom being gone, not just re-confirming timing.
+//
+// RAISED 600 -> 3000 (2026-09-09, user report: "at the hairpin, we're not
+// drawing a planned path that starts wide and goes along the inner part
+// of the turn... clip[ping] the outer cone"). Confirmed live, precisely:
+// a captured /planning/debug_racing_line through this exact hairpin
+// measured its OWN lateral offset from the raw spline centerline at
+// 0.000-0.03m through the entire tight section (only growing past the
+// apex, well after the part that matters), while the corridor there
+// measured ~1.0-1.2m wide -- meaning ~0.35-0.45m of real, unused box room
+// on each side (kOptimizerEdgeBuffer already subtracted). That's not a
+// hard constraint being respected, it's under-convergence: unlike the
+// closed loop (which solves ONCE per lap and can afford to fully
+// converge), this open/pre-lap window restarts from y=0 EVERY cycle (see
+// OptimizeRacingLine's own `y(n, 0.0)` init) with a brand-new corridor,
+// and 600 sweeps of plain Gauss-Seidel evidently isn't enough to move
+// meaningfully away from that cold start before the array gets thrown
+// away and rebuilt next cycle -- effectively publishing raw centerline,
+// never a real racing line, for the entire pre-lap-completion phase.
+// 3000 is a large step, not a timid one, matching the same "there is
+// enormous headroom" reasoning as the 200->600 raise above (a few more
+// milliseconds at most, still nowhere near the ~70-75ms cycle budget) --
+// deliberately closer to the closed loop's own validated 2000 than to the
+// stale 600, since this pipeline's cold-restart-every-cycle handicap
+// argues for MORE sweeps than the closed loop needs, not fewer. Needs
+// live validation specifically for real apex-hugging appearing at the
+// hairpin (nonzero, meaningfully-sized offset_from_center through the
+// tight section), not just re-confirming timing.
+constexpr int kOpenRacingLineSweeps = 3000;
+constexpr double kOpenRacingLineOmega = 1.0;
 
 fsd::ConeColor ConeColorFromName(const std::string &_name)
 {
@@ -186,6 +503,104 @@ int main()
     auto debugCorridorRightPub = node.Advertise<gz::msgs::Pose_V>("/planning/debug_corridor_right");
     auto debugRacingLinePub = node.Advertise<gz::msgs::Pose_V>("/planning/debug_racing_line");
 
+    // Lap timing (2026-09-03 user request, deferred until after the
+    // crossover fix -- see the closed-loop pipeline's own history above for
+    // why: no point timing laps against a path that wasn't a real closed
+    // loop yet). "Live elapsed time" + "first lap time", scoped per the
+    // user's own choice. Sim time (not wall-clock) via /world/trackdrive/
+    // clock, gz.msgs.Clock -- same source and .sim().sec()/.sim().nsec()
+    // pattern foxglove_bridge.cpp's own onClock already uses, so this stays
+    // correct under pause/step/non-realtime playback the way a wall-clock
+    // std::chrono timer wouldn't. World name hardcoded ("trackdrive") --
+    // this file's main() takes no argv today (unlike foxglove_bridge.cpp,
+    // which gets it from dev_sim.sh's own $WORLD_NAME), and every launch
+    // this project has ever used is trackdrive; revisit if that changes.
+    auto lapElapsedPub = node.Advertise<gz::msgs::Double>("/lap_time/elapsed");
+    auto lapFirstLapPub = node.Advertise<gz::msgs::Double>("/lap_time/first_lap");
+    // /lap_time/last_lap (2026-09-04, user request: "modify the lap
+    // counter so that it includes a last lap time") -- the MOST RECENTLY
+    // COMPLETED lap's own duration, updating every time a new lap
+    // finishes, not just the first. Backed by a SEPARATE LapDetector
+    // instance (lapTimer, declared alongside the existing pipeline-switch
+    // lapDetector below) that gets explicitly Reset() after each
+    // completion it observes -- the existing lapDetector must stay a
+    // one-way latch (it drives the closed-loop pipeline switch, a genuine
+    // one-time event), so it can't be reused for repeating per-lap timing
+    // without breaking that.
+    auto lapLastLapPub = node.Advertise<gz::msgs::Double>("/lap_time/last_lap");
+    // /lap_time/laps (2026-09-04, user request: "post the lap times as a
+    // fixed size array of length 10, since laps never exceed 10") -- every
+    // completed lap's own duration, index 0 = lap 1, kept in one place so
+    // a Foxglove table/plot can bind to it without resizing. Fixed at 10
+    // slots always (not grown to match however many laps have actually
+    // completed) -- slots for laps that haven't happened yet stay 0.0,
+    // same "unset means 0" convention firstLapTimeSeconds/lastLapTimeSeconds
+    // already use before their own first completion. gz::msgs::Double_V
+    // (repeated double) rather than 10 separate scalar topics -- this is
+    // genuinely one array-shaped value, not 10 independent ones.
+    constexpr size_t kMaxTrackedLaps = 10;
+    auto lapTimesPub = node.Advertise<gz::msgs::Double_V>("/lap_time/laps");
+    std::array<std::atomic<double>, kMaxTrackedLaps> lapTimes{};
+    std::atomic<size_t> lapCount{0};
+    std::atomic<bool> haveRaceStart{false};
+    std::atomic<uint64_t> raceStartSimTimeNs{0};
+    std::atomic<uint64_t> lastSimTimeNs{0};
+    // Set once, the first cycle the closed loop completes (see the
+    // lapJustCompletedForRecompute block below, the same moment
+    // storedClosedRacingLine etc. are FIRST computed -- that block now
+    // re-runs every lap, see its own comment, but this flag's own
+    // haveFirstLapTime guard still only ever fires once) -- read back here
+    // every clock tick so /lap_time/first_lap keeps
+    // republishing the same value continuously rather than a single
+    // one-shot message a not-yet-subscribed bridge could miss.
+    std::atomic<bool> haveFirstLapTime{false};
+    std::atomic<double> firstLapTimeSeconds{0.0};
+    // Set/updated every time lapTimer (below) observes a completion --
+    // same continuous-republish reasoning as haveFirstLapTime above.
+    std::atomic<bool> haveLastLapTime{false};
+    std::atomic<double> lastLapTimeSeconds{0.0};
+    std::function<void(const gz::msgs::Clock &)> onClock =
+        [&lapElapsedPub, &lapFirstLapPub, &lapLastLapPub, &lapTimesPub, &lapTimes, &haveRaceStart,
+         &raceStartSimTimeNs, &lastSimTimeNs, &haveFirstLapTime, &firstLapTimeSeconds, &haveLastLapTime,
+         &lastLapTimeSeconds](const gz::msgs::Clock &_msg)
+    {
+        const uint64_t ns = static_cast<uint64_t>(_msg.sim().sec()) * 1000000000ULL
+            + static_cast<uint64_t>(_msg.sim().nsec());
+        lastSimTimeNs.store(ns, std::memory_order_relaxed);
+        if (!haveRaceStart.load(std::memory_order_relaxed))
+        {
+            raceStartSimTimeNs.store(ns, std::memory_order_relaxed);
+            haveRaceStart.store(true, std::memory_order_relaxed);
+        }
+        const double elapsedSeconds =
+            static_cast<double>(ns - raceStartSimTimeNs.load(std::memory_order_relaxed)) * 1e-9;
+        gz::msgs::Double elapsedMsg;
+        elapsedMsg.set_data(elapsedSeconds);
+        lapElapsedPub.Publish(elapsedMsg);
+        if (haveFirstLapTime.load(std::memory_order_relaxed))
+        {
+            gz::msgs::Double firstLapMsg;
+            firstLapMsg.set_data(firstLapTimeSeconds.load(std::memory_order_relaxed));
+            lapFirstLapPub.Publish(firstLapMsg);
+        }
+        if (haveLastLapTime.load(std::memory_order_relaxed))
+        {
+            gz::msgs::Double lastLapMsg;
+            lastLapMsg.set_data(lastLapTimeSeconds.load(std::memory_order_relaxed));
+            lapLastLapPub.Publish(lastLapMsg);
+        }
+        gz::msgs::Double_V lapTimesMsg;
+        for (auto &slot : lapTimes)
+        {
+            lapTimesMsg.add_data(slot.load(std::memory_order_relaxed));
+        }
+        lapTimesPub.Publish(lapTimesMsg);
+    };
+    if (!node.Subscribe("/world/trackdrive/clock", onClock))
+    {
+        std::cerr << "planning: failed to subscribe to /world/trackdrive/clock -- lap timing disabled\n";
+    }
+
     fsd::LandmarkMap landmarkMap;
     std::atomic<bool> landmarkPipelineActive{false};
     // Detects lap completion so the pipeline below can switch from a
@@ -195,39 +610,75 @@ int main()
     // leave/return state across every call, same as landmarkPipelineActive.
     fsd::LapDetector lapDetector;
 
-    // Persists the racing line and the corridor's own left/right bounds
-    // across cycles (2026-08-31 user request: "stored, and tuned as we
-    // navigate around the track... less jitter") -- see
-    // racing_line_cache.hpp's own comment for why recomputing everything
-    // from scratch every cycle was producing jitter even when the
-    // underlying track geometry hadn't actually changed. Separate caches
-    // (not one shared instance) so the racing line's own points never
-    // collide in the same spatial grid as the corridor boundary points --
-    // they occupy genuinely different world positions in normal driving,
-    // but keeping them in separate maps removes any chance of an
-    // unintended interaction rather than relying on that always being true.
-    fsd::RacingLineCache racingLineCache;
-    fsd::RacingLineCache corridorLeftCache;
-    fsd::RacingLineCache corridorRightCache;
-    // How much of each cycle's freshly-computed value to blend in -- see
-    // BlendAndStore's own comment. 0.3 is a first, untested-live value:
-    // low enough to meaningfully damp cycle-to-cycle jitter, high enough
-    // that the cache still tracks genuine track changes (a landmark
-    // correction, not just noise) within a handful of cycles rather than
-    // lagging noticeably behind reality. Retune from a fresh live
-    // measurement the same way every other first-attempt constant in this
-    // pipeline has been.
-    constexpr double kBlendAlpha = 0.3;
+    // Separate instance for REPEATING per-lap timing (2026-09-04, user
+    // request: "modify the lap counter so that it includes a last lap
+    // time") -- see lap_detector.hpp's own Reset() comment for why this
+    // can't share lapDetector above (that one must stay a one-way latch
+    // for the pipeline switch). Explicitly Reset() after each completion
+    // this instance observes, in the same rising-edge block lapDetector's
+    // own one-time completion is already handled in below.
+    fsd::LapDetector lapTimer;
+    // Elapsed-since-race-start (seconds) at the moment of the PREVIOUSLY
+    // completed lap, so each new completion's own duration is computable
+    // as a simple difference -- 0.0 for lap 1 (a lap's duration measured
+    // from the race start IS just its own elapsed-time-at-completion).
+    double previousLapCompletionSeconds = 0.0;
 
-    // Closed-loop pipeline state, computed ONCE (not every cycle) -- see
-    // this file's 2026-08-31 postmortem comment at the closedLoop branch
-    // below for why. The whole track's topology doesn't change quickly
-    // once mapped; re-deciding it from scratch every ~10Hz cycle off
-    // live, momentarily-noisy vehicle pose was the actual source of the
-    // recurring stuck-car bugs here, not any single fixable defect.
-    // closedLoopComputed is a one-way latch, same convention as
-    // landmarkPipelineActive/LapDetector's own m_lapComplete.
-    bool closedLoopComputed = false;
+    // RacingLineCache/corridorLeftCache/corridorRightCache/kBlendAlpha
+    // (originally added 2026-08-31 to damp cycle-to-cycle jitter in the
+    // open pipeline's own recomputed-every-cycle racing line and debug
+    // corridor arrays) REMOVED ENTIRELY 2026-09-03 -- see the open
+    // pipeline's own racing-line block below (where the blend used to be
+    // applied) for the full reasoning: the same 0.5m grid-cell-collision
+    // mechanism already found and removed for the closed-loop case (this
+    // comment block's own next paragraph, unchanged below) was ALSO live in
+    // the open pipeline the whole time, and got directly implicated in a
+    // real stuck-car report ("stuck, ghst cone") via a captured
+    // /planned_path showing the same scrambled-ordering signature. No
+    // replacement jitter-damping added here -- see the open pipeline's own
+    // comment for what a real fix would need instead (an index-keyed or
+    // radius-searched cache, not exact grid bucketing).
+    //
+    // Closed-loop /planned_path cross-cycle blending -- ADDED 2026-09-02,
+    // REMOVED 2026-09-03. Two implementations were tried and both actively
+    // corrupted the output rather than smoothing it:
+    //
+    // 1. RacingLineCache, spatially keyed by each point's world position --
+    // confirmed live to collide, since its grid cell size (0.5m) exactly
+    // matched this closed-loop line's own point spacing, hashing adjacent-
+    // but-genuinely-different points into the same cell.
+    //
+    // 2. A direct per-stored-index cache (fixed the collision, since
+    // storedClosedRacingLine has permanently stable indices once computed)
+    // -- but confirmed live to have a DIFFERENT, worse problem: the source
+    // array is completely static once computed (byte-identical across
+    // cycles, verified directly), so there was never any real jitter to
+    // smooth in the first place. The cache's only actual effect was a
+    // failure mode -- if any stored index was ever cached with a bad value
+    // (e.g. from a cycle where an upstream stage hadn't fully settled),
+    // every later cycle revisiting that index would blend toward that
+    // stale value indefinitely, since the blended output was itself written
+    // back into the cache. Confirmed directly: traced every published
+    // /planned_path point back to its nearest stored-line index and found
+    // the tail of the window jumping backward to indices already used
+    // EARLIER in the same message (e.g. output position 58 landing on the
+    // same world position as position 36's index) -- not drift, a cache
+    // returning wrong data.
+    //
+    // No replacement needed: publishing the window directly, with no
+    // cross-cycle blend at all, is correct given the source is already
+    // static -- see this file's own diagnostic dump confirming a max
+    // consecutive-point gap of well under 1m across the entire stored line.
+
+    // Closed-loop pipeline state, RECOMPUTED once per lap completion (not
+    // every ~10Hz cycle) -- see this file's 2026-08-31 postmortem comment
+    // at the closedLoop branch below for why per-CYCLE recompute is unsafe
+    // (that reasoning is about live, momentarily-noisy vehicle pose being
+    // re-decided 10-14 times a SECOND, an entirely different timescale from
+    // "once every time the car crosses the start/finish line," a handful
+    // of times per race at most -- see lapJustCompletedForRecompute's own
+    // comment below for the 2026-09-04 change from a one-way latch to a
+    // per-lap trigger).
     std::vector<fsd::PathPoint> storedClosedMidpoints;
     std::vector<fsd::PathPoint> storedClosedSpline;
     std::vector<fsd::PathPoint> storedClosedCorridorLeft;
@@ -300,12 +751,49 @@ int main()
         return 1;
     }
 
+    // Map-wide landmark confidence (2026-09-04, user request: "make the
+    // track width dynamic, between a min and max value... as the
+    // confidence of the cone locations increase lap after lap... increase
+    // the left and right widths accordingly"). See localization.cpp's
+    // landmarksConfidencePub for exactly what this scalar is (mean
+    // per-landmark OBSERVATION COUNT across the whole discovered map,
+    // HIGHER = more confident -- not position variance, see that
+    // publisher's own comment for why variance was tried first and
+    // confirmed live not to work here) and MarginForConfidence's own
+    // comment for how this is used RELATIVE to a lap-1 baseline, not
+    // against a fixed absolute number. Defaults to 0.0 -- harmless even if
+    // a closed-loop recompute somehow ran before this topic's first real
+    // message ever arrived, since MarginForConfidence's own baseline
+    // capture (see the recompute site) would then also capture 0.0 as
+    // lap 1's baseline, and the very next real message updates this to a
+    // genuine value before the SECOND recompute (lap 2) ever reads it.
+    std::atomic<double> landmarkMeanObsCount{0.0};
+    std::function<void(const gz::msgs::Double &)> onLandmarksConfidence =
+        [&landmarkMeanObsCount](const gz::msgs::Double &_msg)
+    { landmarkMeanObsCount.store(_msg.data(), std::memory_order_relaxed); };
+    if (!node.Subscribe("/estimated_landmarks_confidence", onLandmarksConfidence))
+    {
+        std::cerr << "Failed to subscribe to /estimated_landmarks_confidence\n";
+        return 1;
+    }
+    // Captured ONCE, at the very first closed-loop recompute (lap 1) -- see
+    // MarginForConfidence's own comment for why this run's own lap-1 value,
+    // not a fixed absolute number, is the right conservative anchor. Same
+    // one-way-latch convention as haveFirstLapTime/firstLapTimeSeconds
+    // above.
+    std::atomic<bool> haveFirstLapMeanObsCount{false};
+    std::atomic<double> firstLapMeanObsCount{0.0};
+
     std::function<void(const gz::msgs::Pose_V &)> onEstimatedLandmarks =
-        [&landmarkMap, &landmarkPipelineActive, &lapDetector, &pathPub, &timingPub, &debugMidpointsPub,
-         &debugSplinePub, &debugCorridorLeftPub, &debugCorridorRightPub, &debugRacingLinePub, &racingLineCache,
-         &corridorLeftCache, &corridorRightCache, &closedLoopComputed, &storedClosedMidpoints, &storedClosedSpline,
-         &storedClosedCorridorLeft, &storedClosedCorridorRight, &storedClosedRacingLine,
-         &closedLoopCursor](const gz::msgs::Pose_V &_msg)
+        [&landmarkMap, &landmarkPipelineActive, &lapDetector, &lapTimer, &previousLapCompletionSeconds,
+         &pathPub, &timingPub, &debugMidpointsPub,
+         &debugSplinePub, &debugCorridorLeftPub, &debugCorridorRightPub, &debugRacingLinePub,
+         &storedClosedMidpoints, &storedClosedSpline, &storedClosedCorridorLeft,
+         &storedClosedCorridorRight, &storedClosedRacingLine, &closedLoopCursor,
+         &haveRaceStart, &raceStartSimTimeNs, &lastSimTimeNs, &haveFirstLapTime,
+         &firstLapTimeSeconds, &haveLastLapTime, &lastLapTimeSeconds, &lapTimes, &lapCount,
+         &landmarkMeanObsCount, &haveFirstLapMeanObsCount, &firstLapMeanObsCount,
+         kMaxTrackedLaps](const gz::msgs::Pose_V &_msg)
     {
         std::vector<fsd::WorldCone> landmarks;
         landmarks.reserve(static_cast<size_t>(_msg.pose_size()));
@@ -339,6 +827,46 @@ int main()
         // by an earlier cycle where it was (poseValid itself never resets
         // to false once set -- see LandmarkMap::UpdatePose).
         lapDetector.Update(window.vehiclePose.x, window.vehiclePose.y);
+
+        // Repeating per-lap timing (2026-09-04) -- independent of the
+        // pipeline-switch block below, since this needs to keep firing for
+        // every lap, not just the first. Update() is a no-op once
+        // m_lapComplete is set (see lap_detector.hpp's own one-way-latch
+        // comment), so this correctly does nothing between the moment
+        // lapTimer completes and the Reset() call a few lines down runs --
+        // there's no window where a stale "complete" could be double-
+        // counted.
+        lapTimer.Update(window.vehiclePose.x, window.vehiclePose.y);
+        // Captured BEFORE the timing block's own lapTimer.Reset() below --
+        // see lapJustCompletedForRecompute's own use further down (2026-09-
+        // 04) for why this needs to survive past that Reset() call, unlike
+        // the timing logic's own lapTimer.LapComplete() check just below,
+        // which is fine reading it fresh since it runs first.
+        const bool lapJustCompletedForRecompute = lapTimer.LapComplete();
+        if (lapTimer.LapComplete() && haveRaceStart.load(std::memory_order_relaxed))
+        {
+            const uint64_t ns = lastSimTimeNs.load(std::memory_order_relaxed);
+            const uint64_t startNs = raceStartSimTimeNs.load(std::memory_order_relaxed);
+            const double nowElapsed = static_cast<double>(ns - startNs) * 1e-9;
+            const double thisLapDuration = nowElapsed - previousLapCompletionSeconds;
+            lastLapTimeSeconds.store(thisLapDuration, std::memory_order_relaxed);
+            haveLastLapTime.store(true, std::memory_order_relaxed);
+            previousLapCompletionSeconds = nowElapsed;
+            // Store into the fixed 10-slot array (2026-09-04) -- see
+            // lapTimes/lapCount's own declaration comment above. Silently
+            // stops recording past the 10th lap rather than wrapping or
+            // growing -- "laps never exceed 10" was stated as a known
+            // constraint of this track/race format, not something to
+            // defensively handle beyond simply not writing out of bounds.
+            const size_t idx = lapCount.load(std::memory_order_relaxed);
+            if (idx < kMaxTrackedLaps)
+            {
+                lapTimes[idx].store(thisLapDuration, std::memory_order_relaxed);
+                lapCount.store(idx + 1, std::memory_order_relaxed);
+            }
+            lapTimer.Reset();
+        }
+
         // Once a lap completes, switch from the windowed (local, forward-
         // facing) landmark set to every landmark ever seen (QueryAll(),
         // which legitimately does return the FULL discovered map --
@@ -350,15 +878,23 @@ int main()
         // LOCAL concept.
         //
         // ARCHITECTURE: the closed-loop midpoints/spline/corridor/racing-
-        // line are computed EXACTLY ONCE, the first cycle closedLoop goes
-        // true, not every cycle -- re-deciding the whole track's topology
-        // from scratch off live, momentarily-noisy vehicle pose every
-        // ~10Hz cycle was the root source of most stuck-car bugs found
-        // here (2026-08-31/09-01). Each cycle after that looks up the
-        // nearest point on the stored line to the vehicle's CURRENT
-        // position (see the lookup below) and walks forward from there --
-        // "map once, localize within it", the same split every SLAM-
-        // adjacent system uses.
+        // line are recomputed once EVERY LAP (lapJustCompletedForRecompute,
+        // 2026-09-04 -- was a one-way latch, computed exactly once ever,
+        // before the dynamic-corridor-width feature below needed a way to
+        // apply an improved confidence-based margin on lap 2, 3, etc.), not
+        // every cycle -- re-deciding the whole track's topology from
+        // scratch off live, momentarily-noisy vehicle pose every ~10Hz
+        // cycle was the root source of most stuck-car bugs found here
+        // (2026-08-31/09-01), but that risk is about a 10-14Hz timescale,
+        // not a "once every lap" one -- a lap takes many seconds, and the
+        // vehicle pose at a lap boundary is no noisier than at any other
+        // moment this same recompute already had to tolerate the one time
+        // it used to run. Every cycle BETWEEN recomputes still looks up the
+        // nearest point on the CURRENTLY stored line to the vehicle's
+        // CURRENT position (see the lookup below) and walks forward from
+        // there -- "map once [per lap], localize within it", the same
+        // split every SLAM-adjacent system uses, just with "once" now
+        // meaning "once per lap" instead of "once ever".
         //
         // STATUS (2026-09-01, end of a long multi-session debugging
         // effort -- see chat history for the full blow-by-blow): SEVEN
@@ -420,16 +956,49 @@ int main()
         const bool closedLoop = lapDetector.LapComplete();
         const fsd::LandmarkMap::WindowResult activeSet = closedLoop ? landmarkMap.QueryAll() : window;
 
-        if (closedLoop && !closedLoopComputed)
+        if (closedLoop && lapJustCompletedForRecompute)
         {
+            // Lap timing: on the very FIRST lap this is the exact rising
+            // edge for /lap_time/first_lap; on every lap after that this
+            // whole outer block re-runs (see its own comment above) but
+            // this specific inner check is already a no-op via its own
+            // haveFirstLapTime guard, so /lap_time/first_lap still only
+            // ever gets set once, correctly. Only captured if a clock tick
+            // has actually arrived yet (haveRaceStart) -- true in practice
+            // well before a lap finishes, this just avoids a bogus 0.0s
+            // reading in the pathological case of a lap completing before
+            // this process's very first /world/trackdrive/clock message.
+            if (haveRaceStart.load(std::memory_order_relaxed) && !haveFirstLapTime.load(std::memory_order_relaxed))
+            {
+                const uint64_t ns = lastSimTimeNs.load(std::memory_order_relaxed);
+                const uint64_t startNs = raceStartSimTimeNs.load(std::memory_order_relaxed);
+                firstLapTimeSeconds.store(static_cast<double>(ns - startNs) * 1e-9, std::memory_order_relaxed);
+                haveFirstLapTime.store(true, std::memory_order_relaxed);
+            }
             storedClosedMidpoints =
-                fsd::ClosedLoopMidpointExtractor(activeSet.blue, activeSet.yellow, activeSet.vehiclePose);
+                fsd::ClosedLoopMidpointExtractor(activeSet.blue, activeSet.yellow, activeSet.orange, activeSet.vehiclePose);
             storedClosedSpline = fsd::FitAndSampleClosedSpline(storedClosedMidpoints, kSplineSampleSpacing);
+            // Dynamic margin (2026-09-04) -- see MarginForConfidence's own
+            // comment for the full derivation and why this is relative to
+            // THIS run's own lap-1 baseline, not a fixed absolute number.
+            // Baseline captured ONCE, right here, the first time this block
+            // ever runs (lap 1) -- current mean read fresh on every
+            // recompute (including this same one), so a later lap's line
+            // genuinely gets to use whatever the map's confidence has
+            // improved to relative to that fixed lap-1 anchor.
+            const double currentMeanObsCount = landmarkMeanObsCount.load(std::memory_order_relaxed);
+            if (!haveFirstLapMeanObsCount.load(std::memory_order_relaxed))
+            {
+                firstLapMeanObsCount.store(currentMeanObsCount, std::memory_order_relaxed);
+                haveFirstLapMeanObsCount.store(true, std::memory_order_relaxed);
+            }
+            const double dynamicCorridorMargin =
+                MarginForConfidence(currentMeanObsCount, firstLapMeanObsCount.load(std::memory_order_relaxed));
             const std::vector<fsd::CorridorSample> corridor = fsd::ComputeCorridor(
-                storedClosedSpline, activeSet.blue, activeSet.yellow, activeSet.orange, kCorridorSafetyMargin,
+                storedClosedSpline, activeSet.blue, activeSet.yellow, activeSet.orange, dynamicCorridorMargin,
                 kCorridorMinHalfWidth, kCorridorMaxHalfWidth, /*closed=*/true);
-            storedClosedRacingLine = fsd::OptimizeRacingLine(corridor, kRacingLineIterations, kRacingLineRate,
-                                                              kRacingLineMaxStep, /*closed=*/true);
+            storedClosedRacingLine = fsd::OptimizeRacingLine(corridor, kClosedRacingLineSweeps,
+                                                              kClosedRacingLineOmega, /*closed=*/true);
             storedClosedCorridorLeft.clear();
             storedClosedCorridorRight.clear();
             storedClosedCorridorLeft.reserve(corridor.size());
@@ -439,11 +1008,10 @@ int main()
                 const double leftNormalX = -c.tangentY;
                 const double leftNormalY = c.tangentX;
                 storedClosedCorridorLeft.push_back(
-                    fsd::PathPoint{c.point.x + c.halfWidth * leftNormalX, c.point.y + c.halfWidth * leftNormalY});
-                storedClosedCorridorRight.push_back(
-                    fsd::PathPoint{c.point.x - c.halfWidth * leftNormalX, c.point.y - c.halfWidth * leftNormalY});
+                    fsd::PathPoint{c.point.x + c.leftBound * leftNormalX, c.point.y + c.leftBound * leftNormalY});
+                storedClosedCorridorRight.push_back(fsd::PathPoint{c.point.x - c.rightBound * leftNormalX,
+                                                                     c.point.y - c.rightBound * leftNormalY});
             }
-            closedLoopComputed = true;
             closedLoopCursor = 0;
             // Max consecutive gap in the stored racing line -- diagnostic
             // only, printed once here rather than requiring another
@@ -459,11 +1027,20 @@ int main()
                 const double dy = storedClosedRacingLine[i].y - storedClosedRacingLine[i - 1].y;
                 maxGap = std::max(maxGap, std::sqrt(dx * dx + dy * dy));
             }
-            std::cerr << "planning: lap complete after " << lapDetector.DistanceTraveled()
-                      << "m -- computed closed-loop pipeline once (blue=" << activeSet.blue.size()
+            // lapCount already reflects THIS just-completed lap (incremented
+            // by the timing block above, same cycle) -- more meaningful
+            // here than lapDetector.DistanceTraveled(), which is frozen at
+            // lap 1's own value from lap 2 onward (lapDetector is a
+            // one-way latch, see closedLoop's own declaration; Update()
+            // becomes a no-op once complete).
+            std::cerr << "planning: lap " << lapCount.load(std::memory_order_relaxed)
+                      << " complete -- recomputed closed-loop pipeline (blue=" << activeSet.blue.size()
                       << " yellow=" << activeSet.yellow.size() << " orange=" << activeSet.orange.size()
                       << ", racing line points=" << storedClosedRacingLine.size()
-                      << ", max consecutive gap=" << maxGap << "m)\n";
+                      << ", max consecutive gap=" << maxGap << "m, mean landmark obsCount="
+                      << currentMeanObsCount << " (lap-1 baseline="
+                      << firstLapMeanObsCount.load(std::memory_order_relaxed)
+                      << "), dynamic corridor margin=" << dynamicCorridorMargin << "m)\n";
             // Dump the ACTUAL frozen array to disk -- diagnostic only.
             // Confirmed necessary (2026-09-01): re-running the pipeline
             // offline against a LATER capture of /estimated_landmarks
@@ -479,7 +1056,7 @@ int main()
                 std::cerr << "planning: FAILED to open dump file, errno=" << errno << " (" << strerror(errno)
                           << ")\n";
             }
-            dump << "idx,x,y,dirDeg,turnDeg,halfWidth\n";
+            dump << "idx,x,y,dirDeg,turnDeg,leftBound,rightBound\n";
             double prevDir = 0.0;
             bool havePrevDir = false;
             const size_t dn = storedClosedRacingLine.size();
@@ -497,8 +1074,10 @@ int main()
                 }
                 havePrevDir = true;
                 prevDir = dir;
-                const double hw = i < corridor.size() ? corridor[i].halfWidth : -1.0;
-                dump << i << "," << p.x << "," << p.y << "," << dir << "," << turn << "," << hw << "\n";
+                const double lb = i < corridor.size() ? corridor[i].leftBound : -1.0;
+                const double rb = i < corridor.size() ? corridor[i].rightBound : -1.0;
+                dump << i << "," << p.x << "," << p.y << "," << dir << "," << turn << "," << lb << "," << rb
+                     << "\n";
             }
         }
 
@@ -510,35 +1089,48 @@ int main()
         std::vector<fsd::PathPoint> openRacingLine;
         if (!closedLoop)
         {
-            openMidpoints = kActiveMidpointExtractor(activeSet.blue, activeSet.yellow, activeSet.vehiclePose);
+            openMidpoints = kActiveMidpointExtractor(activeSet.blue, activeSet.yellow, activeSet.orange, activeSet.vehiclePose);
             openSpline = fsd::FitAndSampleSpline(openMidpoints, kSplineSampleSpacing);
             openCorridor = fsd::ComputeCorridor(openSpline, activeSet.blue, activeSet.yellow, activeSet.orange,
                                                  kCorridorSafetyMargin, kCorridorMinHalfWidth, kCorridorMaxHalfWidth,
                                                  /*closed=*/false);
-            openRacingLine = fsd::OptimizeRacingLine(openCorridor, kRacingLineIterations, kRacingLineRate,
-                                                      kRacingLineMaxStep, /*closed=*/false);
-            // Blend each freshly-optimized point toward whatever's cached at
-            // its grid cell -- this is what actually damps cycle-to-cycle
-            // jitter (see racing_line_cache.hpp's header comment); keyed by
-            // the fresh (pre-blend) position since track geometry is static
-            // cycle to cycle, so the same physical point should land in the
-            // same cell. Only meaningful here (the open pipeline still
-            // recomputes every cycle) -- the closed pipeline is computed
-            // once, so there's nothing to blend across cycles for it.
-            //
-            // SAFETY: the blended point is a mix of THIS cycle's corridor-
-            // clamped point and a PAST cycle's corridor-clamped point -- if
-            // the corridor narrowed between those two cycles, the blend is
-            // not itself guaranteed to stay inside the CURRENT corridor.
-            // Live-tested 2026-08-31: without this re-clamp, the car drove
-            // close enough to the track edge to clip cones and go airborne.
+            openRacingLine = fsd::OptimizeRacingLine(openCorridor, kOpenRacingLineSweeps,
+                                                      kOpenRacingLineOmega, /*closed=*/false);
+            // Cross-cycle blend REMOVED (2026-09-03, user report: "stuck,
+            // ghst cone" -- confirmed live via direct offline analysis of a
+            // captured /planned_path: the published open-pipeline array
+            // showed the exact same non-monotonic, locally-scrambled point
+            // ordering signature already diagnosed and fixed for the
+            // CLOSED-loop pipeline on 2026-09-03 (see this file's own
+            // removed-blend-cache history for the closed case) -- two array
+            // positions a few indices apart landing at nearly-identical
+            // world positions, consistent with RacingLineCache's grid-cell
+            // key (0.5m, same as this pipeline's own point spacing)
+            // colliding: a point's blend can pick up a STALE cached value
+            // from a different, unrelated point that happens to hash into
+            // the same or an adjacent cell. That closed-loop fix removed
+            // the cache entirely because the closed source is static (byte-
+            // identical cycle to cycle, so there's no real jitter to damp in
+            // the first place) -- that specific justification does NOT
+            // apply here (the open pipeline genuinely recomputes fresh every
+            // cycle from a live, changing window, so SOME cycle-to-cycle
+            // jitter is real and this cache was originally added to damp
+            // it). Removed anyway: a scrambled path that gets the car
+            // permanently stuck (this pipeline runs BEFORE lap completion,
+            // so a stuck car here can never even reach the point where the
+            // closed-loop pipeline takes over) is a strictly worse outcome
+            // than visible jitter, and this collision mechanism is not a
+            // theoretical risk -- it's the same one already confirmed live
+            // once this session. ClampToCorridor is kept (still a real,
+            // needed safety re-clamp on its own, unrelated to the cache) --
+            // only the blend/cache round-trip is removed. If jitter turns
+            // out to be a real problem again without it, the fix is a
+            // smaller/collision-safe cache key (e.g. keyed by array index
+            // instead of world position, or a proper radius search instead
+            // of exact grid bucketing), not reintroducing this one as-is.
             for (size_t i = 0; i < openRacingLine.size() && i < openCorridor.size(); ++i)
             {
-                fsd::PathPoint &wp = openRacingLine[i];
-                const double freshX = wp.x, freshY = wp.y;
-                wp = racingLineCache.BlendAndStore(freshX, freshY, wp, kBlendAlpha);
-                wp = fsd::ClampToCorridor(wp, openCorridor[i]);
-                racingLineCache.Overwrite(freshX, freshY, wp);
+                openRacingLine[i] = fsd::ClampToCorridor(openRacingLine[i], openCorridor[i]);
             }
         }
 
@@ -547,7 +1139,8 @@ int main()
         // STORED (frozen) values -- identical every cycle, so zero jitter
         // by construction, not just damped. Open: publish this cycle's
         // fresh values, same as always.
-        auto publishWorldPath = [](gz::transport::Node::Publisher &_pub, const std::vector<fsd::PathPoint> &_pts)
+        auto publishWorldPath = [](gz::transport::Node::Publisher &_pub, const std::vector<fsd::PathPoint> &_pts,
+                                    bool _closeLoop = false)
         {
             gz::msgs::Pose_V msg;
             for (const auto &p : _pts)
@@ -556,15 +1149,32 @@ int main()
                 pose->mutable_position()->set_x(p.x);
                 pose->mutable_position()->set_y(p.y);
             }
+            // Visually close the loop for Foxglove's own LINE_STRIP
+            // rendering (foxglove_bridge.cpp's generic kDebugPathTopics
+            // handling), which never connects its own last point back to
+            // the first -- 2026-09-02 user report: these closed-loop debug
+            // topics never actually LOOKED like a closed loop despite the
+            // underlying data genuinely representing one (storedClosed*
+            // really does wrap via modulo indexing everywhere else in this
+            // file, e.g. the cursor lookup below). Only when _closeLoop is
+            // set (the STORED, closed-loop arrays) -- the open pipeline's
+            // own debug paths are genuinely forward-only, and closing THEM
+            // would draw a spurious segment straight across the track.
+            if (_closeLoop && _pts.size() >= 3)
+            {
+                gz::msgs::Pose *closing = msg.add_pose();
+                closing->mutable_position()->set_x(_pts.front().x);
+                closing->mutable_position()->set_y(_pts.front().y);
+            }
             _pub.Publish(msg);
         };
-        publishWorldPath(debugMidpointsPub, closedLoop ? storedClosedMidpoints : openMidpoints);
-        publishWorldPath(debugSplinePub, closedLoop ? storedClosedSpline : openSpline);
-        publishWorldPath(debugRacingLinePub, closedLoop ? storedClosedRacingLine : openRacingLine);
+        publishWorldPath(debugMidpointsPub, closedLoop ? storedClosedMidpoints : openMidpoints, closedLoop);
+        publishWorldPath(debugSplinePub, closedLoop ? storedClosedSpline : openSpline, closedLoop);
+        publishWorldPath(debugRacingLinePub, closedLoop ? storedClosedRacingLine : openRacingLine, closedLoop);
         if (closedLoop)
         {
-            publishWorldPath(debugCorridorLeftPub, storedClosedCorridorLeft);
-            publishWorldPath(debugCorridorRightPub, storedClosedCorridorRight);
+            publishWorldPath(debugCorridorLeftPub, storedClosedCorridorLeft, true);
+            publishWorldPath(debugCorridorRightPub, storedClosedCorridorRight, true);
         }
         else
         {
@@ -575,33 +1185,39 @@ int main()
             {
                 const double leftNormalX = -c.tangentY;
                 const double leftNormalY = c.tangentX;
-                corridorLeft.push_back(fsd::PathPoint{c.point.x + c.halfWidth * leftNormalX,
-                                                        c.point.y + c.halfWidth * leftNormalY});
-                corridorRight.push_back(fsd::PathPoint{c.point.x - c.halfWidth * leftNormalX,
-                                                         c.point.y - c.halfWidth * leftNormalY});
+                corridorLeft.push_back(fsd::PathPoint{c.point.x + c.leftBound * leftNormalX,
+                                                        c.point.y + c.leftBound * leftNormalY});
+                corridorRight.push_back(fsd::PathPoint{c.point.x - c.rightBound * leftNormalX,
+                                                         c.point.y - c.rightBound * leftNormalY});
             }
-            for (auto &wp : corridorLeft)
-            {
-                wp = corridorLeftCache.BlendAndStore(wp.x, wp.y, wp, kBlendAlpha);
-            }
-            for (auto &wp : corridorRight)
-            {
-                wp = corridorRightCache.BlendAndStore(wp.x, wp.y, wp, kBlendAlpha);
-            }
+            // Cross-cycle blend removed here too (2026-09-03) -- same
+            // grid-cell-collision mechanism as openRacingLine's own blend
+            // above (see its own comment for the full reasoning), just for
+            // the debug visualization arrays instead of the array that
+            // actually feeds /planned_path. Debug-only and never consumed
+            // by control, but a collision here would still show up as a
+            // visibly wrong/jumping corridor boundary in Foxglove -- worth
+            // fixing for the same reason, at no behavioral risk since
+            // nothing downstream of these two arrays affects driving.
             publishWorldPath(debugCorridorLeftPub, corridorLeft);
             publishWorldPath(debugCorridorRightPub, corridorRight);
         }
 
         // What actually gets published to /planned_path.
         // Closed: nearest-point lookup into the STORED (already
-        // correctly-oriented, never re-decided) racing line, then a
-        // bounded forward slice walking in that array's own fixed index
-        // order -- no direction re-decision happens here at all, which is
-        // the whole point of computing the loop once (see the closedLoop
-        // comment above).
+        // correctly-oriented, never re-decided) racing line, then the
+        // FULL loop published starting from that point, walking in the
+        // array's own fixed index order all the way around -- no direction
+        // re-decision happens here at all, which is the whole point of
+        // computing the loop once (see the closedLoop comment above).
+        // Published whole, not truncated to a short window (2026-09-03) --
+        // see the publish site below for why that's safe.
         //
-        // The lookup itself uses a PERSISTENT CURSOR + local search
-        // window, NOT a fresh global nearest-distance scan every cycle --
+        // The CURSOR LOOKUP (finding where "nearest" is) still uses a
+        // PERSISTENT CURSOR + local search window, NOT a fresh global
+        // nearest-distance scan every cycle -- this is about efficiently
+        // and safely finding the START of the published loop, unrelated to
+        // how much of the loop gets published from there --
         // confirmed live (2026-08-31) as a real, severe bug the global-
         // scan version had: wherever a closed loop passes close to
         // itself (a start/finish area next to another section, a hairpin
@@ -630,7 +1246,6 @@ int main()
         // Open: this cycle's freshly-computed racing line, used whole (it
         // was already scoped to the windowed/forward-facing query, so
         // never needs this kind of bounding).
-        constexpr size_t kClosedLoopPublishCount = 60;
         constexpr int kClosedLoopCursorWindow = 30;  // index units (~15m at 0.5m spacing)
         std::vector<fsd::PathPoint> racingLineForPublish;
         size_t diagNearestIdx = 0;
@@ -754,10 +1369,85 @@ int main()
                         break;
                     }
                 }
+                // SANITY RE-CHECK (2026-09-03 user report: "stuck" -- chassis
+                // height normal, /planned_path non-empty, but confirmed live
+                // via direct offline replay that the published rotation did
+                // NOT start anywhere near the vehicle's true nearest point --
+                // the true nearest (world-verified, no closer candidate
+                // exists anywhere on the whole loop) was clearly identifiable
+                // and easily passed its own forward-progress check, yet the
+                // cursor had settled on something else entirely). Root cause:
+                // the loop above breaks on the FIRST window width that finds
+                // ANY passing candidate -- "foundUsable" only ever meant "a
+                // candidate exists in THIS window," never "this is actually
+                // close to the car." If closedLoopCursor has drifted enough
+                // that even the narrowest window (kClosedLoopCursorWindow=30)
+                // already contains SOME point that happens to pass the
+                // forward check (entirely plausible on a loop -- most stretches
+                // have SOME forward-facing point somewhere), the search stops
+                // right there and never tries a wider window, even though
+                // that "found" point can be many meters from the car's real
+                // position. This is a DIFFERENT gap from the "Global resync"
+                // case just below (which only fires when NO window finds
+                // anything at all) -- this one fires when a window finds
+                // something, just not the RIGHT something. kCursorSanityDist
+                // (5.0m) is comfortably above normal per-cycle tracking
+                // distance (the corridor itself averages ~1.7m half-width, so
+                // a genuinely-tracking cursor's own result should rarely
+                // exceed a few meters) but well under the scale of an actual
+                // divergence (the 2026-09-02 report above measured a 320+
+                // index gap) -- only escalates to the O(n) global check (same
+                // cost concern as the comment below, but only paid when the
+                // windowed result already looks suspicious, not every cycle).
+                constexpr double kCursorSanityDist = 5.0;  // meters
+                if (foundUsable && bestDistSq > kCursorSanityDist * kCursorSanityDist)
+                {
+                    size_t globalIdx = nearestIdx;
+                    double globalDistSq = bestDistSq;
+                    if (searchRange(0, n - 1, globalIdx, globalDistSq) && globalDistSq < bestDistSq)
+                    {
+                        nearestIdx = globalIdx;
+                        bestDistSq = globalDistSq;
+                    }
+                }
+                // Global resync (2026-09-02 user report): confirmed live as
+                // a real, distinct failure mode from the "locally sparse
+                // stretch" case the sparse-stretch fallback below already
+                // handles -- the cursor can fall arbitrarily far behind the
+                // car's true position (observed: cursor pinned at index
+                // 192, car's true nearest index at 515, on a 552-point
+                // loop -- 320+ indices apart, far past even the widest
+                // window=250 search above), with NO way to recover:
+                // whenever the ABOVE windowed search fails, the fallback
+                // below computes a fresh LIVE path but deliberately never
+                // touches closedLoopCursor (see its own comment), so the
+                // gap between the frozen cursor and the car's real position
+                // only ever grows, cycle after cycle, forever, once it
+                // first exceeds the window. This is NOT a plain global
+                // nearest-distance search (see this whole block's own
+                // opening comment for why that's unsafe on a self-crossing
+                // loop) -- it's the EXACT SAME forward-progress-verified
+                // searchRange() used above, just given the whole array
+                // (0..n-1, already self-wrapping via searchRange's own
+                // modulo) instead of a window clamped/anchored to the
+                // stale cursor. The forward-progress check is what actually
+                // rejects fold-back candidates (confirmed live 2026-09-01,
+                // see its own comment) -- the window was an efficiency/
+                // extra-safety layer on top of it, not the sole source of
+                // correctness, so extending the SAME check globally is safe
+                // as a last resort, not a reversion to the original bug.
+                // Deliberately tried only after the local widening above
+                // has already exhausted itself (an O(n) full scan every
+                // cycle would be wasteful when the cheap local search
+                // already succeeds the vast majority of the time).
                 if (!foundUsable)
                 {
-                    // Even the widest search found nothing usable in the
-                    // STORED array -- confirmed live (2026-09-01) as a
+                    foundUsable = searchRange(0, n - 1, nearestIdx, bestDistSq);
+                }
+                if (!foundUsable)
+                {
+                    // Even the global resync above found nothing usable in
+                    // the STORED array -- confirmed live (2026-09-01) as a
                     // real, recurring case, not just a theoretical one:
                     // some track sections end up genuinely sparse in the
                     // one-time snapshot (perception simply didn't detect/
@@ -785,15 +1475,14 @@ int main()
                     // sparse stretch, the normal stored-line lookup
                     // resumes on its own next cycle.
                     const std::vector<fsd::PathPoint> fallbackMidpoints =
-                        kActiveMidpointExtractor(window.blue, window.yellow, window.vehiclePose);
+                        kActiveMidpointExtractor(window.blue, window.yellow, window.orange, window.vehiclePose);
                     const std::vector<fsd::PathPoint> fallbackSpline =
                         fsd::FitAndSampleSpline(fallbackMidpoints, kSplineSampleSpacing);
                     const std::vector<fsd::CorridorSample> fallbackCorridor = fsd::ComputeCorridor(
                         fallbackSpline, window.blue, window.yellow, window.orange, kCorridorSafetyMargin,
                         kCorridorMinHalfWidth, kCorridorMaxHalfWidth, /*closed=*/false);
-                    racingLineForPublish = fsd::OptimizeRacingLine(fallbackCorridor, kRacingLineIterations,
-                                                                    kRacingLineRate, kRacingLineMaxStep,
-                                                                    /*closed=*/false);
+                    racingLineForPublish = fsd::OptimizeRacingLine(fallbackCorridor, kOpenRacingLineSweeps,
+                                                                    kOpenRacingLineOmega, /*closed=*/false);
                     diagNearestIdx = closedLoopCursor;  // unchanged -- didn't move the cursor this cycle
                     diagNearestDist = -1.0;             // sentinel: fallback path was used, not a lookup
                 }
@@ -802,10 +1491,23 @@ int main()
                     closedLoopCursor = nearestIdx;
                     diagNearestIdx = nearestIdx;
                     diagNearestDist = std::sqrt(bestDistSq);
+                    // Publish the FULL loop, rotated to start at nearestIdx,
+                    // not a truncated window (2026-09-03, explicit user
+                    // request: "/planned_path" should visually BE the closed
+                    // loop, with target selection handling "pick the point
+                    // in front" rather than pre-truncating the array).
+                    // Safe to do: pure_pursuit_controller.cpp's own target
+                    // search is already DISTANCE-gated, not count-gated (it
+                    // breaks on the first point past lookaheadDistance, and
+                    // the forward-preview scan just skips anything past
+                    // kBrakePreviewDistance) -- searching a longer array
+                    // costs a few more skipped iterations, not a behavior
+                    // change. RemoveBehindCarPoints (downstream) still trims
+                    // whatever ends up behind the car once converted to body
+                    // frame, same as it always did for the windowed case.
                     const size_t un = storedClosedRacingLine.size();
-                    const size_t count = std::min(un, kClosedLoopPublishCount);
-                    racingLineForPublish.reserve(count);
-                    for (size_t k = 0; k < count; ++k)
+                    racingLineForPublish.reserve(un);
+                    for (size_t k = 0; k < un; ++k)
                     {
                         racingLineForPublish.push_back(storedClosedRacingLine[(nearestIdx + k) % un]);
                     }
@@ -827,6 +1529,15 @@ int main()
             const fsd::Point2D body = fsd::WorldToBody(window.vehiclePose, wp.x, wp.y);
             racingLineBody.push_back(fsd::PathPoint{body.x, body.y});
         }
+
+        // No cross-cycle blending for the closed-loop published window --
+        // the source (storedClosedRacingLine) is a frozen, static array
+        // with no real jitter to smooth, and a from-scratch cache-based
+        // attempt was confirmed live to corrupt the output instead. The
+        // open pipeline's own racing line no longer blends either (2026-09-
+        // 03, see that block's own declaration comment for why -- the same
+        // corruption mechanism, confirmed live there too).
+
         double diagPreClampMinX = 0.0, diagPreClampMaxX = 0.0;
         if (!racingLineBody.empty())
         {
@@ -839,11 +1550,13 @@ int main()
         }
 
         // Safety-net clamp, same as the reactive pipeline's own final step
-        // (path_utils.hpp) -- reused unmodified, since EnforceMinTurnRadius/
-        // EnforceMinClearance's geometry is already correctly defined
-        // relative to the vehicle at the body-frame origin. Needs ALL
-        // nearby cones (including orange, which the centerline extraction
-        // itself deliberately excludes) converted to body frame too.
+        // (path_utils.hpp) -- reused unmodified, since EnforceMinTurnRadius's
+        // geometry is already correctly defined relative to the vehicle at
+        // the body-frame origin. Needs ALL nearby cones (including orange,
+        // which the centerline extraction itself deliberately excludes)
+        // converted to body frame too, for EnforceMinTurnRadius's own
+        // post-clamp clearance drop-check (EnforceMinClearance itself is no
+        // longer called on this corridor-based path -- see below).
         std::vector<fsd::ClassifiedCone> allConesBody;
         allConesBody.reserve(window.blue.size() + window.yellow.size() + window.orange.size());
         for (const auto *coneList : {&window.blue, &window.yellow, &window.orange})
@@ -861,8 +1574,10 @@ int main()
         // starting at the vehicle's world position) is still correct in
         // body frame.
         //
-        // EnforceMinTurnRadius runs LAST -- confirmed directly (2026-08-31)
-        // as a real, live bug the other way around: EnforceMinClearance's
+        // EnforceMinTurnRadius runs LAST -- historical reasoning from when
+        // this call site still ran EnforceMinClearance first (removed
+        // 2026-09-04, see below): confirmed directly (2026-08-31) as a
+        // real, live bug the other way around, EnforceMinClearance's
         // cone-avoidance push has no awareness of the turn-radius
         // constraint, so it can shove a waypoint back OUTSIDE the vehicle's
         // achievable curvature after EnforceMinTurnRadius had just pulled
@@ -870,13 +1585,137 @@ int main()
         // implying curvature nearly 2x the physical max, right at a
         // hairpin apex where the racing line deliberately hugs the inside
         // boundary (see path_generator.cpp's own NearestPairMidpointPath
-        // for the fuller explanation -- same bug, same fix, both call
-        // sites).
+        // for the fuller explanation -- that reactive-pipeline call site
+        // still runs both, in this order, for the same reason).
+        // Closed-loop: only clamp a GEOMETRICALLY-determined near prefix of
+        // the array (the car's actual upcoming path), NOT the whole
+        // 555-point loop (2026-09-03, two iterations to get right --
+        // history below). EnforceMinTurnRadius's engagement test is body-
+        // frame PROXIMITY (|x| < kMinTurnRadius), not array position -- on
+        // a track that passes close to the car's current spot more than
+        // once (confirmed real, not a bug: /planning/debug_racing_line
+        // shows the same underlying data with no artifact), a point that's
+        // far away in the array (a DIFFERENT lap/leg of the track) can
+        // still land inside that small radius purely because it's
+        // geographically nearby, and get incorrectly squashed toward the
+        // vehicle's own centerline as if it were the car's own next
+        // waypoint -- confirmed live as the exact mechanism behind a
+        // visible "hook"/crossover in /planned_path that doesn't exist in
+        // /debug_racing_line's unclamped version of the same data.
+        //
+        // First attempt: a FIXED array-position cutoff (e.g. "first 80/350
+        // positions"). Two real problems, both confirmed live: (1) if
+        // clamping drops several near points (car genuinely close to a
+        // cone), the fixed cutoff still reattaches raw data starting at
+        // the ORIGINAL fixed position regardless, leaving a gap -- a
+        // published path whose first point was 11.8m from the vehicle
+        // origin, a real stuck event. (2) even after making that boundary
+        // adaptive, a fixed position range still isn't safe: WHERE the
+        // track happens to fold back near itself varies with the car's
+        // current position on the loop -- one capture showed a fold-back
+        // at array position 96, well inside what should have been a "safe"
+        // near zone, so no fixed count/range is universally correct.
+        //
+        // Correct approach: determine the near zone GEOMETRICALLY instead
+        // of by a fixed count. Scan forward from k=0 (RAW, pre-clamp body
+        // positions) and stop the very first time a point's range exceeds
+        // kWindowRadius -- the same radius allConesBody itself is limited
+        // to, so points beyond it have no live cone data to clamp against
+        // anyway. Critically this is a ONE-WAY, MONOTONIC scan: once the
+        // raw path has left the vehicle's immediate vicinity, it never
+        // re-enters "near" classification even if a later point (a
+        // different, unrelated leg of the track folding back close by)
+        // happens to have a small range of its own -- that's exactly the
+        // self-crossing case this whole fix exists to exclude. Points
+        // within the resulting prefix still get the normal
+        // EnforceMinClearance/TurnRadius treatment (including drops for
+        // genuinely unsafe ones); the boundary is deliberately NOT grown
+        // back out to backfill drops the way the first fix attempt did --
+        // growing past the geometric near-zone boundary would just
+        // reintroduce the fold-back risk. A drop-heavy near zone
+        // publishing fewer usable points is an accepted, rare degraded
+        // case (the same limitation the original small fixed-window design
+        // always had), not something to patch further here.
         const size_t diagPreClampCount = racingLineBody.size();
-        racingLineBody =
-            fsd::EnforceMinTurnRadius(fsd::EnforceMinClearance(std::move(racingLineBody), allConesBody));
+        if (closedLoop)
+        {
+            size_t cutoff = racingLineBody.size();
+            for (size_t k = 0; k < racingLineBody.size(); ++k)
+            {
+                const double range = std::hypot(racingLineBody[k].x, racingLineBody[k].y);
+                if (range > kWindowRadius)
+                {
+                    cutoff = k;
+                    break;
+                }
+            }
+            std::vector<fsd::PathPoint> nearPart(racingLineBody.begin(),
+                                                   racingLineBody.begin() + static_cast<long>(cutoff));
+            std::vector<fsd::PathPoint> farPart(racingLineBody.begin() + static_cast<long>(cutoff),
+                                                 racingLineBody.end());
+            // EnforceMinClearance REMOVED from this path entirely (2026-09-
+            // 04, user reports "the blue planned path... zigzagged" and
+            // separately "fails to stay in track... crossover... near the
+            // hairpin" -- STILL present after a first attempt that kept the
+            // push but re-clamped with ClampToCorridor afterward). That
+            // first attempt only bounded the damage, it didn't remove it:
+            // ClampToCorridor's own tolerance (+-1m longitudinal via
+            // kMaxLongitudinalDrift, plus the full corridor lateral width)
+            // is generous relative to this pipeline's 0.5m sample spacing
+            // by design -- it exists to absorb a SMALL cross-cycle blend
+            // drift, not a multi-meter push -- so a point could still land
+            // anywhere in a ~1-2m cloud independent of its neighbors',
+            // which is still enough scatter, relative to 0.5m spacing, to
+            // read as a zigzag. Confirmed directly: a live capture with the
+            // re-clamp already deployed still showed a 177 degree turn and
+            // max per-point displacement of 1.66m from the optimizer's own
+            // output.
+            //
+            // The actual fix is removing EnforceMinClearance's push, not
+            // bounding it further. It's now fully redundant: the corridor
+            // (corridor.cpp's ComputeCorridor) already reserves
+            // kCorridorSafetyMargin on every sample against the nearest
+            // blue/yellow/orange boundary cone, and OptimizeRacingLine's
+            // SOR solve keeps every point inside that bound BY
+            // CONSTRUCTION -- this push, layered on top, can only ever
+            // break that guarantee (as just confirmed), never improve on
+            // it. It was designed for the OLD reactive pipeline's raw
+            // centerline (path_generator.cpp), which had no corridor
+            // concept and no other source of clearance guarantee at all --
+            // that justification doesn't carry over to a pipeline where the
+            // clearance guarantee already exists upstream, smoothly, by
+            // construction. EnforceMinTurnRadius is KEPT: it enforces a
+            // genuinely different constraint (vehicle kinematics) that
+            // corridor width alone says nothing about, and its own clamp is
+            // a simple, smooth, monotonic function of body-frame x (not a
+            // sum of independent per-cone pushes), so it doesn't reintroduce
+            // this same neighbor-incoherence failure mode.
+            nearPart = fsd::EnforceMinTurnRadius(std::move(nearPart));
+            racingLineBody = std::move(nearPart);
+            racingLineBody.insert(racingLineBody.end(), farPart.begin(), farPart.end());
+        }
+        else
+        {
+            // See the closed-loop branch's own comment just above for why
+            // EnforceMinClearance is no longer called here.
+            racingLineBody = fsd::EnforceMinTurnRadius(std::move(racingLineBody));
+        }
         const size_t diagPostClampCount = racingLineBody.size();
-        racingLineBody = RemoveBehindCarPoints(std::move(racingLineBody));
+        // NOT applied to the closed-loop case (2026-09-03) -- this filter
+        // drops any point with negative body-frame x, which is exactly
+        // right for a short forward-only window (negative x there really
+        // does mean "just passed"), but wrong once the FULL loop is
+        // published: roughly half of any closed loop's points naturally
+        // fall behind the car's CURRENT instantaneous heading simply
+        // because they're on the far/opposite side of the track, not
+        // because the car passed them. Confirmed live as the cause of the
+        // published loop rendering as a chopped/partial shape instead of
+        // the actual track outline. The open pipeline's own short window
+        // still needs this exactly as before.
+        if (!closedLoop)
+        {
+            racingLineBody = RemoveBehindCarPoints(std::move(racingLineBody));
+        }
 
         // Diagnostic only, rate-limited to once every ~2s (not every empty
         // cycle) -- added specifically to pin down a confirmed live empty-

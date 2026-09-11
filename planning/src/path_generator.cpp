@@ -13,15 +13,32 @@ namespace
 // MinimizeCurvature: how many neighbor-averaging passes to run, and how
 // much of each pass's pull to actually apply. Picked for a smooth, visibly
 // wider hairpin shape without needing many iterations to converge --
-// see MinimizeCurvature's own comment for the algorithm. Not yet tuned
-// against a second independent live measurement the way some other
-// constants in this file are -- a first, reasoned attempt at a genuinely
-// new algorithm; if live testing shows the racing line isn't wide enough
-// (raise kCurvatureSmoothingIterations or kCurvatureSmoothingRate) or is
-// cutting corners too aggressively into the clearance margin (lower them),
-// that's a reason to retune with fresh measurements, not to have guessed
-// harder up front.
-constexpr int kCurvatureSmoothingIterations = 15;
+// see MinimizeCurvature's own comment for the algorithm.
+//
+// DISABLED (iterations 15 -> 0), 2026-09-08, user report: "planned path
+// goes too wide" -- confirmed live as a real cone-wedge, not just a visual
+// impression: this track's own real per-side slack between EnforceMinClearance
+// (kMinCarClearance=1.35m) and the raw 3.0m track width is only
+// ~0.10-0.20m (see path_utils.cpp's own EnforceMinTurnRadius comment,
+// "on this track's real corridor margins"), and this pass exists
+// specifically to spend lateral room pulling the path toward the
+// boundary. With essentially none available, every pull immediately
+// re-triggers EnforceMinClearance, and when the resulting point also
+// fails EnforceMinTurnRadius's clearance recheck, that function's own
+// documented fallback publishes a too-close point anyway rather than
+// stopping -- a believable, direct mechanism for the live wedge.
+// Exactly the same lesson already learned on the CLOSED-LOOP racing line
+// (racing_line_optimizer.cpp, 2026-09-04: "back to safe, barely-optimized
+// centerline-hugging shape... a car essentially following raw centerline
+// through corners needs more margin, not less"), just never applied here.
+// 0 disables the smoothing (the loop below simply doesn't run, falling
+// back to the raw paired-midpoint centerline) without deleting the
+// mechanism -- re-enable only once this track's own margin budget is
+// separately widened (a larger kAssumedHalfTrackWidth-relative corridor,
+// or a smaller kMinCarClearance/kCorridorLateralClearance, each a real
+// safety tradeoff of its own) or the smoothing itself is made
+// margin-aware, not by guessing a smaller nonzero rate under time pressure.
+constexpr int kCurvatureSmoothingIterations = 0;
 constexpr double kCurvatureSmoothingRate = 0.35;
 // Caps how far a SINGLE iteration can move any one waypoint -- confirmed
 // directly as necessary, not just defensive: with only a handful of

@@ -21,7 +21,7 @@
 // actual STEERING decision (see planning.cpp for why: /planned_path
 // waypoints are already relative to the car, so no absolute pose is needed
 // to steer toward one). /estimated_pose IS subscribed to now, but only for
-// PurePursuitController's stuck-detection/reverse-recovery path (see
+// PurePursuitController's stuck-detection path (see
 // control_types.hpp's ControlInputs::worldX/worldY comment) -- normal
 // driving never reads it.
 //

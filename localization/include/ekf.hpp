@@ -72,8 +72,13 @@ public:
         double x;
         double y;
         ConeColor color;
-        // Positional variance (Pll diagonal) AT THE MOMENT OF RETIREMENT --
-        // zero/unused for still-active landmarks. Needed because the
+        // Positional variance (Pll diagonal). For a retired landmark, this
+        // is frozen AT THE MOMENT OF RETIREMENT (no longer part of the
+        // joint state to read live, see the class comment); for a still-
+        // ACTIVE landmark, Landmarks() populates this fresh from m_P's own
+        // diagonal on every call (2026-09-04 -- previously hardcoded to
+        // 0.0/0.0 here, back when nothing needed an active landmark's own
+        // variance from outside this class). Originally added because the
         // retired-landmark re-match gate (see CorrectOrAddLandmark) was
         // using the VEHICLE's own current position variance as a stand-in
         // for "how uncertain am I about this landmark", which collapses to
@@ -162,6 +167,15 @@ public:
     double X() const { return m_x(0); }
     double Y() const { return m_x(1); }
     double Yaw() const { return m_x(2); }
+    // Body-frame forward/lateral velocity and yaw rate -- see the state
+    // vector's own layout (m_x(3)/m_x(4)/m_x(5)) used throughout Predict()/
+    // CorrectGroundSpeed()/CorrectYawRate(). Added 2026-09-02 (user
+    // request: publish velocity/acceleration for Foxglove visualization) --
+    // this state already existed and was being estimated/corrected the
+    // whole time, just never exposed outside the class.
+    double Vx() const { return m_x(3); }
+    double Vy() const { return m_x(4); }
+    double YawRate() const { return m_x(5); }
 
     // Every discovered landmark, active or retired -- see the class
     // comment's "Submap / local correlation" section. Active landmarks'
@@ -399,6 +413,49 @@ private:
     // Same throttling and O(active^2) cost profile as
     // PruneStaleActiveDuplicates, run alongside it.
     void PruneCrossColorConflicts();
+
+    // Orange-priority prune (2026-09-03, user report: "why did we go
+    // straight into the left cone?? ... orange cones have priority and any
+    // cone that's within a certain distance of an orange cone gets removed,
+    // always"). UNCONDITIONAL -- unlike every other Prune* pass in this
+    // class, no obsCount maturity gate and no statistical (Mahalanobis)
+    // test, just a plain Euclidean check against kOrangePruneRadius (see
+    // its own comment in ekf.cpp for why that's set equal to
+    // kDuplicateAbsoluteDistanceCap, not the larger, already-abandoned
+    // kDuplicatePruneRadius). Orange itself is never removed by this pass
+    // (only non-orange landmarks near an orange one are); if two orange
+    // landmarks were somehow both real duplicates of each other, that's
+    // still PruneStaleActiveDuplicates's (same-color) job, unaffected by
+    // this pass. Distinct from PruneCrossColorConflicts above, which
+    // removes BOTH sides of a statistically-confirmed cross-color
+    // duplicate regardless of color -- this pass instead lets orange WIN
+    // unconditionally against any other color within range, on the theory
+    // that a misclassified duplicate near the start/finish gate is more
+    // often a real cone wrongly seen as non-orange than the reverse (the
+    // orange class is visually distinct enough, and this track has only 2
+    // of them, that a genuine orange detection is less likely to be the
+    // spurious one).
+    //
+    // Same throttling and cost profile as the two passes above (O(active^2)
+    // in the worst case, though bounded in practice to O(active * 2) real
+    // comparisons since only 2 orange landmarks exist on this track).
+    void PruneNonOrangeNearOrange();
+
+    // Removes an IMMATURE (obsCount < kMinObsCountForPruning) active
+    // landmark once the vehicle's current pose implies it should
+    // plausibly be re-detectable (in range, roughly ahead -- see
+    // kUnconfirmedVisibleRange/kUnconfirmedVisibleBehindMargin in ekf.cpp)
+    // but it hasn't actually been re-confirmed in kUnconfirmedVisibleTicks
+    // ticks. Closes a real gap the other two prune passes above don't
+    // cover: both of them only ever remove a landmark that's
+    // statistically indistinguishable from ANOTHER nearby landmark -- a
+    // ghost/mis-associated landmark sitting in open space, far from any
+    // real landmark to compare against, was invisible to every existing
+    // mechanism and could persist indefinitely (2026-09-02 user report:
+    // planning routing the car into a ghost cone that never got
+    // corrected). O(active), no matrix work -- much cheaper than the
+    // O(active^2) passes above, throttled more lightly.
+    void PruneUnconfirmedVisibleLandmarks();
 
     // Packs the grid cell containing world position (_x, _y) into a single
     // key for m_retiredGrid -- see that member's comment for the grid this

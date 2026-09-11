@@ -322,6 +322,33 @@ constexpr double kLandmarkVarianceFloor = 0.3; // meters^2 (per axis, Pll's diag
 // while erasing a real track-boundary cone is a safety issue.
 constexpr double kDuplicateAbsoluteDistanceCap = 0.35; // meters
 
+// Orange-priority prune radius (2026-09-03, user report: "why did we go
+// straight into the left cone?? ... orange cones have priority and any
+// cone that's within a certain distance of an orange cone gets removed,
+// always"). Deliberately set EQUAL to kDuplicateAbsoluteDistanceCap, NOT
+// to the larger historical kDuplicatePruneRadius (1.5m, see that
+// constant's own comment above for why it was abandoned) -- the user
+// asked for an unconditional ("always") removal with no statistical/
+// maturity gating at all, which is exactly the class of fixed-Euclidean-
+// threshold rule this file's own measured history (real minimum distinct-
+// cone spacing on this track is 0.57m, confirmed directly from
+// trackdrive.sdf) already found unsafe at anything approaching 1.5m: it
+// would delete genuinely real, distinct boundary cones that simply happen
+// to sit near the start/finish gate, not just misclassification
+// duplicates. 0.35m keeps the same safety property kDuplicateAbsoluteDistanceCap
+// already relies on -- well under the real minimum genuine cone spacing,
+// so an unconditional rule at this radius can't ever remove two real,
+// distinct cones on this track, no matter how it's gated. Not yet live-
+// validated for whether this catches the actual case that produced the
+// "went straight into the left cone" report -- if a spurious duplicate
+// near the gate turns out to sit farther than 0.35m from its real orange
+// counterpart, this radius alone won't catch it, and the actual root
+// cause may be unrelated to this prune pass at all (see this constant's
+// own call site comment in ekf.hpp for the alternative explanation this
+// session already flagged: the racing line now legitimately hugs closer
+// to real boundary cones after a separate, unrelated fix).
+constexpr double kOrangePruneRadius = kDuplicateAbsoluteDistanceCap; // meters
+
 bool IsStatisticallySameLandmark(double dx, double dy, double varX1, double varY1, double varX2, double varY2)
 {
     if (dx * dx + dy * dy > kDuplicateAbsoluteDistanceCap * kDuplicateAbsoluteDistanceCap)
@@ -364,6 +391,58 @@ bool IsStatisticallySameLandmark(double dx, double dy, double varX1, double varY
 // catch it (these run every 20th correction -- see each prune function's
 // own throttling comment).
 constexpr uint32_t kMinObsCountForPruning = 3;
+
+// BUG FIX (2026-09-02, user report): a landmark that's a wrong/ghost
+// detection (mis-association, spurious cluster -- see
+// lidar_projector.cpp's own ghost-landmark history) but happens to sit
+// far enough from any REAL nearby landmark to fail both the primary
+// Mahalanobis match gate (CorrectOrAddLandmark) and the duplicate-pruning
+// gate (kDuplicateAbsoluteDistanceCap/IsStatisticallySameLandmark above)
+// has, until now, had NO mechanism that could ever remove it: correction
+// only ever happens on a MATCH, and every existing prune pass only fires
+// when there's ANOTHER landmark nearby to compare against. A ghost
+// sitting in open space, isolated from whatever real cone it was
+// mis-detected near, would sit in the active map forever -- or until
+// EvictStaleIfOverCapacity's pure LRU-under-capacity-pressure eventually
+// reaches it, which can take a full lap or never happen at all if the
+// same perception glitch keeps spuriously "re-confirming" it in place.
+//
+// Fix (PruneUnconfirmedVisibleLandmarks, below): track whether the
+// vehicle's CURRENT pose implies a given landmark should plausibly be
+// re-detectable right now (in range, roughly ahead -- see
+// kUnconfirmedVisibleRange/kUnconfirmedVisibleBehindMargin), and if so,
+// whether it's actually been re-confirmed recently (kUnconfirmedVisibleTicks).
+// Deliberately scoped to IMMATURE landmarks only (obsCount <
+// kMinObsCountForPruning, the same maturity bar the duplicate-pruning
+// passes already use) -- a landmark already confirmed several times over
+// is overwhelmingly more likely to be a real cone temporarily missed by
+// one noisy detection cycle (occlusion, motion blur, a momentary
+// confidence dip) than an actual ghost, and erasing a REAL track-boundary
+// cone is a safety issue this file's own established philosophy (see
+// kDuplicateAbsoluteDistanceCap's own comment) treats as far worse than a
+// ghost surviving a few extra cycles.
+constexpr double kUnconfirmedVisibleRange = 15.0;  // meters, conservatively inside
+                                                    // lidar_projector.cpp's own kMaxValidRange=20.0
+// Same "roughly ahead, not sharply behind" allowance as
+// planning/landmark_map.cpp's own kBehindMargin, reused here for
+// consistency of what this whole system considers "the car could
+// plausibly have just seen this". Deliberately NOT a real camera-FOV
+// model (this codebase's 3-camera panorama's exact angular coverage isn't
+// modeled anywhere else either) -- a conservative approximation favoring
+// false negatives (missing a real ghost) over false positives (evicting a
+// real cone) is the safer default per this file's own established
+// philosophy.
+constexpr double kUnconfirmedVisibleBehindMargin = -3.0;  // meters
+// m_tick advances on every landmark correction/add EVENT, not once per
+// camera frame -- with ~10-20 landmarks typically in view at once on this
+// track, that's roughly 10-20 ticks per actual perception cycle
+// (~9-10Hz), so ~150 ticks approximates several real seconds -- long
+// enough that a single missed detection or two (ordinary noise) can't
+// trigger this, short enough to actually clear a ghost within a few
+// seconds of the car passing where it claims to be. First-attempt,
+// untested-live value -- retune from a fresh live measurement the same
+// way every other first-attempt constant in this codebase has been.
+constexpr uint64_t kUnconfirmedVisibleTicks = 150;
 } // namespace
 
 namespace fsd
@@ -813,7 +892,26 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
         // PruneStaleRetiredDuplicates's declaration in ekf.hpp).
         PruneStaleRetiredDuplicates();
         PruneStaleActiveDuplicates();
+        // BUG FIX (2026-09-03, confirmed live minutes after deploy: 0
+        // orange landmarks in /estimated_landmarks despite a real orange
+        // cone having been detected there moments earlier, immediately
+        // followed by a stuck-watchdog latch right at the gate).
+        // PruneNonOrangeNearOrange must run BEFORE PruneCrossColorConflicts,
+        // not after -- the exact misclassification duplicate scenario
+        // PruneNonOrangeNearOrange exists to resolve (a real orange cone
+        // plus a spurious same-position wrong-color detection) is ALSO
+        // exactly what PruneCrossColorConflicts's own cross-color
+        // statistical test fires on, and that pass removes BOTH sides
+        // unconditionally once it fires -- including the real orange cone,
+        // before PruneNonOrangeNearOrange ever got a chance to instead keep
+        // orange and remove only the spurious duplicate. Running the
+        // orange-priority pass first resolves that same pair (real orange,
+        // spurious other-color duplicate) its own way, so by the time
+        // PruneCrossColorConflicts runs there's no longer a conflicting
+        // pair left for it to find.
+        PruneNonOrangeNearOrange();
         PruneCrossColorConflicts();
+        PruneUnconfirmedVisibleLandmarks();
         return;
     }
 
@@ -933,7 +1031,12 @@ void Ekf::CorrectOrAddLandmark(double _measuredBodyX, double _measuredBodyY,
     EvictStaleIfOverCapacity();
     PruneStaleRetiredDuplicates();
     PruneStaleActiveDuplicates();
+    // See the other call site's own comment (above, in the reactivation
+    // branch) for why PruneNonOrangeNearOrange must run before
+    // PruneCrossColorConflicts, not after.
+    PruneNonOrangeNearOrange();
     PruneCrossColorConflicts();
+    PruneUnconfirmedVisibleLandmarks();
 }
 
 void Ekf::LandmarkInnovation(int _landmarkIndex, double _measuredBodyX, double _measuredBodyY,
@@ -1170,8 +1273,25 @@ std::vector<Ekf::LandmarkEstimate> Ekf::Landmarks() const
     for (size_t i = 0; i < m_landmarkColors.size(); ++i)
     {
         const int li = kVehicleStateDim + 2 * static_cast<int>(i);
-        result.push_back(LandmarkEstimate{
-            m_x(li), m_x(li + 1), m_landmarkColors[i], 0.0, 0.0, m_landmarkUid[i], m_landmarkObsCount[i]});
+        // varX/varY populated from m_P's own diagonal (2026-09-04) -- these
+        // used to be hardcoded 0.0/0.0 for every ACTIVE landmark (the
+        // struct's own header comment used to say "zero/unused for still-
+        // active landmarks"), since nothing internal to this class ever
+        // needed an active landmark's variance outside the joint m_P it
+        // already lives in. Now needed by an external consumer (planning's
+        // confidence-based corridor width): m_P(li,li)/m_P(li+1,li+1) is
+        // the EXACT same extraction RemoveActiveLandmark's own retirement
+        // path already uses to freeze varX/varY at the moment a landmark
+        // leaves the joint state (see below) -- this just does it for every
+        // still-active landmark too, on every query, rather than only once
+        // at retirement. Safe: every existing internal read of varX/varY
+        // (IsStatisticallySameLandmark, AddLandmark's reactivation fusion)
+        // only ever reads it off m_retiredLandmarks entries or a
+        // _priorEstimate sourced from there, never off a fresh Landmarks()
+        // result -- this only changes what flows OUT to external
+        // publishers, nothing fed back into the EKF's own internal logic.
+        result.push_back(LandmarkEstimate{m_x(li), m_x(li + 1), m_landmarkColors[i], m_P(li, li), m_P(li + 1, li + 1),
+                                           m_landmarkUid[i], m_landmarkObsCount[i]});
     }
     // Retired landmarks are no longer part of the joint state (see the
     // class comment), but /estimated_landmarks should still show the full
@@ -1485,6 +1605,106 @@ void Ekf::PruneCrossColorConflicts()
             ++a;
         }
         // Same re-scan-from-a reasoning as PruneStaleActiveDuplicates above.
+    }
+}
+
+void Ekf::PruneNonOrangeNearOrange()
+{
+    // Throttled -- see this method's declaration in ekf.hpp for why.
+    static int callCount = 0;
+    if (++callCount % 20 != 0)
+    {
+        return;
+    }
+
+    // Collect victims first rather than removing while iterating -- a
+    // single non-orange landmark could be within range of BOTH orange
+    // landmarks (unlikely given the gate's own real spacing, but not
+    // structurally impossible), and RemoveActiveLandmark shifts every
+    // later index down by one, which would corrupt an in-progress outer
+    // loop over m_landmarkColors. Sorted + deduped, then removed
+    // largest-index-first so removing one never invalidates an
+    // earlier-indexed victim still waiting in this same list.
+    std::vector<size_t> toRemove;
+    for (size_t o = 0; o < m_landmarkColors.size(); ++o)
+    {
+        if (m_landmarkColors[o] != fsd::ConeColor::Orange)
+        {
+            continue;
+        }
+        const int liO = kVehicleStateDim + 2 * static_cast<int>(o);
+        for (size_t b = 0; b < m_landmarkColors.size(); ++b)
+        {
+            if (b == o || m_landmarkColors[b] == fsd::ConeColor::Orange)
+            {
+                continue;
+            }
+            const int liB = kVehicleStateDim + 2 * static_cast<int>(b);
+            const double dx = m_x(liO) - m_x(liB);
+            const double dy = m_x(liO + 1) - m_x(liB + 1);
+            if (dx * dx + dy * dy < kOrangePruneRadius * kOrangePruneRadius)
+            {
+                toRemove.push_back(b);
+            }
+        }
+    }
+    std::sort(toRemove.begin(), toRemove.end());
+    toRemove.erase(std::unique(toRemove.begin(), toRemove.end()), toRemove.end());
+    for (auto it = toRemove.rbegin(); it != toRemove.rend(); ++it)
+    {
+        RemoveActiveLandmark(*it);
+    }
+}
+
+void Ekf::PruneUnconfirmedVisibleLandmarks()
+{
+    // Throttled, same reasoning as the other Prune* passes' own comments
+    // -- lighter than their 20 here since this pass is only O(active)
+    // (a handful of scalar comparisons per landmark, no matrix work at
+    // all, unlike the O(active^2) passes above).
+    static int callCount = 0;
+    if (++callCount % 5 != 0)
+    {
+        return;
+    }
+
+    const double yaw = m_x(2);
+    const double cosYaw = std::cos(yaw);
+    const double sinYaw = std::sin(yaw);
+
+    for (size_t i = 0; i < m_landmarkColors.size();)
+    {
+        // See kUnconfirmedVisibleRange's own comment for why this is
+        // scoped to immature landmarks only.
+        if (m_landmarkObsCount[i] >= kMinObsCountForPruning)
+        {
+            ++i;
+            continue;
+        }
+
+        const int li = kVehicleStateDim + 2 * static_cast<int>(i);
+        const double dx = m_x(li) - m_x(0);
+        const double dy = m_x(li + 1) - m_x(1);
+        // Body-frame offset (inverse of the world-frame conversion at the
+        // top of CorrectOrAddLandmark) -- rotate the world-frame delta by
+        // -yaw.
+        const double bodyX = dx * cosYaw + dy * sinYaw;
+        const double bodyY = -dx * sinYaw + dy * cosYaw;
+        const double range = std::hypot(bodyX, bodyY);
+
+        const bool shouldBeVisible =
+            range <= kUnconfirmedVisibleRange && bodyX >= kUnconfirmedVisibleBehindMargin;
+        const uint64_t ticksSinceConfirmed = m_tick - m_landmarkLastSeen[i];
+
+        if (shouldBeVisible && ticksSinceConfirmed >= kUnconfirmedVisibleTicks)
+        {
+            RemoveActiveLandmark(i);
+            // Re-scan from the SAME index i -- RemoveActiveLandmark
+            // shifted every later index down by one (see its own
+            // declaration comment in ekf.hpp).
+            continue;
+        }
+        ++i;
     }
 }
 

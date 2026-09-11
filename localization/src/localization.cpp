@@ -5,13 +5,16 @@
 #include <string>
 
 #include <gz/transport/Node.hh>
+#include <gz/msgs/double.pb.h>
 #include <gz/msgs/imu.pb.h>
+#include <gz/msgs/marker.pb.h>
 #include <gz/msgs/navsat.pb.h>
 #include <gz/msgs/odometry.pb.h>
 #include <gz/msgs/pose.pb.h>
 #include <gz/msgs/pose_v.pb.h>
 #include <gz/msgs/time.pb.h>
 #include <gz/msgs/uint64.pb.h>
+#include <gz/msgs/vector3d.pb.h>
 
 #include <common/scoped_timer.hpp>
 #include "cone_color.hpp"
@@ -54,6 +57,21 @@
 //                        frame, this is the filter's persistent, growing
 //                        map, republished after each /cone_detections
 //                        batch)
+//   /estimated_velocity           gz.msgs.Vector3d (BODY-frame vx/vy,
+//                                 straight from the EKF's own velocity
+//                                 state -- not rotated to world frame, see
+//                                 2026-09-02 user request -- z always 0,
+//                                 planar model, see ekf.hpp)
+//   /estimated_velocity_marker    gz.msgs.Marker   (same vector, drawn as a
+//                                 2-point LINE_STRIP local to the vehicle's
+//                                 own frame -- foxglove_bridge.cpp anchors
+//                                 it to kEstimatedFrameId, not world, so it
+//                                 moves/rotates WITH the car)
+//   /estimated_acceleration       gz.msgs.Vector3d (BODY-frame ax/ay/az,
+//                                 straight from the raw IMU reading, not
+//                                 differentiated from the velocity estimate)
+//   /estimated_acceleration_marker gz.msgs.Marker  (same, as a LINE_STRIP,
+//                                 same vehicle-local frame_id handling)
 //
 // Deliberately NOT yet included (next step, not done here):
 //   - AckermannSteering's own /model/fsd_car/odometry (redundant with
@@ -285,6 +303,64 @@ double StampToSeconds(const gz::msgs::Time &_stamp)
 {
     return static_cast<double>(_stamp.sec()) + static_cast<double>(_stamp.nsec()) * 1e-9;
 }
+
+// Local (vehicle-frame) height these vectors are drawn FROM -- EKF is a
+// planar (x,y,yaw) model with no z state (see ekf.hpp's own state-vector
+// comment), so there's no real chassis height to anchor to, and (2026-09-02
+// user request) these vectors are body-frame, not world-frame, so this is
+// an offset along the vehicle's OWN local z axis, not a world altitude. A
+// small fixed offset purely for visualization keeps the line from clipping
+// through the car mesh rather than representing anything physical.
+constexpr double kVectorMarkerHeight = 0.5;  // meters, local to the vehicle frame
+
+// Draws one vector as a 2-point LINE_STRIP from (originX,Y,Z) to
+// (originX,Y,Z) + (vecX,Y,Z)*_lengthScale -- deliberately NOT an ARROW-type
+// marker: ARROW's default facing axis is a gz-sim rendering-internal detail
+// not documented in marker.proto itself, so getting it right would need
+// live trial and error, whereas two endpoints unambiguously draw the
+// vector regardless of any implicit mesh orientation. _lengthScale=1.0
+// draws the vector at its own true magnitude in meters (5 m/s -> a 5m
+// line) -- a reasonable default at this vehicle's own scale; adjust per
+// call if velocity/acceleration turn out too small/large to see clearly
+// live. Shared by both the velocity and acceleration publishers below so
+// their only difference is namespace/id/color.
+gz::msgs::Marker MakeVectorMarker(uint64_t _id, const std::string &_ns, double _originX, double _originY,
+                                   double _originZ, double _vecX, double _vecY, double _vecZ, float _r,
+                                   float _g, float _b, double _lengthScale = 1.0)
+{
+    gz::msgs::Marker marker;
+    marker.set_ns(_ns);
+    marker.set_id(_id);
+    marker.set_action(gz::msgs::Marker::ADD_MODIFY);
+    marker.set_type(gz::msgs::Marker::LINE_STRIP);
+    marker.set_visibility(gz::msgs::Marker::ALL);
+
+    gz::msgs::Vector3d *start = marker.add_point();
+    start->set_x(_originX);
+    start->set_y(_originY);
+    start->set_z(_originZ);
+
+    gz::msgs::Vector3d *end = marker.add_point();
+    end->set_x(_originX + _vecX * _lengthScale);
+    end->set_y(_originY + _vecY * _lengthScale);
+    end->set_z(_originZ + _vecZ * _lengthScale);
+
+    marker.mutable_scale()->set_x(0.08);
+    marker.mutable_scale()->set_y(0.08);
+    marker.mutable_scale()->set_z(0.08);
+
+    gz::msgs::Material *material = marker.mutable_material();
+    material->mutable_ambient()->set_r(_r);
+    material->mutable_ambient()->set_g(_g);
+    material->mutable_ambient()->set_b(_b);
+    material->mutable_ambient()->set_a(1.0f);
+    material->mutable_diffuse()->set_r(_r);
+    material->mutable_diffuse()->set_g(_g);
+    material->mutable_diffuse()->set_b(_b);
+    material->mutable_diffuse()->set_a(1.0f);
+
+    return marker;
+}
 } // namespace
 
 int main()
@@ -294,6 +370,19 @@ int main()
     const fsd::GeodeticConverter geo(kRefLatDeg, kRefLonDeg, kRefAltM);
 
     auto posePub = node.Advertise<gz::msgs::Pose>("/estimated_pose");
+    // Velocity/acceleration publishing (2026-09-02, user request): this
+    // state already existed inside the EKF (Vx()/Vy(), see ekf.hpp) and
+    // inside the raw IMU message (linear_acceleration), just never
+    // published anywhere. Two topics each -- a plain Vector3d for
+    // Foxglove's Plot panel (numeric x/y/z fields, easy to chart over
+    // time) and a Marker (2-point LINE_STRIP, see MakeVectorMarker's own
+    // comment) for the 2D/3D vector view -- since a Plot panel can't
+    // usefully chart a Marker's point list, and a 3D view can't draw a bare
+    // Vector3d without a position to anchor it at.
+    auto velocityPub = node.Advertise<gz::msgs::Vector3d>("/estimated_velocity");
+    auto velocityMarkerPub = node.Advertise<gz::msgs::Marker>("/estimated_velocity_marker");
+    auto accelerationPub = node.Advertise<gz::msgs::Vector3d>("/estimated_acceleration");
+    auto accelerationMarkerPub = node.Advertise<gz::msgs::Marker>("/estimated_acceleration_marker");
     auto landmarksPub = node.Advertise<gz::msgs::Pose_V>("/estimated_landmarks");
     // TEMPORARY (rigorous jitter measurement): a SEPARATE topic, not
     // /estimated_landmarks itself -- foxglove_bridge.cpp's DetectionConeSpec
@@ -313,6 +402,24 @@ int main()
     // jitter needs to be measured in. Remove once jitter is fully
     // characterized.
     auto landmarksDebugPub = node.Advertise<gz::msgs::Pose_V>("/estimated_landmarks_debug");
+    // Map-wide landmark confidence (2026-09-04, user request: dynamic
+    // corridor width that starts narrow and widens as cone-location
+    // confidence increases lap over lap). A single scalar -- the mean
+    // per-landmark OBSERVATION COUNT across the WHOLE discovered map
+    // (active + retired) -- rather than a per-landmark array on its own
+    // topic: the consumer (planning.cpp) only ever needs one "how good is
+    // the map right now" number to pick a single corridor margin for the
+    // next full-loop recompute, not a per-cone breakdown, and a single
+    // scalar sidesteps having to correlate two independently-published
+    // topics' arrays back to the same landmark by index (a real risk if the
+    // landmark set changes size between the two publishes).
+    // HIGHER = more confident (more repeated observations). NOT variance/
+    // stddev-based, despite that being the first, more obvious-looking
+    // choice -- see publishLandmarks's own comment at the actual
+    // computation for why that was tried first, then confirmed LIVE (same
+    // day) to be floor-saturated and non-discriminating in this EKF, and
+    // replaced with this instead.
+    auto landmarksConfidencePub = node.Advertise<gz::msgs::Double>("/estimated_landmarks_confidence");
 
     // Per-cycle compute time (microseconds). Unlike the other 3 processes,
     // localization has 5 distinct callbacks (one per sensor stream) rather
@@ -354,6 +461,30 @@ int main()
         msg.mutable_orientation()->set_z(std::sin(halfYaw));
         msg.mutable_orientation()->set_w(std::cos(halfYaw));
         posePub.Publish(msg);
+
+        // Body frame (2026-09-02, user request -- NOT world frame, reverted
+        // from an earlier version of this feature that rotated by yaw):
+        // ekf.Vx()/Vy() are already body-frame (forward/lateral, see
+        // ekf.hpp's own comment) -- published as-is. The marker's origin is
+        // similarly local (0,0,kVectorMarkerHeight) rather than the
+        // vehicle's world position -- see foxglove_bridge.cpp's own comment
+        // on why frame_id=kEstimatedFrameId (not kFrameId="world") for
+        // these two marker channels specifically: anchoring to the
+        // vehicle's OWN moving/rotating frame is what makes body-frame
+        // components mean anything visually (e.g. lateral velocity/
+        // accel showing as a sideways offset from the chassis's own nose,
+        // not just "some direction in the world" that's only meaningful
+        // relative to whichever way the car happened to be pointed at that
+        // instant).
+        gz::msgs::Vector3d velMsg;
+        velMsg.set_x(ekf.Vx());
+        velMsg.set_y(ekf.Vy());
+        velMsg.set_z(0.0);  // planar EKF -- see ekf.hpp's own state-vector comment
+        velocityPub.Publish(velMsg);
+
+        velocityMarkerPub.Publish(MakeVectorMarker(
+            /*_id=*/0, "velocity", 0.0, 0.0, kVectorMarkerHeight, ekf.Vx(), ekf.Vy(), 0.0,
+            /*_r=*/0.0f, /*_g=*/1.0f, /*_b=*/0.0f));
     };
 
     auto publishLandmarks = [&]()
@@ -382,6 +513,44 @@ int main()
             p->mutable_position()->set_y(lm.y);
         }
         landmarksDebugPub.Publish(debugMsg);
+
+        // See landmarksConfidencePub's own declaration comment above for
+        // what this is and why a single scalar. Skipped while the map is
+        // still completely empty (right at process start) -- 0.0 landmarks
+        // has no meaningful mean.
+        //
+        // obsCount-based, NOT varX/varY-based (2026-09-04, changed same day
+        // as introduced): confirmed LIVE, immediately, that mean position
+        // stddev is the wrong signal here -- captured at ~0.540-0.542m
+        // repeatedly within the first several seconds of a run and never
+        // moved from there. Root cause: kLandmarkVarianceFloor=0.3m^2 (see
+        // ekf.cpp) clamps EVERY landmark's Pll UP to that floor whenever a
+        // correction would take it lower, and a single near-range
+        // detection's own raw measurement variance is typically already
+        // below that floor (LandmarkStddev's own kLandmarkBaseStddev=0.1m
+        // near range -> 0.01m^2, well under 0.3) -- so almost every
+        // landmark gets floored to essentially the SAME value on its FIRST
+        // correction, not gradually over many. This is exactly the same
+        // floor-saturation problem LandmarkEstimate::obsCount's own header
+        // comment already documents for a different consumer (the
+        // duplicate-vs-fresh-landmark pruning gate) -- "Pll's diagonal
+        // alone can't distinguish a genuinely distinct, well-confirmed cone
+        // from a fresh, still-uncertain one once kLandmarkVarianceFloor has
+        // clamped both to the same floor, but obsCount can." Mean obsCount
+        // across the whole map genuinely does grow with repeated
+        // observation (no floor clamps it), giving the actually-monotonic,
+        // lap-over-lap-improving signal this feature needs.
+        if (!landmarks.empty())
+        {
+            double sumObsCount = 0.0;
+            for (const auto &lm : landmarks)
+            {
+                sumObsCount += static_cast<double>(lm.obsCount);
+            }
+            gz::msgs::Double confidenceMsg;
+            confidenceMsg.set_data(sumObsCount / static_cast<double>(landmarks.size()));
+            landmarksConfidencePub.Publish(confidenceMsg);
+        }
     };
 
     // Antenna ENU fixes are cached so a heading correction can be computed
@@ -458,6 +627,30 @@ int main()
             ekf.CorrectYawRate(_msg.angular_velocity().z(), kGyroZStddev);
         }
         publishEstimate();
+
+        // Body frame (2026-09-02, user request -- NOT world frame, reverted
+        // from an earlier version that rotated by yaw, same as velocity
+        // above): straight from the raw IMU reading, not differentiated
+        // from the EKF's own velocity estimate -- a real accelerometer
+        // measures this directly and far less noisily than numerically
+        // differentiating an already-noisy velocity state would.
+        // linear_acceleration is already body-frame (x forward, y left,
+        // per this codebase's standard convention -- see
+        // common/frame_transform.hpp's own header comment), published
+        // as-is.
+        const double axBody = _msg.linear_acceleration().x();
+        const double ayBody = _msg.linear_acceleration().y();
+        const double azBody = _msg.linear_acceleration().z();
+
+        gz::msgs::Vector3d accelMsg;
+        accelMsg.set_x(axBody);
+        accelMsg.set_y(ayBody);
+        accelMsg.set_z(azBody);
+        accelerationPub.Publish(accelMsg);
+
+        accelerationMarkerPub.Publish(MakeVectorMarker(
+            /*_id=*/0, "acceleration", 0.0, 0.0, kVectorMarkerHeight, axBody, ayBody, 0.0,
+            /*_r=*/1.0f, /*_g=*/0.0f, /*_b=*/0.0f));
     };
     if (!node.Subscribe("/imu", onImu))
     {

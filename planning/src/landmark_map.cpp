@@ -19,7 +19,41 @@ namespace fsd
 // barely behind the vehicle's origin available for pairing continuity
 // right around the car, matching the kind of small tolerance used
 // elsewhere in this codebase rather than a knife-edge boundary.
-constexpr double kBehindMargin = -3.0;  // meters
+//
+// WIDENED -3.0 -> -8.0 (2026-09-05, user request: "increase the memory so
+// that a cone seen earlier doesn't get forgotten" -- live investigation at
+// the hairpin found a REAL, already-localized cone (ground truth: 0.98m
+// from the car, roughly dead ahead) producing a completely EMPTY
+// /cone_detections that cycle (YOLO/lidar near-field gap, not this file's
+// own problem to fix -- see the session's own separate finding), yet the
+// corridor still couldn't use it despite it already being a known landmark
+// in the persistent map (LandmarkMap draws from every cone ever localized,
+// not just the current cycle's fresh detections -- that's this whole
+// class's own documented purpose). Root cause here: this is the EXACT SAME
+// heading-lag mechanism already found and fixed once tonight in
+// planning.cpp's RemoveBehindCarPoints, just in a different function that
+// filter wasn't touching -- at a sharp/hairpin turn, the vehicle's own
+// current heading can lag the track's local curvature by 90 degrees or
+// more, so a landmark only a few meters away but past the apex projects to
+// a heading-relative "forward" value far more negative than its own true
+// distance would suggest (at 5m and 150 degrees of heading mismatch,
+// forward = 5*cos(150deg) = -4.3m, already past the old -3.0m margin; a
+// sharper mismatch pushes it further still). The landmark was never
+// forgotten by the MAP (it's still in m_landmarks, added once and kept
+// forever short of the EKF's own pruning) -- it was being excluded from
+// THIS QUERY specifically by a directional filter that conflates "behind
+// the car's current instantaneous heading" with "genuinely on an already-
+// passed section of track", which is exactly the same conflation
+// RemoveBehindCarPoints' own fix (2026-09-05, planning.cpp) already
+// identified and corrected for the published-path case. -8.0m gives real
+// margin for that heading-lag effect at a hairpin (comfortably covers the
+// 5m/150deg case above, and even 8m at a near-180-degree mismatch) while
+// staying well inside kWindowRadius=20.0m overall, so a genuinely-distant,
+// actually-already-passed straight section still can't leak in just
+// because this margin grew -- the original failure this constant guards
+// against needed something on the order of tens of meters behind to
+// reproduce, not single digits.
+constexpr double kBehindMargin = -8.0;  // meters
 
 
 void LandmarkMap::UpdateLandmarks(std::vector<WorldCone> _landmarks)

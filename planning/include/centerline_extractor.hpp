@@ -29,7 +29,7 @@ namespace fsd
 // ordered midpoints this stage produces).
 using MidpointExtractorFn = std::function<std::vector<PathPoint>(
     const std::vector<WorldCone> &blue, const std::vector<WorldCone> &yellow,
-    const Pose2D &vehiclePose)>;
+    const std::vector<WorldCone> &orange, const Pose2D &vehiclePose)>;
 
 // Default/current implementation: mutual-nearest-neighbor pairing between
 // blue and yellow landmarks (same algorithm as path_generator.cpp's
@@ -38,8 +38,22 @@ using MidpointExtractorFn = std::function<std::vector<PathPoint>(
 // applied to a windowed WORLD-frame landmark set instead of one cycle's
 // body-frame detections. Ordered via the shared OrderWaypointsByTraversal
 // (path_utils.hpp), cursor = vehicle's world position.
+//
+// `orange` (2026-09-04, user report: "the algorithm doesn't handle orange
+// cones properly" -- confirmed live: the two nearest LEGITIMATE blue-
+// yellow-pair midpoints straddling the real start/finish gate sat 3.3-3.5m
+// away from the gate's own center on EITHER side, a ~6.5m hole in
+// centerline coverage exactly where the gate is, since blue/yellow cones
+// are sparse/absent running THROUGH a real gate -- OrderWaypointsByTraversal
+// then has to blindly bridge that gap with no real anchor point there, a
+// plausible source of an off-track-looking "veer" unrelated to any actual
+// curvature). Pairs up orange cones the same mutual-nearest-neighbor way as
+// blue/yellow and adds each pair's own midpoint as a genuine waypoint
+// anchoring the gate's true center, closing that gap directly instead of
+// leaving it for downstream stages to paper over.
 std::vector<PathPoint> TwoPointMidpointExtractor(const std::vector<WorldCone> &blue,
                                                   const std::vector<WorldCone> &yellow,
+                                                  const std::vector<WorldCone> &orange,
                                                   const Pose2D &vehiclePose);
 
 // Full-track counterpart, used once a lap completes (see lap_detector.hpp)
@@ -68,7 +82,11 @@ std::vector<PathPoint> TwoPointMidpointExtractor(const std::vector<WorldCone> &b
 // a sound starting alignment for the cursor. Output is implicitly in
 // travel order already (blueChain's own order), no separate
 // OrderWaypointsByTraversal pass needed on the result.
+// `orange` -- same gate-anchor addition as TwoPointMidpointExtractor's own
+// (see its own comment), applied here too so the closed-loop spline gets
+// the same real anchor point at the gate once a lap completes.
 std::vector<PathPoint> ClosedLoopMidpointExtractor(const std::vector<WorldCone> &blue,
                                                     const std::vector<WorldCone> &yellow,
+                                                    const std::vector<WorldCone> &orange,
                                                     const Pose2D &vehiclePose);
 }  // namespace fsd

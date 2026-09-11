@@ -90,8 +90,15 @@
     <light name="sun" type="directional">
       <cast_shadows>true</cast_shadows>
       <pose>0 0 10 0 0 0</pose>
-      <diffuse>0.8 0.8 0.8 1</diffuse>
-      <specular>0.2 0.2 0.2 1</specular>
+      <!-- Brightened (2026-09-02, user request) -- note <pose> above does
+           NOT affect a directional light's appearance at all (it's treated
+           as coming from infinitely far away, so only direction/intensity
+           matter, not position); "moving the sun" for brightness has no
+           effect, this is what actually does. specular raised alongside
+           diffuse so the cone_orange PBR material's new roughness/metalness
+           tuning (see its own model.sdf) has a visible highlight to catch. -->
+      <diffuse>1 1 1 1</diffuse>
+      <specular>0.4 0.4 0.4 1</specular>
       <direction>-0.5 0.1 -0.9</direction>
     </light>
 

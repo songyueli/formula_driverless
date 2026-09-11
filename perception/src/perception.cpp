@@ -191,12 +191,25 @@ constexpr double kPanoHFovRad = 1.8850; // 108 deg
 // with best.onnx -- it's tied to the exact GPU + TensorRT version it was
 // built on (see cone_detector_trt.hpp), and has to be rebuilt via trtexec
 // any time best.onnx changes.
+// Trying train_v3 (2026-09-02, experimental): retrain on a per-INSTANCE
+// class-balanced sample (ml/prepare_data.py's scan_and_balance -- equal
+// blue/yellow/orange-family instance counts, not just equal image counts
+// like train_v2's stratify fix) -- but only 25 epochs on 5991 images
+// (train_v2 was 100 epochs on 8783). Validation: orange/large_orange are
+// now the BEST classes (recall 0.72-0.74) instead of the worst, but
+// overall recall dropped across every class (blue/yellow ~0.66 vs
+// train_v2's ~0.74) from the much shorter train + smaller dataset -- this
+// confirms the balancing approach works, but is NOT necessarily a better
+// deployed model than train_v2 yet. train_v2's weights are left untouched
+// on disk (not train's original weights -- see below) -- point this back
+// at "train_v2" to revert to the previous deployed model, or "train" to go
+// all the way back to the first retrain.
 #ifdef PERCEPTION_USE_TENSORRT
 using ActiveDetector = ConeDetectorTrt;
-constexpr const char *kModelPath = "ml/runs/detect/train/weights/best.engine";
+constexpr const char *kModelPath = "ml/runs/detect/train_v3/weights/best.engine";
 #else
 using ActiveDetector = ConeDetector;
-constexpr const char *kModelPath = "ml/runs/detect/train/weights/best.onnx";
+constexpr const char *kModelPath = "ml/runs/detect/train_v3/weights/best.onnx";
 #endif
 constexpr float kConfThreshold = 0.25f;
 
